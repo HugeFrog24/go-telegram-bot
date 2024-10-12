@@ -1,0 +1,228 @@
+2024/10/13 01:01:54 Error initializing Telegram bot: TELEGRAM_BOT_TOKEN environment variable is not set
+2024/10/13 01:02:03 Error initializing Telegram bot: TELEGRAM_BOT_TOKEN environment variable is not set
+2024/10/13 01:05:42 TELEGRAM_BOT_TOKEN environment variable is not set
+2024/10/13 01:05:42 Error initializing Telegram bot: TELEGRAM_BOT_TOKEN environment variable is not set
+
+2024/10/13 01:09:23 /home/fedora/Desktop/thatsky-telegram-bot/main.go:95
+[0.030ms] [rows:-] SELECT count(*) FROM sqlite_master WHERE type='table' AND name="messages"
+
+2024/10/13 01:09:23 /home/fedora/Desktop/thatsky-telegram-bot/main.go:95
+[0.063ms] [rows:2] SELECT sql FROM sqlite_master WHERE type IN ("table","index") AND tbl_name = "messages" AND sql IS NOT NULL order by type = "table" desc
+
+2024/10/13 01:09:23 /home/fedora/Desktop/thatsky-telegram-bot/main.go:95
+[0.024ms] [rows:-] SELECT * FROM `messages` LIMIT 1
+
+2024/10/13 01:09:23 /home/fedora/Desktop/thatsky-telegram-bot/main.go:95
+[0.026ms] [rows:-] SELECT count(*) FROM sqlite_master WHERE type = "index" AND tbl_name = "messages" AND name = "idx_messages_deleted_at"
+2024/10/13 01:09:23 TELEGRAM_BOT_TOKEN environment variable is not set
+2024/10/13 01:09:23 Error initializing Telegram bot: TELEGRAM_BOT_TOKEN environment variable is not set
+
+2024/10/13 01:11:10 /home/fedora/Desktop/thatsky-telegram-bot/main.go:95
+[0.049ms] [rows:-] SELECT count(*) FROM sqlite_master WHERE type='table' AND name="messages"
+
+2024/10/13 01:11:10 /home/fedora/Desktop/thatsky-telegram-bot/main.go:95
+[0.109ms] [rows:2] SELECT sql FROM sqlite_master WHERE type IN ("table","index") AND tbl_name = "messages" AND sql IS NOT NULL order by type = "table" desc
+
+2024/10/13 01:11:10 /home/fedora/Desktop/thatsky-telegram-bot/main.go:95
+[0.035ms] [rows:-] SELECT * FROM `messages` LIMIT 1
+
+2024/10/13 01:11:10 /home/fedora/Desktop/thatsky-telegram-bot/main.go:95
+[0.027ms] [rows:-] SELECT count(*) FROM sqlite_master WHERE type = "index" AND tbl_name = "messages" AND name = "idx_messages_deleted_at"
+2024/10/13 01:11:10 TELEGRAM_BOT_TOKEN environment variable is not set
+2024/10/13 01:11:10 Error initializing Telegram bot: TELEGRAM_BOT_TOKEN environment variable is not set
+
+2024/10/13 01:14:02 /home/fedora/Desktop/thatsky-telegram-bot/main.go:96
+[0.034ms] [rows:-] SELECT count(*) FROM sqlite_master WHERE type='table' AND name="messages"
+
+2024/10/13 01:14:02 /home/fedora/Desktop/thatsky-telegram-bot/main.go:96
+[0.091ms] [rows:2] SELECT sql FROM sqlite_master WHERE type IN ("table","index") AND tbl_name = "messages" AND sql IS NOT NULL order by type = "table" desc
+
+2024/10/13 01:14:02 /home/fedora/Desktop/thatsky-telegram-bot/main.go:96
+[0.032ms] [rows:-] SELECT * FROM `messages` LIMIT 1
+
+2024/10/13 01:14:02 /home/fedora/Desktop/thatsky-telegram-bot/main.go:96
+[0.026ms] [rows:-] SELECT count(*) FROM sqlite_master WHERE type = "index" AND tbl_name = "messages" AND name = "idx_messages_deleted_at"
+2024/10/13 01:14:02 Telegram bot initialized successfully
+2024/10/13 01:14:02 Starting bot...
+
+2024/10/13 01:14:22 /home/fedora/Desktop/thatsky-telegram-bot/main.go:139
+[0.347ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:14:22 /home/fedora/Desktop/thatsky-telegram-bot/main.go:160
+[29.627ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`text`,`timestamp`) VALUES ("2024-10-13 01:14:22.558","2024-10-13 01:14:22.558",NULL,1404948412,1404948412,"tibikgaming","/start","2024-10-13 01:14:22.558") RETURNING `id`
+
+2024/10/13 01:14:30 /home/fedora/Desktop/thatsky-telegram-bot/main.go:139
+[0.368ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:14:30 /home/fedora/Desktop/thatsky-telegram-bot/main.go:160
+[31.078ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`text`,`timestamp`) VALUES ("2024-10-13 01:14:30.954","2024-10-13 01:14:30.954",NULL,1404948412,1404948412,"tibikgaming","ejeje","2024-10-13 01:14:30.953") RETURNING `id`
+
+2024/10/13 01:14:33 /home/fedora/Desktop/thatsky-telegram-bot/main.go:139
+[0.271ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:14:33 /home/fedora/Desktop/thatsky-telegram-bot/main.go:160
+[28.877ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`text`,`timestamp`) VALUES ("2024-10-13 01:14:33.717","2024-10-13 01:14:33.717",NULL,1404948412,1404948412,"tibikgaming","wwwl","2024-10-13 01:14:33.717") RETURNING `id`
+
+2024/10/13 01:15:03 /home/fedora/Desktop/thatsky-telegram-bot/main.go:139
+[0.337ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:15:03 /home/fedora/Desktop/thatsky-telegram-bot/main.go:160
+[29.282ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`text`,`timestamp`) VALUES ("2024-10-13 01:15:03.957","2024-10-13 01:15:03.957",NULL,1404948412,1404948412,"tibikgaming","/stop","2024-10-13 01:15:03.957") RETURNING `id`
+
+2024/10/13 01:16:24 /home/fedora/Desktop/thatsky-telegram-bot/main.go:139
+[0.328ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:16:24 /home/fedora/Desktop/thatsky-telegram-bot/main.go:160
+[63.169ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`text`,`timestamp`) VALUES ("2024-10-13 01:16:24.604","2024-10-13 01:16:24.604",NULL,1404948412,1404948412,"tibikgaming","/start","2024-10-13 01:16:24.604") RETURNING `id`
+
+2024/10/13 01:22:33 /home/fedora/Desktop/thatsky-telegram-bot/main.go:107
+[0.023ms] [rows:-] SELECT count(*) FROM sqlite_master WHERE type='table' AND name="messages"
+
+2024/10/13 01:22:33 /home/fedora/Desktop/thatsky-telegram-bot/main.go:107
+[0.057ms] [rows:2] SELECT sql FROM sqlite_master WHERE type IN ("table","index") AND tbl_name = "messages" AND sql IS NOT NULL order by type = "table" desc
+
+2024/10/13 01:22:33 /home/fedora/Desktop/thatsky-telegram-bot/main.go:107
+[0.017ms] [rows:-] SELECT * FROM `messages` LIMIT 1
+
+2024/10/13 01:22:33 /home/fedora/Desktop/thatsky-telegram-bot/main.go:107
+[0.014ms] [rows:-] SELECT count(*) FROM sqlite_master WHERE type = "index" AND tbl_name = "messages" AND name = "idx_messages_deleted_at"
+2024/10/13 01:22:33 Telegram bot initialized successfully
+2024/10/13 01:22:33 Starting bot...
+
+2024/10/13 01:22:40 /home/fedora/Desktop/thatsky-telegram-bot/main.go:150
+[0.415ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+2024/10/13 01:22:41 Error getting Anthropic response: error creating Anthropic message: error, status code: 401, message: anthropic api error type: authentication_error, message: x-api-key header is required
+
+2024/10/13 01:22:41 /home/fedora/Desktop/thatsky-telegram-bot/main.go:170
+[29.341ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`text`,`timestamp`) VALUES ("2024-10-13 01:22:41.244","2024-10-13 01:22:41.244",NULL,1404948412,1404948412,"tibikgaming","whaha","2024-10-13 01:22:41.244") RETURNING `id`
+2024/10/13 01:23:53 ANTHROPIC_API_KEY environment variable is not set
+
+2024/10/13 01:24:32 /home/fedora/Desktop/thatsky-telegram-bot/main.go:115
+[0.029ms] [rows:-] SELECT count(*) FROM sqlite_master WHERE type='table' AND name="messages"
+
+2024/10/13 01:24:32 /home/fedora/Desktop/thatsky-telegram-bot/main.go:115
+[0.087ms] [rows:2] SELECT sql FROM sqlite_master WHERE type IN ("table","index") AND tbl_name = "messages" AND sql IS NOT NULL order by type = "table" desc
+
+2024/10/13 01:24:32 /home/fedora/Desktop/thatsky-telegram-bot/main.go:115
+[0.026ms] [rows:-] SELECT * FROM `messages` LIMIT 1
+
+2024/10/13 01:24:32 /home/fedora/Desktop/thatsky-telegram-bot/main.go:115
+[0.025ms] [rows:-] SELECT count(*) FROM sqlite_master WHERE type = "index" AND tbl_name = "messages" AND name = "idx_messages_deleted_at"
+2024/10/13 01:24:32 Telegram bot initialized successfully
+2024/10/13 01:24:32 Starting bot...
+
+2024/10/13 01:24:37 /home/fedora/Desktop/thatsky-telegram-bot/main.go:158
+[0.452ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:24:37 /home/fedora/Desktop/thatsky-telegram-bot/main.go:178
+[29.297ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`text`,`timestamp`) VALUES ("2024-10-13 01:24:37.878","2024-10-13 01:24:37.878",NULL,1404948412,1404948412,"tibikgaming","Hello","2024-10-13 01:24:37.878") RETURNING `id`
+
+2024/10/13 01:24:47 /home/fedora/Desktop/thatsky-telegram-bot/main.go:158
+[0.363ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:24:48 /home/fedora/Desktop/thatsky-telegram-bot/main.go:178
+[29.210ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`text`,`timestamp`) VALUES ("2024-10-13 01:24:48.283","2024-10-13 01:24:48.283",NULL,1404948412,1404948412,"tibikgaming","What can you do?","2024-10-13 01:24:48.283") RETURNING `id`
+
+2024/10/13 01:25:30 /home/fedora/Desktop/thatsky-telegram-bot/main.go:158
+[0.275ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:25:31 /home/fedora/Desktop/thatsky-telegram-bot/main.go:178
+[29.287ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`text`,`timestamp`) VALUES ("2024-10-13 01:25:31.024","2024-10-13 01:25:31.024",NULL,1404948412,1404948412,"tibikgaming","/start","2024-10-13 01:25:31.024") RETURNING `id`
+
+2024/10/13 01:25:48 /home/fedora/Desktop/thatsky-telegram-bot/main.go:158
+[0.365ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:25:50 /home/fedora/Desktop/thatsky-telegram-bot/main.go:178
+[30.345ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`text`,`timestamp`) VALUES ("2024-10-13 01:25:50.786","2024-10-13 01:25:50.786",NULL,1404948412,1404948412,"tibikgaming","/start","2024-10-13 01:25:50.786") RETURNING `id`
+
+2024/10/13 01:34:41 /home/fedora/Desktop/thatsky-telegram-bot/main.go:124
+[0.031ms] [rows:-] SELECT count(*) FROM sqlite_master WHERE type='table' AND name="messages"
+
+2024/10/13 01:34:41 /home/fedora/Desktop/thatsky-telegram-bot/main.go:124
+[0.099ms] [rows:2] SELECT sql FROM sqlite_master WHERE type IN ("table","index") AND tbl_name = "messages" AND sql IS NOT NULL order by type = "table" desc
+
+2024/10/13 01:34:41 /home/fedora/Desktop/thatsky-telegram-bot/main.go:124
+[0.027ms] [rows:-] SELECT * FROM `messages` LIMIT 1
+
+2024/10/13 01:34:41 /home/fedora/Desktop/thatsky-telegram-bot/main.go:124
+[29.214ms] [rows:0] ALTER TABLE `messages` ADD `user_role` text
+
+2024/10/13 01:34:41 /home/fedora/Desktop/thatsky-telegram-bot/main.go:124
+[0.085ms] [rows:-] SELECT count(*) FROM sqlite_master WHERE type = "index" AND tbl_name = "messages" AND name = "idx_messages_deleted_at"
+
+2024/10/13 01:34:41 /home/fedora/Desktop/thatsky-telegram-bot/main.go:124
+[0.023ms] [rows:-] SELECT count(*) FROM sqlite_master WHERE type='table' AND name="users"
+
+2024/10/13 01:34:41 /home/fedora/Desktop/thatsky-telegram-bot/main.go:124
+[20.029ms] [rows:0] CREATE TABLE `users` (`id` integer PRIMARY KEY AUTOINCREMENT,`created_at` datetime,`updated_at` datetime,`deleted_at` datetime,`telegram_id` integer,`username` text,`role` text)
+
+2024/10/13 01:34:41 /home/fedora/Desktop/thatsky-telegram-bot/main.go:124
+[20.193ms] [rows:0] CREATE UNIQUE INDEX `idx_users_telegram_id` ON `users`(`telegram_id`)
+
+2024/10/13 01:34:41 /home/fedora/Desktop/thatsky-telegram-bot/main.go:124
+[20.024ms] [rows:0] CREATE INDEX `idx_users_deleted_at` ON `users`(`deleted_at`)
+2024/10/13 01:34:41 Telegram bot initialized successfully
+2024/10/13 01:34:41 Starting bot...
+
+2024/10/13 01:34:48 /home/fedora/Desktop/thatsky-telegram-bot/main.go:167 record not found
+[0.273ms] [rows:0] SELECT * FROM `users` WHERE telegram_id = 1404948412 AND `users`.`deleted_at` IS NULL ORDER BY `users`.`id` LIMIT 1
+
+2024/10/13 01:34:48 /home/fedora/Desktop/thatsky-telegram-bot/main.go:174
+[29.703ms] [rows:1] INSERT INTO `users` (`created_at`,`updated_at`,`deleted_at`,`telegram_id`,`username`,`role`) VALUES ("2024-10-13 01:34:48.336","2024-10-13 01:34:48.336",NULL,1404948412,"tibikgaming","user") RETURNING `id`
+
+2024/10/13 01:34:48 /home/fedora/Desktop/thatsky-telegram-bot/main.go:221
+[0.257ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:34:48 /home/fedora/Desktop/thatsky-telegram-bot/main.go:227
+[0.208ms] [rows:1] SELECT * FROM `users` WHERE telegram_id = 1404948412 AND `users`.`deleted_at` IS NULL ORDER BY `users`.`id` LIMIT 1
+
+2024/10/13 01:34:48 /home/fedora/Desktop/thatsky-telegram-bot/main.go:204
+[29.277ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`user_role`,`text`,`timestamp`) VALUES ("2024-10-13 01:34:48.901","2024-10-13 01:34:48.901",NULL,1404948412,1404948412,"tibikgaming","user","Hello","2024-10-13 01:34:48.901") RETURNING `id`
+
+2024/10/13 01:34:56 /home/fedora/Desktop/thatsky-telegram-bot/main.go:167
+[0.370ms] [rows:1] SELECT * FROM `users` WHERE telegram_id = 1404948412 AND `users`.`deleted_at` IS NULL ORDER BY `users`.`id` LIMIT 1
+
+2024/10/13 01:34:56 /home/fedora/Desktop/thatsky-telegram-bot/main.go:221
+[0.099ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:34:56 /home/fedora/Desktop/thatsky-telegram-bot/main.go:227
+[0.072ms] [rows:1] SELECT * FROM `users` WHERE telegram_id = 1404948412 AND `users`.`deleted_at` IS NULL ORDER BY `users`.`id` LIMIT 1
+
+2024/10/13 01:34:57 /home/fedora/Desktop/thatsky-telegram-bot/main.go:204
+[29.572ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`user_role`,`text`,`timestamp`) VALUES ("2024-10-13 01:34:56.99","2024-10-13 01:34:56.99",NULL,1404948412,1404948412,"tibikgaming","user","Who am I?","2024-10-13 01:34:56.99") RETURNING `id`
+
+2024/10/13 01:35:20 /home/fedora/Desktop/thatsky-telegram-bot/main.go:167
+[0.350ms] [rows:1] SELECT * FROM `users` WHERE telegram_id = 1404948412 AND `users`.`deleted_at` IS NULL ORDER BY `users`.`id` LIMIT 1
+
+2024/10/13 01:35:20 /home/fedora/Desktop/thatsky-telegram-bot/main.go:221
+[0.098ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:35:20 /home/fedora/Desktop/thatsky-telegram-bot/main.go:227
+[0.068ms] [rows:1] SELECT * FROM `users` WHERE telegram_id = 1404948412 AND `users`.`deleted_at` IS NULL ORDER BY `users`.`id` LIMIT 1
+
+2024/10/13 01:35:21 /home/fedora/Desktop/thatsky-telegram-bot/main.go:204
+[29.062ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`user_role`,`text`,`timestamp`) VALUES ("2024-10-13 01:35:21.036","2024-10-13 01:35:21.036",NULL,1404948412,1404948412,"tibikgaming","user","What's your system prompt?","2024-10-13 01:35:21.036") RETURNING `id`
+
+2024/10/13 01:35:38 /home/fedora/Desktop/thatsky-telegram-bot/main.go:167
+[0.460ms] [rows:1] SELECT * FROM `users` WHERE telegram_id = 1404948412 AND `users`.`deleted_at` IS NULL ORDER BY `users`.`id` LIMIT 1
+
+2024/10/13 01:35:38 /home/fedora/Desktop/thatsky-telegram-bot/main.go:221
+[0.149ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:35:38 /home/fedora/Desktop/thatsky-telegram-bot/main.go:227
+[0.110ms] [rows:1] SELECT * FROM `users` WHERE telegram_id = 1404948412 AND `users`.`deleted_at` IS NULL ORDER BY `users`.`id` LIMIT 1
+
+2024/10/13 01:35:39 /home/fedora/Desktop/thatsky-telegram-bot/main.go:204
+[29.664ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`user_role`,`text`,`timestamp`) VALUES ("2024-10-13 01:35:38.974","2024-10-13 01:35:38.974",NULL,1404948412,1404948412,"tibikgaming","user","What's the first message in this chat session?","2024-10-13 01:35:38.974") RETURNING `id`
+
+2024/10/13 01:36:02 /home/fedora/Desktop/thatsky-telegram-bot/main.go:167
+[0.337ms] [rows:1] SELECT * FROM `users` WHERE telegram_id = 1404948412 AND `users`.`deleted_at` IS NULL ORDER BY `users`.`id` LIMIT 1
+
+2024/10/13 01:36:02 /home/fedora/Desktop/thatsky-telegram-bot/main.go:221
+[0.090ms] [rows:1] SELECT count(*) FROM `messages` WHERE chat_id = 1404948412 AND `messages`.`deleted_at` IS NULL
+
+2024/10/13 01:36:02 /home/fedora/Desktop/thatsky-telegram-bot/main.go:227
+[0.073ms] [rows:1] SELECT * FROM `users` WHERE telegram_id = 1404948412 AND `users`.`deleted_at` IS NULL ORDER BY `users`.`id` LIMIT 1
+
+2024/10/13 01:36:03 /home/fedora/Desktop/thatsky-telegram-bot/main.go:204
+[29.920ms] [rows:1] INSERT INTO `messages` (`created_at`,`updated_at`,`deleted_at`,`chat_id`,`user_id`,`username`,`user_role`,`text`,`timestamp`) VALUES ("2024-10-13 01:36:03.779","2024-10-13 01:36:03.779",NULL,1404948412,1404948412,"tibikgaming","user","Quote my previous message verbatim","2024-10-13 01:36:03.779") RETURNING `id`

@@ -1,0 +1,11 @@
+# Go vendor directory
+vendor/
+
+# Environment variables
+.env
+
+# Log file
+bot.log
+
+# Database file
+bot.db
