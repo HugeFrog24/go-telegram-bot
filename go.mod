@@ -6,6 +6,7 @@ require (
 	github.com/go-telegram/bot v1.8.4
 	github.com/joho/godotenv v1.5.1
 	github.com/liushuangls/go-anthropic/v2 v2.8.1
+	golang.org/x/time v0.7.0
 	gorm.io/driver/sqlite v1.5.6
 	gorm.io/gorm v1.25.12
 )

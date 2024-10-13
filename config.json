@@ -1,0 +1,6 @@
+{
+    "memory_size": 10,
+    "messages_per_hour": 20,
+    "messages_per_day": 100,
+    "temp_ban_duration": "24h"
+}
