@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log"
 	"os"
 	"sync"
 	"time"
@@ -20,12 +22,26 @@ type Bot struct {
 	chatMemories    map[int64]*ChatMemory
 	memorySize      int
 	chatMemoriesMu  sync.RWMutex
-	config          Config
+	config          BotConfig
 	userLimiters    map[int64]*userLimiter
 	userLimitersMu  sync.RWMutex
+	clock           Clock
+	botID           uint // Reference to BotModel.ID
 }
 
-func NewBot(db *gorm.DB, config Config) (*Bot, error) {
+func NewBot(db *gorm.DB, config BotConfig, clock Clock) (*Bot, error) {
+	// Retrieve or create Bot entry in the database
+	var botEntry BotModel
+	err := db.Where("identifier = ?", config.ID).First(&botEntry).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		botEntry = BotModel{Identifier: config.ID, Name: config.ID} // Customize as needed
+		if err := db.Create(&botEntry).Error; err != nil {
+			return nil, err
+		}
+	} else if err != nil {
+		return nil, err
+	}
+
 	anthropicClient := anthropic.NewClient(os.Getenv("ANTHROPIC_API_KEY"))
 
 	b := &Bot{
@@ -35,9 +51,11 @@ func NewBot(db *gorm.DB, config Config) (*Bot, error) {
 		memorySize:      config.MemorySize,
 		config:          config,
 		userLimiters:    make(map[int64]*userLimiter),
+		clock:           clock,
+		botID:           botEntry.ID, // Ensure BotModel has ID field
 	}
 
-	tgBot, err := initTelegramBot(b.handleUpdate)
+	tgBot, err := initTelegramBot(config.TelegramToken, b.handleUpdate)
 	if err != nil {
 		return nil, err
 	}
@@ -71,18 +89,27 @@ func (b *Bot) getOrCreateUser(userID int64, username string) (User, error) {
 }
 
 func (b *Bot) createMessage(chatID, userID int64, username, userRole, text string, isUser bool) Message {
-	return Message{
+	message := Message{
 		ChatID:    chatID,
-		UserID:    userID,
-		Username:  username,
 		UserRole:  userRole,
 		Text:      text,
 		Timestamp: time.Now(),
 		IsUser:    isUser,
 	}
+
+	if isUser {
+		message.UserID = userID
+		message.Username = username
+	} else {
+		message.UserID = 0
+		message.Username = "AI Assistant"
+	}
+
+	return message
 }
 
 func (b *Bot) storeMessage(message Message) error {
+	message.BotID = b.botID // Associate the message with the correct bot
 	return b.db.Create(&message).Error
 }
 
@@ -92,16 +119,23 @@ func (b *Bot) getOrCreateChatMemory(chatID int64) *ChatMemory {
 	b.chatMemoriesMu.RUnlock()
 
 	if !exists {
-		var messages []Message
-		b.db.Where("chat_id = ?", chatID).Order("timestamp asc").Limit(b.memorySize * 2).Find(&messages)
-
-		chatMemory = &ChatMemory{
-			Messages: messages,
-			Size:     b.memorySize * 2,
-		}
-
 		b.chatMemoriesMu.Lock()
-		b.chatMemories[chatID] = chatMemory
+		// Double-check to prevent race condition
+		chatMemory, exists = b.chatMemories[chatID]
+		if !exists {
+			var messages []Message
+			b.db.Where("chat_id = ? AND bot_id = ?", chatID, b.botID).
+				Order("timestamp asc").
+				Limit(b.memorySize * 2).
+				Find(&messages)
+
+			chatMemory = &ChatMemory{
+				Messages: messages,
+				Size:     b.memorySize * 2,
+			}
+
+			b.chatMemories[chatID] = chatMemory
+		}
 		b.chatMemoriesMu.Unlock()
 	}
 
@@ -140,7 +174,7 @@ func (b *Bot) prepareContextMessages(chatMemory *ChatMemory) []anthropic.Message
 
 func (b *Bot) isNewChat(chatID int64) bool {
 	var count int64
-	b.db.Model(&Message{}).Where("chat_id = ?", chatID).Count(&count)
+	b.db.Model(&Message{}).Where("chat_id = ? AND bot_id = ?", chatID, b.botID).Count(&count)
 	return count == 1
 }
 
@@ -153,10 +187,49 @@ func (b *Bot) isAdminOrOwner(userID int64) bool {
 	return user.Role.Name == "admin" || user.Role.Name == "owner"
 }
 
-func initTelegramBot(handleUpdate func(ctx context.Context, b *bot.Bot, update *models.Update)) (*bot.Bot, error) {
+func initTelegramBot(token string, handleUpdate func(ctx context.Context, tgBot *bot.Bot, update *models.Update)) (*bot.Bot, error) {
 	opts := []bot.Option{
 		bot.WithDefaultHandler(handleUpdate),
 	}
 
-	return bot.New(os.Getenv("TELEGRAM_BOT_TOKEN"), opts...)
+	return bot.New(token, opts...)
+}
+
+// sendResponse sends a message to the specified chat.
+func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string) {
+	_, err := b.tgBot.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: chatID,
+		Text:   text,
+	})
+	if err != nil {
+		log.Printf("[%s] [ERROR] Error sending message: %v", b.config.ID, err)
+	}
+}
+
+// sendStats sends the bot statistics to the specified chat.
+func (b *Bot) sendStats(ctx context.Context, chatID int64) {
+	totalUsers, totalMessages, err := b.getStats()
+	if err != nil {
+		fmt.Printf("Error fetching stats: %v\n", err)
+		b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve the stats at this time.")
+		return
+	}
+
+	statsMessage := fmt.Sprintf("📊 **Bot Statistics:**\n\n- Total Users: %d\n- Total Messages: %d", totalUsers, totalMessages)
+	b.sendResponse(ctx, chatID, statsMessage)
+}
+
+// getStats retrieves the total number of users and messages from the database.
+func (b *Bot) getStats() (int64, int64, error) {
+	var totalUsers int64
+	if err := b.db.Model(&User{}).Count(&totalUsers).Error; err != nil {
+		return 0, 0, err
+	}
+
+	var totalMessages int64
+	if err := b.db.Model(&Message{}).Count(&totalMessages).Error; err != nil {
+		return 0, 0, err
+	}
+
+	return totalUsers, totalMessages, nil
 }

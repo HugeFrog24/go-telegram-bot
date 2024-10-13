@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 
 	"github.com/joho/godotenv"
 )
@@ -32,25 +33,41 @@ func main() {
 		log.Fatalf("Error initializing database: %v", err)
 	}
 
-	// Load configuration
-	config, err := loadConfig("config.json")
+	// Load all bot configurations
+	configs, err := loadAllConfigs("config")
 	if err != nil {
-		log.Fatalf("Error loading configuration: %v", err)
+		log.Fatalf("Error loading configurations: %v", err)
 	}
 
-	// Create Bot instance
-	b, err := NewBot(db, config)
-	if err != nil {
-		log.Fatalf("Error creating bot: %v", err)
-	}
+	// Create a WaitGroup to manage goroutines
+	var wg sync.WaitGroup
 
 	// Set up context with cancellation
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	// Start the bot
-	log.Println("Starting bot...")
-	b.Start(ctx)
+	// Initialize and start each bot
+	for _, config := range configs {
+		wg.Add(1)
+		go func(cfg BotConfig) {
+			defer wg.Done()
+
+			// Create Bot instance with RealClock
+			realClock := RealClock{}
+			bot, err := NewBot(db, cfg, realClock)
+			if err != nil {
+				log.Printf("Error creating bot %s: %v", cfg.ID, err)
+				return
+			}
+
+			// Start the bot
+			log.Printf("Starting bot %s...", cfg.ID)
+			bot.Start(ctx)
+		}(config)
+	}
+
+	// Wait for all bots to finish
+	wg.Wait()
 }
 
 func initLogger() (*os.File, error) {
@@ -64,7 +81,7 @@ func initLogger() (*os.File, error) {
 }
 
 func checkRequiredEnvVars() {
-	requiredEnvVars := []string{"TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY"}
+	requiredEnvVars := []string{"ANTHROPIC_API_KEY"}
 	for _, envVar := range requiredEnvVars {
 		if os.Getenv(envVar) == "" {
 			log.Fatalf("%s environment variable is not set", envVar)

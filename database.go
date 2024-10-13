@@ -27,7 +27,7 @@ func initDB() (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	err = db.AutoMigrate(&Message{}, &User{}, &Role{})
+	err = db.AutoMigrate(&BotModel{}, &ConfigModel{}, &Message{}, &User{}, &Role{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to migrate database schema: %w", err)
 	}

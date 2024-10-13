@@ -9,3 +9,7 @@ bot.log
 
 # Database file
 bot.db
+
+# All config files except for the default
+config/*
+!config/default.json

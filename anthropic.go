@@ -8,23 +8,31 @@ import (
 )
 
 func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Message, isNewChat, isAdminOrOwner bool) (string, error) {
+	// Use prompts from config
 	var systemMessage string
 	if isNewChat {
-		systemMessage = "You are a helpful AI assistant."
+		systemMessage = b.config.SystemPrompts["new_chat"]
 	} else {
-		systemMessage = "Continue the conversation."
+		systemMessage = b.config.SystemPrompts["continue_conversation"]
 	}
 
+	// Combine default prompt with custom instructions
+	systemMessage = b.config.SystemPrompts["default"] + " " + b.config.SystemPrompts["custom_instructions"] + " " + systemMessage
+
 	if !isAdminOrOwner {
-		systemMessage += " Avoid discussing sensitive topics or providing harmful information."
+		systemMessage += " " + b.config.SystemPrompts["avoid_sensitive"]
 	}
 
 	// Ensure the roles are correct
 	for i := range messages {
-		if messages[i].Role == "user" {
+		switch messages[i].Role {
+		case anthropic.RoleUser:
 			messages[i].Role = anthropic.RoleUser
-		} else if messages[i].Role == "assistant" {
+		case anthropic.RoleAssistant:
 			messages[i].Role = anthropic.RoleAssistant
+		default:
+			// Default to 'user' if role is unrecognized
+			messages[i].Role = anthropic.RoleUser
 		}
 	}
 
