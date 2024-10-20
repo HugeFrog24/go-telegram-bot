@@ -3,25 +3,28 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/liushuangls/go-anthropic/v2"
 )
 
 func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Message, isNewChat, isAdminOrOwner, isEmojiOnly bool) (string, error) {
-	// Use prompts from config
-	var systemMessage string
-	if isNewChat {
-		systemMessage = b.config.SystemPrompts["new_chat"]
-	} else {
-		systemMessage = b.config.SystemPrompts["continue_conversation"]
-	}
+	systemMessage := b.config.SystemPrompts["default"]
 
-	// Combine default prompt with custom instructions
-	systemMessage = b.config.SystemPrompts["default"] + " " + b.config.SystemPrompts["custom_instructions"] + " " + systemMessage
+	systemMessage += " " + b.config.SystemPrompts["custom_instructions"]
 
 	if !isAdminOrOwner {
 		systemMessage += " " + b.config.SystemPrompts["avoid_sensitive"]
 	}
+
+	if isNewChat {
+		systemMessage += "\n\n" + b.config.SystemPrompts["new_chat"]
+		log.Printf("New chat detected, appending greeting: %s", b.config.SystemPrompts["new_chat"])
+	} else {
+		systemMessage += " " + b.config.SystemPrompts["continue_conversation"]
+	}
+
+	log.Printf("Final system message: %s", systemMessage)
 
 	if isEmojiOnly {
 		systemMessage += " " + b.config.SystemPrompts["respond_with_emojis"]

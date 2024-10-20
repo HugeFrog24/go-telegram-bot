@@ -115,30 +115,26 @@ func (b *Bot) storeMessage(message Message) error {
 }
 
 func (b *Bot) getOrCreateChatMemory(chatID int64) *ChatMemory {
-	b.chatMemoriesMu.RLock()
+	b.chatMemoriesMu.Lock()
+	defer b.chatMemoriesMu.Unlock()
+
 	chatMemory, exists := b.chatMemories[chatID]
-	b.chatMemoriesMu.RUnlock()
-
 	if !exists {
-		b.chatMemoriesMu.Lock()
-		// Double-check to prevent race condition
-		chatMemory, exists = b.chatMemories[chatID]
-		if !exists {
-			var messages []Message
-			b.db.Where("chat_id = ? AND bot_id = ?", chatID, b.botID).
-				Order("timestamp asc").
-				Limit(b.memorySize * 2).
-				Find(&messages)
-
-			chatMemory = &ChatMemory{
-				Messages: messages,
-				Size:     b.memorySize * 2,
-			}
-
-			b.chatMemories[chatID] = chatMemory
+		chatMemory = &ChatMemory{
+			Messages: make([]Message, 0, b.memorySize*2),
+			Size:     b.memorySize * 2,
 		}
-		b.chatMemoriesMu.Unlock()
+		b.chatMemories[chatID] = chatMemory
 	}
+
+	// Load messages from the database
+	var messages []Message
+	b.db.Where("chat_id = ? AND bot_id = ?", chatID, b.botID).
+		Order("timestamp asc").
+		Limit(chatMemory.Size).
+		Find(&messages)
+
+	chatMemory.Messages = messages
 
 	return chatMemory
 }
@@ -182,7 +178,10 @@ func (b *Bot) prepareContextMessages(chatMemory *ChatMemory) []anthropic.Message
 
 func (b *Bot) isNewChat(chatID int64) bool {
 	var count int64
-	b.db.Model(&Message{}).Where("chat_id = ? AND bot_id = ?", chatID, b.botID).Count(&count)
+	b.db.Model(&Message{}).
+		Where("chat_id = ? AND bot_id = ?", chatID, b.botID).
+		Count(&count)
+	log.Printf("isNewChat: chatID=%d, message count=%d", chatID, count)
 	return count == 1
 }
 

@@ -64,7 +64,6 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 
 	// Proceed only if the message contains text
 	if text == "" {
-		// Optionally, handle other message types or ignore
 		log.Printf("Received a non-text message from user %d in chat %d", userID, chatID)
 		return
 	}
@@ -75,16 +74,20 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		return
 	}
 
+	// 1. Create the user message
 	userMessage := b.createMessage(chatID, userID, username, user.Role.Name, text, true)
-	userMessage.UserRole = string(anthropic.RoleUser) // Convert to string
+	userMessage.UserRole = string(anthropic.RoleUser)
+
+	// 2. Store the message
 	b.storeMessage(userMessage)
 
+	// 3. Retrieve or create chat memory (now includes the current message)
 	chatMemory := b.getOrCreateChatMemory(chatID)
-	b.addMessageToChatMemory(chatMemory, userMessage)
 
+	// 4. Prepare context messages
 	contextMessages := b.prepareContextMessages(chatMemory)
 
-	isEmojiOnly := isOnlyEmojis(text) // Ensure you have this variable defined
+	isEmojiOnly := isOnlyEmojis(text)
 	response, err := b.getAnthropicResponse(ctx, contextMessages, b.isNewChat(chatID), b.isAdminOrOwner(userID), isEmojiOnly)
 	if err != nil {
 		log.Printf("Error getting Anthropic response: %v", err)
@@ -95,7 +98,9 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 
 	assistantMessage := b.createMessage(chatID, 0, "", string(anthropic.RoleAssistant), response, false)
 	b.storeMessage(assistantMessage)
-	b.addMessageToChatMemory(chatMemory, assistantMessage)
+	// Since the assistant's message is also stored, it will be included in the chat memory during the next update
+
+	// Optionally, you can avoid adding messages to chatMemory manually
 }
 
 func (b *Bot) sendRateLimitExceededMessage(ctx context.Context, chatID int64, businessConnectionID string) {
