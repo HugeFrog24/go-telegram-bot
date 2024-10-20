@@ -22,15 +22,24 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		return
 	}
 
-	chatID := message.Chat.ID
-	userID := message.From.ID
-
 	// Extract businessConnectionID if available
 	var businessConnectionID string
 	if update.BusinessConnection != nil {
 		businessConnectionID = update.BusinessConnection.ID
 	} else if message.BusinessConnectionID != "" {
 		businessConnectionID = message.BusinessConnectionID
+	}
+
+	chatID := message.Chat.ID
+	userID := message.From.ID
+	username := message.From.Username
+	text := message.Text
+
+	// Pass the incoming message through the centralized screen for storage
+	_, err := b.screenIncomingMessage(message)
+	if err != nil {
+		log.Printf("Error storing user message: %v", err)
+		return
 	}
 
 	// Check if the message is a command
@@ -40,7 +49,10 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 				command := strings.TrimSpace(message.Text[entity.Offset : entity.Offset+entity.Length])
 				switch command {
 				case "/stats":
-					b.sendStats(ctx, chatID, businessConnectionID)
+					b.sendStats(ctx, chatID, userID, username, businessConnectionID)
+					return
+				case "/whoami":
+					b.sendWhoAmI(ctx, chatID, userID, username, businessConnectionID)
 					return
 				}
 			}
@@ -53,59 +65,71 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		return
 	}
 
-	// Existing rate limit and message handling
+	// Rate limit check
 	if !b.checkRateLimits(userID) {
 		b.sendRateLimitExceededMessage(ctx, chatID, businessConnectionID)
 		return
 	}
 
-	username := message.From.Username
-	text := message.Text
-
 	// Proceed only if the message contains text
 	if text == "" {
-		// Optionally, handle other message types or ignore
 		log.Printf("Received a non-text message from user %d in chat %d", userID, chatID)
 		return
 	}
 
-	user, err := b.getOrCreateUser(userID, username)
+	// Determine if the user is the owner
+	var isOwner bool
+	err = b.db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", userID, b.botID, true).First(&User{}).Error
+	if err == nil {
+		isOwner = true
+	}
+
+	user, err := b.getOrCreateUser(userID, username, isOwner)
 	if err != nil {
 		log.Printf("Error getting or creating user: %v", err)
 		return
 	}
 
-	userMessage := b.createMessage(chatID, userID, username, user.Role.Name, text, true)
-	userMessage.UserRole = string(anthropic.RoleUser) // Convert to string
-	b.storeMessage(userMessage)
+	// Update the username if it's empty or has changed
+	if user.Username != username {
+		user.Username = username
+		if err := b.db.Save(&user).Error; err != nil {
+			log.Printf("Error updating user username: %v", err)
+		}
+	}
 
+	// Determine if the text contains only emojis
+	isEmojiOnly := isOnlyEmojis(text)
+
+	// Prepare context messages for Anthropic
 	chatMemory := b.getOrCreateChatMemory(chatID)
-	b.addMessageToChatMemory(chatMemory, userMessage)
-
+	b.addMessageToChatMemory(chatMemory, b.createMessage(chatID, userID, username, user.Role.Name, text, true))
 	contextMessages := b.prepareContextMessages(chatMemory)
 
-	isEmojiOnly := isOnlyEmojis(text) // Ensure you have this variable defined
-	response, err := b.getAnthropicResponse(ctx, contextMessages, b.isNewChat(chatID), b.isAdminOrOwner(userID), isEmojiOnly)
+	// Get response from Anthropic
+	response, err := b.getAnthropicResponse(ctx, contextMessages, b.isNewChat(chatID), isOwner, isEmojiOnly)
 	if err != nil {
 		log.Printf("Error getting Anthropic response: %v", err)
 		response = "I'm sorry, I'm having trouble processing your request right now."
 	}
 
-	b.sendResponse(ctx, chatID, response, businessConnectionID)
-
-	assistantMessage := b.createMessage(chatID, 0, "", string(anthropic.RoleAssistant), response, false)
-	b.storeMessage(assistantMessage)
-	b.addMessageToChatMemory(chatMemory, assistantMessage)
+	// Send the response through the centralized screen
+	if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
+		log.Printf("Error sending response: %v", err)
+		return
+	}
 }
 
 func (b *Bot) sendRateLimitExceededMessage(ctx context.Context, chatID int64, businessConnectionID string) {
-	b.sendResponse(ctx, chatID, "Rate limit exceeded. Please try again later.", businessConnectionID)
+	if err := b.sendResponse(ctx, chatID, "Rate limit exceeded. Please try again later.", businessConnectionID); err != nil {
+		log.Printf("Error sending rate limit exceeded message: %v", err)
+	}
 }
 
 func (b *Bot) handleStickerMessage(ctx context.Context, chatID, userID int64, message *models.Message, businessConnectionID string) {
 	username := message.From.Username
 
-	// Create and store the sticker message
+	// Create the user message (without storing it manually)
 	userMessage := b.createMessage(chatID, userID, username, "user", "Sent a sticker.", true)
 	userMessage.StickerFileID = message.Sticker.FileID
 
@@ -114,9 +138,7 @@ func (b *Bot) handleStickerMessage(ctx context.Context, chatID, userID int64, me
 		userMessage.StickerPNGFile = message.Sticker.Thumbnail.FileID
 	}
 
-	b.storeMessage(userMessage)
-
-	// Update chat memory
+	// Update chat memory with the user message
 	chatMemory := b.getOrCreateChatMemory(chatID)
 	b.addMessageToChatMemory(chatMemory, userMessage)
 
@@ -134,11 +156,11 @@ func (b *Bot) handleStickerMessage(ctx context.Context, chatID, userID int64, me
 		}
 	}
 
-	b.sendResponse(ctx, chatID, response, businessConnectionID)
-
-	assistantMessage := b.createMessage(chatID, 0, "", string(anthropic.RoleAssistant), response, false)
-	b.storeMessage(assistantMessage)
-	b.addMessageToChatMemory(chatMemory, assistantMessage)
+	// Send the response through the centralized screen
+	if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
+		log.Printf("Error sending response: %v", err)
+		return
+	}
 }
 
 func (b *Bot) generateStickerResponse(ctx context.Context, message Message) (string, error) {

@@ -24,9 +24,6 @@ func main() {
 		log.Printf("Error loading .env file: %v", err)
 	}
 
-	// Check for required environment variables
-	checkRequiredEnvVars()
-
 	// Initialize database
 	db, err := initDB()
 	if err != nil {
@@ -52,13 +49,23 @@ func main() {
 		go func(cfg BotConfig) {
 			defer wg.Done()
 
-			// Create Bot instance with RealClock
+			// Create Bot instance without TelegramClient initially
 			realClock := RealClock{}
-			bot, err := NewBot(db, cfg, realClock)
+			bot, err := NewBot(db, cfg, realClock, nil)
 			if err != nil {
 				log.Printf("Error creating bot %s: %v", cfg.ID, err)
 				return
 			}
+
+			// Initialize TelegramClient with the bot's handleUpdate method
+			tgClient, err := initTelegramBot(cfg.TelegramToken, bot.handleUpdate)
+			if err != nil {
+				log.Printf("Error initializing Telegram client for bot %s: %v", cfg.ID, err)
+				return
+			}
+
+			// Assign the TelegramClient to the bot
+			bot.tgBot = tgClient
 
 			// Start the bot
 			log.Printf("Starting bot %s...", cfg.ID)
@@ -78,13 +85,4 @@ func initLogger() (*os.File, error) {
 	mw := io.MultiWriter(os.Stdout, logFile)
 	log.SetOutput(mw)
 	return logFile, nil
-}
-
-func checkRequiredEnvVars() {
-	requiredEnvVars := []string{"ANTHROPIC_API_KEY"}
-	for _, envVar := range requiredEnvVars {
-		if os.Getenv(envVar) == "" {
-			log.Fatalf("%s environment variable is not set", envVar)
-		}
-	}
 }

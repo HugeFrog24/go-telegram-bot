@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -17,7 +16,7 @@ import (
 )
 
 type Bot struct {
-	tgBot           *bot.Bot
+	tgBot           TelegramClient
 	db              *gorm.DB
 	anthropicClient *anthropic.Client
 	chatMemories    map[int64]*ChatMemory
@@ -30,7 +29,8 @@ type Bot struct {
 	botID           uint // Reference to BotModel.ID
 }
 
-func NewBot(db *gorm.DB, config BotConfig, clock Clock) (*Bot, error) {
+// NewBot initializes and returns a new Bot instance.
+func NewBot(db *gorm.DB, config BotConfig, clock Clock, tgClient TelegramClient) (*Bot, error) {
 	// Retrieve or create Bot entry in the database
 	var botEntry BotModel
 	err := db.Where("identifier = ?", config.ID).First(&botEntry).Error
@@ -43,7 +43,38 @@ func NewBot(db *gorm.DB, config BotConfig, clock Clock) (*Bot, error) {
 		return nil, err
 	}
 
-	anthropicClient := anthropic.NewClient(os.Getenv("ANTHROPIC_API_KEY"))
+	// Ensure the owner exists in the Users table
+	var owner User
+	err = db.Where("telegram_id = ? AND bot_id = ?", config.OwnerTelegramID, botEntry.ID).First(&owner).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		// Assign the "owner" role
+		var ownerRole Role
+		err := db.Where("name = ?", "owner").First(&ownerRole).Error
+		if err != nil {
+			return nil, fmt.Errorf("owner role not found: %w", err)
+		}
+
+		owner = User{
+			BotID:      botEntry.ID,
+			TelegramID: config.OwnerTelegramID,
+			Username:   "", // Initialize as empty; will be updated upon interaction
+			RoleID:     ownerRole.ID,
+			IsOwner:    true,
+		}
+
+		if err := db.Create(&owner).Error; err != nil {
+			// If unique constraint is violated, another owner already exists
+			if strings.Contains(err.Error(), "unique index") {
+				return nil, fmt.Errorf("an owner already exists for this bot")
+			}
+			return nil, fmt.Errorf("failed to create owner user: %w", err)
+		}
+	} else if err != nil {
+		return nil, err
+	}
+
+	// Use the per-bot Anthropic API key
+	anthropicClient := anthropic.NewClient(config.AnthropicAPIKey)
 
 	b := &Bot{
 		db:              db,
@@ -54,39 +85,78 @@ func NewBot(db *gorm.DB, config BotConfig, clock Clock) (*Bot, error) {
 		userLimiters:    make(map[int64]*userLimiter),
 		clock:           clock,
 		botID:           botEntry.ID, // Ensure BotModel has ID field
+		tgBot:           tgClient,
 	}
-
-	tgBot, err := initTelegramBot(config.TelegramToken, b.handleUpdate)
-	if err != nil {
-		return nil, err
-	}
-	b.tgBot = tgBot
 
 	return b, nil
 }
 
+// Start begins the bot's operation.
 func (b *Bot) Start(ctx context.Context) {
 	b.tgBot.Start(ctx)
 }
 
-func (b *Bot) getOrCreateUser(userID int64, username string) (User, error) {
+func (b *Bot) getOrCreateUser(userID int64, username string, isOwner bool) (User, error) {
 	var user User
-	err := b.db.Preload("Role").Where("telegram_id = ?", userID).First(&user).Error
+	err := b.db.Preload("Role").Where("telegram_id = ? AND bot_id = ?", userID, b.botID).First(&user).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			var defaultRole Role
-			if err := b.db.Where("name = ?", "user").First(&defaultRole).Error; err != nil {
-				return User{}, err
+			// Check if an owner already exists for this bot
+			if isOwner {
+				var existingOwner User
+				err := b.db.Where("bot_id = ? AND is_owner = ?", b.botID, true).First(&existingOwner).Error
+				if err == nil {
+					return User{}, fmt.Errorf("an owner already exists for this bot")
+				} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+					return User{}, fmt.Errorf("failed to check existing owner: %w", err)
+				}
 			}
-			user = User{TelegramID: userID, Username: username, RoleID: defaultRole.ID}
+
+			var role Role
+			var roleName string
+			if isOwner {
+				roleName = "owner"
+			} else {
+				roleName = "user" // Assign "user" role to non-owner users
+			}
+
+			err := b.db.Where("name = ?", roleName).First(&role).Error
+			if err != nil {
+				return User{}, fmt.Errorf("failed to get role: %w", err)
+			}
+
+			user = User{
+				BotID:      b.botID,
+				TelegramID: userID,
+				Username:   username,
+				RoleID:     role.ID,
+				Role:       role,
+				IsOwner:    isOwner,
+			}
+
 			if err := b.db.Create(&user).Error; err != nil {
-				return User{}, err
+				// If unique constraint is violated, another owner already exists
+				if strings.Contains(err.Error(), "unique index") {
+					return User{}, fmt.Errorf("an owner already exists for this bot")
+				}
+				return User{}, fmt.Errorf("failed to create user: %w", err)
 			}
 		} else {
 			return User{}, err
 		}
+	} else {
+		if isOwner && !user.IsOwner {
+			return User{}, fmt.Errorf("cannot change existing user to owner")
+		}
 	}
+
 	return user, nil
+}
+
+func (b *Bot) getRoleByName(roleName string) (Role, error) {
+	var role Role
+	err := b.db.Where("name = ?", roleName).First(&role).Error
+	return role, err
 }
 
 func (b *Bot) createMessage(chatID, userID int64, username, userRole, text string, isUser bool) Message {
@@ -195,17 +265,28 @@ func (b *Bot) isAdminOrOwner(userID int64) bool {
 	return user.Role.Name == "admin" || user.Role.Name == "owner"
 }
 
-func initTelegramBot(token string, handleUpdate func(ctx context.Context, tgBot *bot.Bot, update *models.Update)) (*bot.Bot, error) {
+func initTelegramBot(token string, handleUpdate func(ctx context.Context, tgBot *bot.Bot, update *models.Update)) (TelegramClient, error) {
 	opts := []bot.Option{
 		bot.WithDefaultHandler(handleUpdate),
 	}
 
-	return bot.New(token, opts...)
+	tgBot, err := bot.New(token, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	return tgBot, nil
 }
 
-// sendResponse sends a message to the specified chat.
-// Returns an error if sending the message fails.
 func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, businessConnectionID string) error {
+	// Pass the outgoing message through the centralized screen for storage
+	_, err := b.screenOutgoingMessage(chatID, text, businessConnectionID)
+	if err != nil {
+		log.Printf("Error storing assistant message: %v", err)
+		return err
+	}
+
+	// Prepare message parameters
 	params := &bot.SendMessageParams{
 		ChatID: chatID,
 		Text:   text,
@@ -215,7 +296,8 @@ func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, busin
 		params.BusinessConnectionID = businessConnectionID
 	}
 
-	_, err := b.tgBot.SendMessage(ctx, params)
+	// Send the message via Telegram client
+	_, err = b.tgBot.SendMessage(ctx, params)
 	if err != nil {
 		log.Printf("[%s] [ERROR] Error sending message to chat %d with BusinessConnectionID %s: %v",
 			b.config.ID, chatID, businessConnectionID, err)
@@ -225,16 +307,29 @@ func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, busin
 }
 
 // sendStats sends the bot statistics to the specified chat.
-func (b *Bot) sendStats(ctx context.Context, chatID int64, businessConnectionID string) {
+func (b *Bot) sendStats(ctx context.Context, chatID int64, userID int64, username string, businessConnectionID string) {
 	totalUsers, totalMessages, err := b.getStats()
 	if err != nil {
 		fmt.Printf("Error fetching stats: %v\n", err)
-		b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve the stats at this time.", businessConnectionID)
+		if err := b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve the stats at this time.", businessConnectionID); err != nil {
+			log.Printf("Error sending response: %v", err)
+		}
 		return
 	}
 
-	statsMessage := fmt.Sprintf("📊 **Bot Statistics:**\n\n- Total Users: %d\n- Total Messages: %d", totalUsers, totalMessages)
-	b.sendResponse(ctx, chatID, statsMessage, businessConnectionID)
+	// Do NOT manually escape hyphens here
+	statsMessage := fmt.Sprintf(
+		"📊 Bot Statistics:\n\n"+
+			"- Total Users: %d\n"+
+			"- Total Messages: %d",
+		totalUsers,
+		totalMessages,
+	)
+
+	// Send the response through the centralized screen
+	if err := b.sendResponse(ctx, chatID, statsMessage, businessConnectionID); err != nil {
+		log.Printf("Error sending stats message: %v", err)
+	}
 }
 
 // getStats retrieves the total number of users and messages from the database.
@@ -270,4 +365,78 @@ func isEmoji(r rune) bool {
 		(r >= 0x1F680 && r <= 0x1F6FF) || // Transport and Map
 		(r >= 0x2600 && r <= 0x26FF) || // Misc symbols
 		(r >= 0x2700 && r <= 0x27BF) // Dingbats
+}
+
+func (b *Bot) sendWhoAmI(ctx context.Context, chatID int64, userID int64, username string, businessConnectionID string) {
+	user, err := b.getOrCreateUser(userID, username, false)
+	if err != nil {
+		log.Printf("Error getting or creating user: %v", err)
+		if err := b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve your information.", businessConnectionID); err != nil {
+			log.Printf("Error sending response: %v", err)
+		}
+		return
+	}
+
+	role, err := b.getRoleByName(user.Role.Name)
+	if err != nil {
+		log.Printf("Error getting role by name: %v", err)
+		if err := b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve your role information.", businessConnectionID); err != nil {
+			log.Printf("Error sending response: %v", err)
+		}
+		return
+	}
+
+	whoAmIMessage := fmt.Sprintf(
+		"👤 Your Information:\n\n"+
+			"- Username: %s\n"+
+			"- Role: %s",
+		user.Username,
+		role.Name,
+	)
+
+	// Send the response through the centralized screen
+	if err := b.sendResponse(ctx, chatID, whoAmIMessage, businessConnectionID); err != nil {
+		log.Printf("Error sending /whoami message: %v", err)
+	}
+}
+
+// screenIncomingMessage handles storing of incoming messages.
+func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
+	userRole := string(anthropic.RoleUser) // Convert RoleUser to string
+	userMessage := b.createMessage(message.Chat.ID, message.From.ID, message.From.Username, userRole, message.Text, true)
+
+	// If the message contains a sticker, include its details.
+	if message.Sticker != nil {
+		userMessage.StickerFileID = message.Sticker.FileID
+		if message.Sticker.Thumbnail != nil {
+			userMessage.StickerPNGFile = message.Sticker.Thumbnail.FileID
+		}
+	}
+
+	// Store the message.
+	if err := b.storeMessage(userMessage); err != nil {
+		return Message{}, err
+	}
+
+	// Update chat memory.
+	chatMemory := b.getOrCreateChatMemory(message.Chat.ID)
+	b.addMessageToChatMemory(chatMemory, userMessage)
+
+	return userMessage, nil
+}
+
+// screenOutgoingMessage handles storing of outgoing messages.
+func (b *Bot) screenOutgoingMessage(chatID int64, response string, businessConnectionID string) (Message, error) {
+	assistantMessage := b.createMessage(chatID, 0, "", string(anthropic.RoleAssistant), response, false)
+
+	// Store the message.
+	if err := b.storeMessage(assistantMessage); err != nil {
+		return Message{}, err
+	}
+
+	// Update chat memory.
+	chatMemory := b.getOrCreateChatMemory(chatID)
+	b.addMessageToChatMemory(chatMemory, assistantMessage)
+
+	return assistantMessage, nil
 }

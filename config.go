@@ -18,6 +18,9 @@ type BotConfig struct {
 	TempBanDuration string            `json:"temp_ban_duration"`
 	Model           anthropic.Model   `json:"model"` // Changed from string to anthropic.Model
 	SystemPrompts   map[string]string `json:"system_prompts"`
+	Active          bool              `json:"active"` // New field to control bot activity
+	OwnerTelegramID int64             `json:"owner_telegram_id"`
+	AnthropicAPIKey string            `json:"anthropic_api_key"` // Add this line
 }
 
 // Custom unmarshalling to handle anthropic.Model
@@ -54,6 +57,12 @@ func loadAllConfigs(dir string) ([]BotConfig, error) {
 			config, err := loadConfig(configPath)
 			if err != nil {
 				return nil, fmt.Errorf("failed to load config %s: %w", configPath, err)
+			}
+
+			// Skip inactive bots
+			if !config.Active {
+				fmt.Printf("Skipping inactive bot: %s\n", config.ID)
+				continue
 			}
 
 			// Validate that ID is present
