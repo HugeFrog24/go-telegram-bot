@@ -11,35 +11,63 @@ import (
 )
 
 func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.Update) {
-	if update.Message == nil {
+	var message *models.Message
+
+	if update.Message != nil {
+		message = update.Message
+	} else if update.BusinessMessage != nil {
+		message = update.BusinessMessage
+	} else {
+		// No message to process
 		return
 	}
 
-	chatID := update.Message.Chat.ID
-	userID := update.Message.From.ID
+	chatID := message.Chat.ID
+	userID := message.From.ID
+
+	// Extract businessConnectionID if available
+	var businessConnectionID string
+	if update.BusinessConnection != nil {
+		businessConnectionID = update.BusinessConnection.ID
+	} else if message.BusinessConnectionID != "" {
+		businessConnectionID = message.BusinessConnectionID
+	}
 
 	// Check if the message is a command
-	if update.Message.Entities != nil {
-		for _, entity := range update.Message.Entities {
+	if message.Entities != nil {
+		for _, entity := range message.Entities {
 			if entity.Type == "bot_command" {
-				command := strings.TrimSpace(update.Message.Text[entity.Offset : entity.Offset+entity.Length])
+				command := strings.TrimSpace(message.Text[entity.Offset : entity.Offset+entity.Length])
 				switch command {
 				case "/stats":
-					b.sendStats(ctx, chatID)
+					b.sendStats(ctx, chatID, businessConnectionID)
 					return
 				}
 			}
 		}
 	}
 
-	// Existing rate limit and message handling
-	if !b.checkRateLimits(userID) {
-		b.sendRateLimitExceededMessage(ctx, chatID)
+	// Check if the message contains a sticker
+	if message.Sticker != nil {
+		b.handleStickerMessage(ctx, chatID, userID, message, businessConnectionID)
 		return
 	}
 
-	username := update.Message.From.Username
-	text := update.Message.Text
+	// Existing rate limit and message handling
+	if !b.checkRateLimits(userID) {
+		b.sendRateLimitExceededMessage(ctx, chatID, businessConnectionID)
+		return
+	}
+
+	username := message.From.Username
+	text := message.Text
+
+	// Proceed only if the message contains text
+	if text == "" {
+		// Optionally, handle other message types or ignore
+		log.Printf("Received a non-text message from user %d in chat %d", userID, chatID)
+		return
+	}
 
 	user, err := b.getOrCreateUser(userID, username)
 	if err != nil {
@@ -56,19 +84,84 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 
 	contextMessages := b.prepareContextMessages(chatMemory)
 
-	response, err := b.getAnthropicResponse(ctx, contextMessages, b.isNewChat(chatID), b.isAdminOrOwner(userID))
+	isEmojiOnly := isOnlyEmojis(text) // Ensure you have this variable defined
+	response, err := b.getAnthropicResponse(ctx, contextMessages, b.isNewChat(chatID), b.isAdminOrOwner(userID), isEmojiOnly)
 	if err != nil {
 		log.Printf("Error getting Anthropic response: %v", err)
 		response = "I'm sorry, I'm having trouble processing your request right now."
 	}
 
-	b.sendResponse(ctx, chatID, response)
+	b.sendResponse(ctx, chatID, response, businessConnectionID)
 
 	assistantMessage := b.createMessage(chatID, 0, "", string(anthropic.RoleAssistant), response, false)
 	b.storeMessage(assistantMessage)
 	b.addMessageToChatMemory(chatMemory, assistantMessage)
 }
 
-func (b *Bot) sendRateLimitExceededMessage(ctx context.Context, chatID int64) {
-	b.sendResponse(ctx, chatID, "Rate limit exceeded. Please try again later.")
+func (b *Bot) sendRateLimitExceededMessage(ctx context.Context, chatID int64, businessConnectionID string) {
+	b.sendResponse(ctx, chatID, "Rate limit exceeded. Please try again later.", businessConnectionID)
+}
+
+func (b *Bot) handleStickerMessage(ctx context.Context, chatID, userID int64, message *models.Message, businessConnectionID string) {
+	username := message.From.Username
+
+	// Create and store the sticker message
+	userMessage := b.createMessage(chatID, userID, username, "user", "Sent a sticker.", true)
+	userMessage.StickerFileID = message.Sticker.FileID
+
+	// Safely store the Thumbnail's FileID if available
+	if message.Sticker.Thumbnail != nil {
+		userMessage.StickerPNGFile = message.Sticker.Thumbnail.FileID
+	}
+
+	b.storeMessage(userMessage)
+
+	// Update chat memory
+	chatMemory := b.getOrCreateChatMemory(chatID)
+	b.addMessageToChatMemory(chatMemory, userMessage)
+
+	// Generate AI response about the sticker
+	response, err := b.generateStickerResponse(ctx, userMessage)
+	if err != nil {
+		log.Printf("Error generating sticker response: %v", err)
+		// Provide a fallback dynamic response based on sticker type
+		if message.Sticker.IsAnimated {
+			response = "Wow, that's a cool animated sticker!"
+		} else if message.Sticker.IsVideo {
+			response = "Interesting video sticker!"
+		} else {
+			response = "That's a cool sticker!"
+		}
+	}
+
+	b.sendResponse(ctx, chatID, response, businessConnectionID)
+
+	assistantMessage := b.createMessage(chatID, 0, "", string(anthropic.RoleAssistant), response, false)
+	b.storeMessage(assistantMessage)
+	b.addMessageToChatMemory(chatMemory, assistantMessage)
+}
+
+func (b *Bot) generateStickerResponse(ctx context.Context, message Message) (string, error) {
+	// Example: Use the sticker type to generate a response
+	if message.StickerFileID != "" {
+		// Prepare context with information about the sticker
+		contextMessages := []anthropic.Message{
+			{
+				Role: anthropic.RoleUser,
+				Content: []anthropic.MessageContent{
+					anthropic.NewTextMessageContent("User sent a sticker."),
+				},
+			},
+		}
+
+		// Since this is a sticker message, isEmojiOnly is false
+		response, err := b.getAnthropicResponse(ctx, contextMessages, false, false, false)
+		if err != nil {
+			return "", err
+		}
+
+		return response, nil
+	}
+
+	return "Hmm, that's interesting!", nil
 }

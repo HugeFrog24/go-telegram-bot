@@ -5,16 +5,37 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/liushuangls/go-anthropic/v2"
 )
 
 type BotConfig struct {
-	ID              string            `json:"id"` // Unique identifier for the bot
+	ID              string            `json:"id"`             // Unique identifier for the bot
+	TelegramToken   string            `json:"telegram_token"` // Telegram Bot Token
 	MemorySize      int               `json:"memory_size"`
 	MessagePerHour  int               `json:"messages_per_hour"`
 	MessagePerDay   int               `json:"messages_per_day"`
 	TempBanDuration string            `json:"temp_ban_duration"`
+	Model           anthropic.Model   `json:"model"` // Changed from string to anthropic.Model
 	SystemPrompts   map[string]string `json:"system_prompts"`
-	TelegramToken   string            `json:"telegram_token"` // Telegram Bot Token
+}
+
+// Custom unmarshalling to handle anthropic.Model
+func (c *BotConfig) UnmarshalJSON(data []byte) error {
+	type Alias BotConfig
+	aux := &struct {
+		Model string `json:"model"`
+		*Alias
+	}{
+		Alias: (*Alias)(c),
+	}
+
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	c.Model = anthropic.Model(aux.Model)
+	return nil
 }
 
 func loadAllConfigs(dir string) ([]BotConfig, error) {
@@ -57,6 +78,11 @@ func loadAllConfigs(dir string) ([]BotConfig, error) {
 			}
 			tokens[config.TelegramToken] = true
 
+			// Validate Model
+			if config.Model == "" {
+				return nil, fmt.Errorf("config %s is missing 'model' field", configPath)
+			}
+
 			configs = append(configs, config)
 		}
 	}
@@ -77,14 +103,6 @@ func loadConfig(filename string) (BotConfig, error) {
 		return config, fmt.Errorf("failed to decode JSON from %s: %w", filename, err)
 	}
 
-	// Optionally override telegram_token with environment variable if set
-	// Uncomment the following lines if you choose to use environment variables for tokens
-	/*
-	   if envToken := os.Getenv(fmt.Sprintf("TELEGRAM_TOKEN_%s", config.ID)); envToken != "" {
-	       config.TelegramToken = envToken
-	   }
-	*/
-
 	return config, nil
 }
 
@@ -99,6 +117,9 @@ func (c *BotConfig) Reload(filename string) error {
 	if err := decoder.Decode(c); err != nil {
 		return fmt.Errorf("failed to decode JSON from %s: %w", filename, err)
 	}
+
+	// Ensure the Model is correctly casted
+	c.Model = anthropic.Model(c.Model)
 
 	return nil
 }

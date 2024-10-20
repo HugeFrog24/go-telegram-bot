@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -162,10 +163,17 @@ func (b *Bot) prepareContextMessages(chatMemory *ChatMemory) []anthropic.Message
 		if !msg.IsUser {
 			role = anthropic.RoleAssistant
 		}
+
+		textContent := strings.TrimSpace(msg.Text)
+		if textContent == "" {
+			// Skip empty messages
+			continue
+		}
+
 		contextMessages = append(contextMessages, anthropic.Message{
 			Role: role,
 			Content: []anthropic.MessageContent{
-				anthropic.NewTextMessageContent(msg.Text),
+				anthropic.NewTextMessageContent(textContent),
 			},
 		})
 	}
@@ -196,27 +204,37 @@ func initTelegramBot(token string, handleUpdate func(ctx context.Context, tgBot 
 }
 
 // sendResponse sends a message to the specified chat.
-func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string) {
-	_, err := b.tgBot.SendMessage(ctx, &bot.SendMessageParams{
+// Returns an error if sending the message fails.
+func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, businessConnectionID string) error {
+	params := &bot.SendMessageParams{
 		ChatID: chatID,
 		Text:   text,
-	})
-	if err != nil {
-		log.Printf("[%s] [ERROR] Error sending message: %v", b.config.ID, err)
 	}
+
+	if businessConnectionID != "" {
+		params.BusinessConnectionID = businessConnectionID
+	}
+
+	_, err := b.tgBot.SendMessage(ctx, params)
+	if err != nil {
+		log.Printf("[%s] [ERROR] Error sending message to chat %d with BusinessConnectionID %s: %v",
+			b.config.ID, chatID, businessConnectionID, err)
+		return err
+	}
+	return nil
 }
 
 // sendStats sends the bot statistics to the specified chat.
-func (b *Bot) sendStats(ctx context.Context, chatID int64) {
+func (b *Bot) sendStats(ctx context.Context, chatID int64, businessConnectionID string) {
 	totalUsers, totalMessages, err := b.getStats()
 	if err != nil {
 		fmt.Printf("Error fetching stats: %v\n", err)
-		b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve the stats at this time.")
+		b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve the stats at this time.", businessConnectionID)
 		return
 	}
 
 	statsMessage := fmt.Sprintf("📊 **Bot Statistics:**\n\n- Total Users: %d\n- Total Messages: %d", totalUsers, totalMessages)
-	b.sendResponse(ctx, chatID, statsMessage)
+	b.sendResponse(ctx, chatID, statsMessage, businessConnectionID)
 }
 
 // getStats retrieves the total number of users and messages from the database.
@@ -232,4 +250,24 @@ func (b *Bot) getStats() (int64, int64, error) {
 	}
 
 	return totalUsers, totalMessages, nil
+}
+
+// isOnlyEmojis checks if the string consists solely of emojis.
+func isOnlyEmojis(s string) bool {
+	for _, r := range s {
+		if !isEmoji(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// isEmoji determines if a rune is an emoji.
+// This is a simplistic check and can be expanded based on requirements.
+func isEmoji(r rune) bool {
+	return (r >= 0x1F600 && r <= 0x1F64F) || // Emoticons
+		(r >= 0x1F300 && r <= 0x1F5FF) || // Misc Symbols and Pictographs
+		(r >= 0x1F680 && r <= 0x1F6FF) || // Transport and Map
+		(r >= 0x2600 && r <= 0x26FF) || // Misc symbols
+		(r >= 0x2700 && r <= 0x27BF) // Dingbats
 }

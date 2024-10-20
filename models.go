@@ -28,19 +28,22 @@ type ConfigModel struct {
 
 type Message struct {
 	gorm.Model
-	BotID     uint
-	ChatID    int64
-	UserID    int64
-	Username  string
-	UserRole  string
-	Text      string
-	Timestamp time.Time
-	IsUser    bool
+	BotID          uint
+	ChatID         int64
+	UserID         int64
+	Username       string
+	UserRole       string
+	Text           string
+	StickerFileID  string `json:"sticker_file_id,omitempty"`  // New field to store Sticker File ID
+	StickerPNGFile string `json:"sticker_png_file,omitempty"` // Optionally store PNG file ID if needed
+	Timestamp      time.Time
+	IsUser         bool
 }
 
 type ChatMemory struct {
-	Messages []Message
-	Size     int
+	Messages             []Message
+	Size                 int
+	BusinessConnectionID string // New field to store the business connection ID
 }
 
 type Role struct {

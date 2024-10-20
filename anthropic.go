@@ -7,7 +7,7 @@ import (
 	"github.com/liushuangls/go-anthropic/v2"
 )
 
-func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Message, isNewChat, isAdminOrOwner bool) (string, error) {
+func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Message, isNewChat, isAdminOrOwner, isEmojiOnly bool) (string, error) {
 	// Use prompts from config
 	var systemMessage string
 	if isNewChat {
@@ -23,6 +23,10 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Mes
 		systemMessage += " " + b.config.SystemPrompts["avoid_sensitive"]
 	}
 
+	if isEmojiOnly {
+		systemMessage += " " + b.config.SystemPrompts["respond_with_emojis"]
+	}
+
 	// Ensure the roles are correct
 	for i := range messages {
 		switch messages[i].Role {
@@ -36,13 +40,10 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Mes
 		}
 	}
 
-	model := anthropic.ModelClaude3Dot5Sonnet20240620
-	if !isAdminOrOwner {
-		model = anthropic.ModelClaudeInstant1Dot2
-	}
+	model := anthropic.Model(b.config.Model)
 
 	resp, err := b.anthropicClient.CreateMessages(ctx, anthropic.MessagesRequest{
-		Model:     model,
+		Model:     model, // Now `model` is of type anthropic.Model
 		Messages:  messages,
 		System:    systemMessage,
 		MaxTokens: 1000,
