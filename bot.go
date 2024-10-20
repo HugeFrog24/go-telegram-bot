@@ -203,13 +203,10 @@ func initTelegramBot(token string, handleUpdate func(ctx context.Context, tgBot 
 	return bot.New(token, opts...)
 }
 
-// sendResponse sends a message to the specified chat.
-// Returns an error if sending the message fails.
 func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, businessConnectionID string) error {
 	params := &bot.SendMessageParams{
-		ChatID:    chatID,
-		Text:      text,
-		ParseMode: models.ParseModeMarkdown,
+		ChatID: chatID,
+		Text:   text,
 	}
 
 	if businessConnectionID != "" {
@@ -236,9 +233,9 @@ func (b *Bot) sendStats(ctx context.Context, chatID int64, userID int64, usernam
 
 	// Do NOT manually escape hyphens here
 	statsMessage := fmt.Sprintf(
-		"📊 *Bot Statistics:*\n\n"+
-			"\\- Total Users: %d\n"+
-			"\\- Total Messages: %d",
+		"📊 Bot Statistics:\n\n"+
+			"- Total Users: %d\n"+
+			"- Total Messages: %d",
 		totalUsers,
 		totalMessages,
 	)
