@@ -40,7 +40,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 				command := strings.TrimSpace(message.Text[entity.Offset : entity.Offset+entity.Length])
 				switch command {
 				case "/stats":
-					b.sendStats(ctx, chatID, businessConnectionID)
+					b.sendStats(ctx, chatID, userID, message.From.Username, businessConnectionID)
 					return
 				}
 			}

@@ -1,4 +1,4 @@
-module github.com/HugeFrog24/thatsky-telegram-bot
+module github.com/HugeFrog24/go-telegram-bot
 
 go 1.23.2
 

@@ -24,6 +24,7 @@ type ConfigModel struct {
 	TempBanDuration string `json:"temp_ban_duration"`
 	SystemPrompts   string `json:"system_prompts"` // Consider JSON string or separate table
 	TelegramToken   string `json:"telegram_token"`
+	Active          bool   `json:"active"`
 }
 
 type Message struct {

@@ -207,8 +207,9 @@ func initTelegramBot(token string, handleUpdate func(ctx context.Context, tgBot 
 // Returns an error if sending the message fails.
 func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, businessConnectionID string) error {
 	params := &bot.SendMessageParams{
-		ChatID: chatID,
-		Text:   text,
+		ChatID:    chatID,
+		Text:      text,
+		ParseMode: models.ParseModeMarkdown,
 	}
 
 	if businessConnectionID != "" {
@@ -225,7 +226,7 @@ func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, busin
 }
 
 // sendStats sends the bot statistics to the specified chat.
-func (b *Bot) sendStats(ctx context.Context, chatID int64, businessConnectionID string) {
+func (b *Bot) sendStats(ctx context.Context, chatID int64, userID int64, username string, businessConnectionID string) {
 	totalUsers, totalMessages, err := b.getStats()
 	if err != nil {
 		fmt.Printf("Error fetching stats: %v\n", err)
@@ -233,8 +234,29 @@ func (b *Bot) sendStats(ctx context.Context, chatID int64, businessConnectionID 
 		return
 	}
 
-	statsMessage := fmt.Sprintf("📊 **Bot Statistics:**\n\n- Total Users: %d\n- Total Messages: %d", totalUsers, totalMessages)
-	b.sendResponse(ctx, chatID, statsMessage, businessConnectionID)
+	// Do NOT manually escape hyphens here
+	statsMessage := fmt.Sprintf(
+		"📊 *Bot Statistics:*\n\n"+
+			"\\- Total Users: %d\n"+
+			"\\- Total Messages: %d",
+		totalUsers,
+		totalMessages,
+	)
+
+	// Store the user's /stats command
+	userMessage := b.createMessage(chatID, userID, username, "user", "/stats", true)
+	if err := b.storeMessage(userMessage); err != nil {
+		log.Printf("Error storing user message: %v", err)
+	}
+
+	// Send and store the bot's response
+	if err := b.sendResponse(ctx, chatID, statsMessage, businessConnectionID); err != nil {
+		log.Printf("Error sending stats message: %v", err)
+	}
+	assistantMessage := b.createMessage(chatID, 0, "", "assistant", statsMessage, false)
+	if err := b.storeMessage(assistantMessage); err != nil {
+		log.Printf("Error storing assistant message: %v", err)
+	}
 }
 
 // getStats retrieves the total number of users and messages from the database.
