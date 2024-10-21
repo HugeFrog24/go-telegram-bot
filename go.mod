@@ -1,6 +1,6 @@
 module github.com/HugeFrog24/go-telegram-bot
 
-go 1.23.2
+go 1.23
 
 require (
 	github.com/go-telegram/bot v1.9.0
