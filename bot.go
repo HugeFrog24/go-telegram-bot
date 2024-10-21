@@ -226,7 +226,9 @@ func (b *Bot) sendStats(ctx context.Context, chatID int64, userID int64, usernam
 	totalUsers, totalMessages, err := b.getStats()
 	if err != nil {
 		fmt.Printf("Error fetching stats: %v\n", err)
-		b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve the stats at this time.", businessConnectionID)
+		if err := b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve the stats at this time.", businessConnectionID); err != nil {
+			log.Printf("Error sending failure response: %v", err)
+		}
 		return
 	}
 
@@ -248,6 +250,7 @@ func (b *Bot) sendStats(ctx context.Context, chatID int64, userID int64, usernam
 	// Send and store the bot's response
 	if err := b.sendResponse(ctx, chatID, statsMessage, businessConnectionID); err != nil {
 		log.Printf("Error sending stats message: %v", err)
+		return
 	}
 	assistantMessage := b.createMessage(chatID, 0, "", "assistant", statsMessage, false)
 	if err := b.storeMessage(assistantMessage); err != nil {
