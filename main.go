@@ -71,7 +71,7 @@ func main() {
 }
 
 func initLogger() (*os.File, error) {
-	logFile, err := os.OpenFile("bot.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	logFile, err := os.OpenFile("bot.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, err
 	}
