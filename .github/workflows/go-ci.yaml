@@ -54,12 +54,3 @@ jobs:
         uses: securego/gosec@master
         with:
           args: ./...
-
-      # Upload Test Coverage to Codecov
-      - name: Upload Coverage to Codecov
-        uses: codecov/codecov-action@v3
-        with:
-          files: coverage.out
-          flags: unittests
-          name: codecov-umbrella
-          fail_ci_if_error: true
