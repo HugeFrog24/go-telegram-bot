@@ -99,7 +99,7 @@ func loadAllConfigs(dir string) ([]BotConfig, error) {
 
 func loadConfig(filename string) (BotConfig, error) {
 	var config BotConfig
-	file, err := os.Open(filename)
+	file, err := os.Open(filepath.Clean(filename))
 	if err != nil {
 		return config, fmt.Errorf("failed to open config file %s: %w", filename, err)
 	}
@@ -114,7 +114,7 @@ func loadConfig(filename string) (BotConfig, error) {
 }
 
 func (c *BotConfig) Reload(filename string) error {
-	file, err := os.Open(filename)
+	file, err := os.Open(filepath.Clean(filename))
 	if err != nil {
 		return fmt.Errorf("failed to open config file %s: %w", filename, err)
 	}
