@@ -4,8 +4,8 @@ vendor/
 # Environment variables
 .env
 
-# Log file
-bot.log
+# Any log files
+*.log
 
 # Database file
 bot.db
