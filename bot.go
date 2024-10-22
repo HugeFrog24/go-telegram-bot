@@ -32,7 +32,7 @@ type Bot struct {
 	botID           uint // Reference to BotModel.ID
 }
 
-// bot.go
+// NewBot initializes and returns a new Bot instance.
 func NewBot(db *gorm.DB, config BotConfig, clock Clock, tgClient TelegramClient) (*Bot, error) {
 	// Retrieve or create Bot entry in the database
 	var botEntry BotModel
@@ -94,6 +94,7 @@ func NewBot(db *gorm.DB, config BotConfig, clock Clock, tgClient TelegramClient)
 	return b, nil
 }
 
+// Start begins the bot's operation.
 func (b *Bot) Start(ctx context.Context) {
 	b.tgBot.Start(ctx)
 }
@@ -281,6 +282,14 @@ func initTelegramBot(token string, handleUpdate func(ctx context.Context, tgBot 
 }
 
 func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, businessConnectionID string) error {
+	// Pass the outgoing message through the centralized screen for storage
+	_, err := b.screenOutgoingMessage(chatID, text, businessConnectionID)
+	if err != nil {
+		log.Printf("Error storing assistant message: %v", err)
+		return err
+	}
+
+	// Prepare message parameters
 	params := &bot.SendMessageParams{
 		ChatID: chatID,
 		Text:   text,
@@ -290,7 +299,8 @@ func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, busin
 		params.BusinessConnectionID = businessConnectionID
 	}
 
-	_, err := b.tgBot.SendMessage(ctx, params)
+	// Send the message via Telegram client
+	_, err = b.tgBot.SendMessage(ctx, params)
 	if err != nil {
 		log.Printf("[%s] [ERROR] Error sending message to chat %d with BusinessConnectionID %s: %v",
 			b.config.ID, chatID, businessConnectionID, err)
@@ -319,19 +329,9 @@ func (b *Bot) sendStats(ctx context.Context, chatID int64, userID int64, usernam
 		totalMessages,
 	)
 
-	// Store the user's /stats command
-	userMessage := b.createMessage(chatID, userID, username, "user", "/stats", true)
-	if err := b.storeMessage(userMessage); err != nil {
-		log.Printf("Error storing user message: %v", err)
-	}
-
-	// Send and store the bot's response
+	// Send the response through the centralized screen
 	if err := b.sendResponse(ctx, chatID, statsMessage, businessConnectionID); err != nil {
 		log.Printf("Error sending stats message: %v", err)
-	}
-	assistantMessage := b.createMessage(chatID, 0, "", "assistant", statsMessage, false)
-	if err := b.storeMessage(assistantMessage); err != nil {
-		log.Printf("Error storing assistant message: %v", err)
 	}
 }
 
@@ -389,19 +389,49 @@ func (b *Bot) sendWhoAmI(ctx context.Context, chatID int64, userID int64, userna
 		caser.String(user.Role.Name),
 	)
 
-	// Store the user's /whoami command
-	userMessage := b.createMessage(chatID, userID, username, "user", "/whoami", true)
-	if err := b.storeMessage(userMessage); err != nil {
-		log.Printf("Error storing user message: %v", err)
-	}
-
-	// Send and store the bot's response
+	// Send the response through the centralized screen
 	if err := b.sendResponse(ctx, chatID, whoAmIMessage, businessConnectionID); err != nil {
 		log.Printf("Error sending /whoami message: %v", err)
 	}
-	assistantMessage := b.createMessage(chatID, 0, "", "assistant", whoAmIMessage, false)
-	if err := b.storeMessage(assistantMessage); err != nil {
-		log.Printf("Error storing assistant message: %v", err)
+}
+
+// screenIncomingMessage handles storing of incoming messages.
+func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
+	userRole := string(anthropic.RoleUser) // Convert RoleUser to string
+	userMessage := b.createMessage(message.Chat.ID, message.From.ID, message.From.Username, userRole, message.Text, true)
+
+	// If the message contains a sticker, include its details.
+	if message.Sticker != nil {
+		userMessage.StickerFileID = message.Sticker.FileID
+		if message.Sticker.Thumbnail != nil {
+			userMessage.StickerPNGFile = message.Sticker.Thumbnail.FileID
+		}
 	}
-	b.addMessageToChatMemory(b.getOrCreateChatMemory(chatID), assistantMessage)
+
+	// Store the message.
+	if err := b.storeMessage(userMessage); err != nil {
+		return Message{}, err
+	}
+
+	// Update chat memory.
+	chatMemory := b.getOrCreateChatMemory(message.Chat.ID)
+	b.addMessageToChatMemory(chatMemory, userMessage)
+
+	return userMessage, nil
+}
+
+// screenOutgoingMessage handles storing of outgoing messages.
+func (b *Bot) screenOutgoingMessage(chatID int64, response string, businessConnectionID string) (Message, error) {
+	assistantMessage := b.createMessage(chatID, 0, "", string(anthropic.RoleAssistant), response, false)
+
+	// Store the message.
+	if err := b.storeMessage(assistantMessage); err != nil {
+		return Message{}, err
+	}
+
+	// Update chat memory.
+	chatMemory := b.getOrCreateChatMemory(chatID)
+	b.addMessageToChatMemory(chatMemory, assistantMessage)
+
+	return assistantMessage, nil
 }
