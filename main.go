@@ -25,7 +25,7 @@ func main() {
 	}
 
 	// Check for required environment variables
-	checkRequiredEnvVars()
+	// checkRequiredEnvVars()
 
 	// Initialize database
 	db, err := initDB()

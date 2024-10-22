@@ -20,6 +20,7 @@ type BotConfig struct {
 	SystemPrompts   map[string]string `json:"system_prompts"`
 	Active          bool              `json:"active"` // New field to control bot activity
 	OwnerTelegramID int64             `json:"owner_telegram_id"`
+	AnthropicAPIKey string            `json:"anthropic_api_key"` // Add this line
 }
 
 // Custom unmarshalling to handle anthropic.Model
