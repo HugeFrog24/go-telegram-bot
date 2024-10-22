@@ -3,6 +3,7 @@
     "active": false,
     "telegram_token": "YOUR_TELEGRAM_BOT_TOKEN",
     "owner_telegram_id": 111111111,
+    "anthropic_api_key": "YOUR_SPECIFIC_ANTHROPIC_API_KEY",
     "memory_size": 10,
     "messages_per_hour": 20,
     "messages_per_day": 100,

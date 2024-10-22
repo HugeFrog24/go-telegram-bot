@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -76,8 +75,8 @@ func NewBot(db *gorm.DB, config BotConfig, clock Clock, tgClient TelegramClient)
 		return nil, err
 	}
 
-	// Initialize Anthropic client
-	anthropicClient := anthropic.NewClient(os.Getenv("ANTHROPIC_API_KEY"))
+     // Use the per-bot Anthropic API key
+     anthropicClient := anthropic.NewClient(config.AnthropicAPIKey)
 
 	b := &Bot{
 		db:              db,
