@@ -27,10 +27,14 @@ func initDB() (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
+	// AutoMigrate with unique constraint for owners
 	err = db.AutoMigrate(&BotModel{}, &ConfigModel{}, &Message{}, &User{}, &Role{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to migrate database schema: %w", err)
 	}
+
+	// Add unique index for owners per bot
+	db.SetupJoinTable(&BotModel{}, "Users", &User{})
 
 	err = createDefaultRoles(db)
 	if err != nil {

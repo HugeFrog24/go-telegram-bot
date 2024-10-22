@@ -43,6 +43,33 @@ func NewBot(db *gorm.DB, config BotConfig, clock Clock) (*Bot, error) {
 		return nil, err
 	}
 
+	// Ensure the owner exists in the Users table
+	var owner User
+	err = db.Where("telegram_id = ? AND bot_id = ?", config.OwnerTelegramID, botEntry.ID).First(&owner).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		// Assign the "owner" role
+		var ownerRole Role
+		err := db.Where("name = ?", "owner").First(&ownerRole).Error
+		if err != nil {
+			return nil, fmt.Errorf("owner role not found: %w", err)
+		}
+
+		owner = User{
+			BotID:      botEntry.ID,
+			TelegramID: config.OwnerTelegramID,
+			Username:   "Owner", // You might want to fetch the actual username
+			RoleID:     ownerRole.ID,
+			IsOwner:    true,
+		}
+
+		if err := db.Create(&owner).Error; err != nil {
+			return nil, fmt.Errorf("failed to create owner user: %w", err)
+		}
+	} else if err != nil {
+		return nil, err
+	}
+
+	// Initialize Anthropic client
 	anthropicClient := anthropic.NewClient(os.Getenv("ANTHROPIC_API_KEY"))
 
 	b := &Bot{
@@ -69,24 +96,68 @@ func (b *Bot) Start(ctx context.Context) {
 	b.tgBot.Start(ctx)
 }
 
-func (b *Bot) getOrCreateUser(userID int64, username string) (User, error) {
+func (b *Bot) getOrCreateUser(userID int64, username string, isOwner bool) (User, error) {
 	var user User
-	err := b.db.Preload("Role").Where("telegram_id = ?", userID).First(&user).Error
+	err := b.db.Preload("Role").Where("telegram_id = ? AND bot_id = ?", userID, b.botID).First(&user).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			var defaultRole Role
-			if err := b.db.Where("name = ?", "user").First(&defaultRole).Error; err != nil {
-				return User{}, err
+			var role Role
+			if isOwner {
+				role, err = b.getRoleByName("owner")
+				if err != nil {
+					return User{}, err
+				}
+			} else {
+				role, err = b.getRoleByName("admin")
+				if err != nil {
+					return User{}, err
+				}
 			}
-			user = User{TelegramID: userID, Username: username, RoleID: defaultRole.ID}
+
+			user = User{
+				BotID:      b.botID,
+				TelegramID: userID,
+				Username:   username,
+				RoleID:     role.ID,
+				IsOwner:    isOwner,
+			}
+
 			if err := b.db.Create(&user).Error; err != nil {
 				return User{}, err
 			}
 		} else {
 			return User{}, err
 		}
+	} else {
+		if isOwner && !user.IsOwner {
+			// Check if another owner exists
+			var existingOwner User
+			err := b.db.Where("bot_id = ? AND is_owner = ?", b.botID, true).First(&existingOwner).Error
+			if err == nil {
+				return User{}, fmt.Errorf("a bot can have only one owner")
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return User{}, err
+			}
+			// Promote to owner
+			user.Role, err = b.getRoleByName("owner")
+			if err != nil {
+				return User{}, err
+			}
+			user.RoleID = user.Role.ID
+			user.IsOwner = true
+			if err := b.db.Save(&user).Error; err != nil {
+				return User{}, err
+			}
+		}
 	}
+
 	return user, nil
+}
+
+func (b *Bot) getRoleByName(roleName string) (Role, error) {
+	var role Role
+	err := b.db.Where("name = ?", roleName).First(&role).Error
+	return role, err
 }
 
 func (b *Bot) createMessage(chatID, userID int64, username, userRole, text string, isUser bool) Message {

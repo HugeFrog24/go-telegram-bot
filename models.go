@@ -11,7 +11,7 @@ type BotModel struct {
 	Identifier string `gorm:"uniqueIndex"` // Renamed from ID to Identifier
 	Name       string
 	Configs    []ConfigModel `gorm:"foreignKey:BotID;constraint:OnDelete:CASCADE"`
-	Users      []User        `gorm:"foreignKey:BotID;constraint:OnDelete:CASCADE"` // Added foreign key
+	Users      []User        `gorm:"foreignKey:BotID;constraint:OnDelete:CASCADE"` // Associated users
 	Messages   []Message     `gorm:"foreignKey:BotID;constraint:OnDelete:CASCADE"`
 }
 
@@ -54,9 +54,10 @@ type Role struct {
 
 type User struct {
 	gorm.Model
-	BotID      uint  `gorm:"index"`       // Added foreign key to BotModel
-	TelegramID int64 `gorm:"uniqueIndex"` // Consider composite unique index if TelegramID is unique per Bot
+	BotID      uint  `gorm:"index"`                // Foreign key to BotModel
+	TelegramID int64 `gorm:"uniqueIndex;not null"` // Unique per user
 	Username   string
 	RoleID     uint
 	Role       Role `gorm:"foreignKey:RoleID"`
+	IsOwner    bool `gorm:"default:false"` // Indicates if the user is the owner
 }

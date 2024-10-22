@@ -69,7 +69,14 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		return
 	}
 
-	user, err := b.getOrCreateUser(userID, username)
+	// Determine if the user is the owner
+	var isOwner bool
+	err := b.db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", userID, b.botID, true).First(&User{}).Error
+	if err == nil {
+		isOwner = true
+	}
+
+	user, err := b.getOrCreateUser(userID, username, isOwner)
 	if err != nil {
 		log.Printf("Error getting or creating user: %v", err)
 		return
@@ -84,8 +91,8 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 
 	contextMessages := b.prepareContextMessages(chatMemory)
 
-	isEmojiOnly := isOnlyEmojis(text) // Ensure you have this variable defined
-	response, err := b.getAnthropicResponse(ctx, contextMessages, b.isNewChat(chatID), b.isAdminOrOwner(userID), isEmojiOnly)
+	isEmojiOnly := isOnlyEmojis(text)
+	response, err := b.getAnthropicResponse(ctx, contextMessages, b.isNewChat(chatID), isOwner, isEmojiOnly)
 	if err != nil {
 		log.Printf("Error getting Anthropic response: %v", err)
 		response = "I'm sorry, I'm having trouble processing your request right now."

@@ -22,6 +22,7 @@ func TestCheckRateLimits(t *testing.T) {
 		TempBanDuration: "1m", // Temporary ban duration of 1 minute for testing
 		SystemPrompts:   make(map[string]string),
 		TelegramToken:   "YOUR_TELEGRAM_BOT_TOKEN",
+		OwnerTelegramID: 123456789,
 	}
 
 	// Initialize the Bot with mock data and MockClock
