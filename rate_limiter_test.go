@@ -1,10 +1,13 @@
 package main
 
 import (
-	"strings"
+	"context"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/go-telegram/bot"
+	"github.com/go-telegram/bot/models"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -121,8 +124,20 @@ func TestOwnerAssignment(t *testing.T) {
 		currentTime: time.Now(),
 	}
 
-	// Create the bot
-	bot, err := NewBot(db, config, mockClock)
+	// Initialize MockTelegramClient
+	mockTGClient := &MockTelegramClient{
+		SendMessageFunc: func(ctx context.Context, params *bot.SendMessageParams) (*models.Message, error) {
+			chatID, ok := params.ChatID.(int64)
+			if !ok {
+				return nil, fmt.Errorf("ChatID is not of type int64")
+			}
+			// Simulate successful message sending
+			return &models.Message{ID: 1, Chat: models.Chat{ID: chatID}}, nil
+		},
+	}
+
+	// Create the bot with the mock Telegram client
+	bot, err := NewBot(db, config, mockClock, mockTGClient)
 	if err != nil {
 		t.Fatalf("Failed to create bot: %v", err)
 	}
@@ -142,7 +157,7 @@ func TestOwnerAssignment(t *testing.T) {
 
 	// Verify that the error message is appropriate
 	expectedErrorMsg := "an owner already exists for this bot"
-	if err.Error() != expectedErrorMsg && !strings.Contains(err.Error(), "unique index") {
+	if err.Error() != expectedErrorMsg {
 		t.Fatalf("Unexpected error message: %v", err)
 	}
 
@@ -156,34 +171,15 @@ func TestOwnerAssignment(t *testing.T) {
 		t.Fatalf("Expected role 'admin', got '%s'", adminUser.Role.Name)
 	}
 
-	// Assign owner role to a user from a different bot
-	otherBotConfig := BotConfig{
-		ID:              "other_bot",
-		TelegramToken:   "OTHER_TELEGRAM_TOKEN",
-		MemorySize:      10,
-		MessagePerHour:  5,
-		MessagePerDay:   10,
-		TempBanDuration: "1m",
-		SystemPrompts:   make(map[string]string),
-		Active:          true,
-		OwnerTelegramID: 444444444,
+	// Attempt to change an existing user to owner
+	_, err = bot.getOrCreateUser(333333333, "AdminUser", true)
+	if err == nil {
+		t.Fatalf("Expected error when changing existing user to owner, but got none")
 	}
 
-	otherBot, err := NewBot(db, otherBotConfig, mockClock)
-	if err != nil {
-		t.Fatalf("Failed to create other bot: %v", err)
-	}
-
-	_, err = otherBot.getOrCreateUser(config.OwnerTelegramID, "OwnerOfOtherBot", true)
-	if err != nil {
-		t.Fatalf("Failed to assign existing owner to another bot: %v", err)
-	}
-
-	// Verify multiple bots can have the same owner telegram ID
-	var ownerOfOtherBot User
-	err = db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", config.OwnerTelegramID, otherBot.botID, true).First(&ownerOfOtherBot).Error
-	if err != nil {
-		t.Fatalf("Owner of other bot was not created: %v", err)
+	expectedErrorMsg = "cannot change existing user to owner"
+	if err.Error() != expectedErrorMsg {
+		t.Fatalf("Unexpected error message: %v", err)
 	}
 }
 

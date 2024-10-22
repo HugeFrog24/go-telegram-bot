@@ -42,6 +42,9 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 				case "/stats":
 					b.sendStats(ctx, chatID, userID, message.From.Username, businessConnectionID)
 					return
+				case "/whoami":
+					b.sendWhoAmI(ctx, chatID, userID, message.From.Username, businessConnectionID)
+					return
 				}
 			}
 		}
@@ -82,6 +85,14 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		return
 	}
 
+	// Update the username if it's empty or has changed
+	if user.Username != username {
+		user.Username = username
+		if err := b.db.Save(&user).Error; err != nil {
+			log.Printf("Error updating user username: %v", err)
+		}
+	}
+
 	userMessage := b.createMessage(chatID, userID, username, user.Role.Name, text, true)
 	userMessage.UserRole = string(anthropic.RoleUser) // Convert to string
 	if err := b.storeMessage(userMessage); err != nil {
@@ -109,7 +120,6 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	assistantMessage := b.createMessage(chatID, 0, "", "assistant", response, false)
 	if err := b.storeMessage(assistantMessage); err != nil {
 		log.Printf("Error storing assistant message: %v", err)
-		return
 	}
 	b.addMessageToChatMemory(chatMemory, assistantMessage)
 }
