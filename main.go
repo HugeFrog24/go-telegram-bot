@@ -2,38 +2,28 @@ package main
 
 import (
 	"context"
-	"io"
-	"log"
 	"os"
 	"os/signal"
 	"sync"
-
-	"github.com/joho/godotenv"
 )
 
 func main() {
-	// Initialize logger
-	logFile, err := initLogger()
-	if err != nil {
-		log.Fatalf("Error initializing logger: %v", err)
-	}
-	defer logFile.Close()
+	// Initialize custom loggers
+	initLoggers()
 
-	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Printf("Error loading .env file: %v", err)
-	}
+	// Log the start of the application
+	InfoLogger.Println("Starting Telegram Bot Application")
 
 	// Initialize database
 	db, err := initDB()
 	if err != nil {
-		log.Fatalf("Error initializing database: %v", err)
+		ErrorLogger.Fatalf("Error initializing database: %v", err)
 	}
 
 	// Load all bot configurations
 	configs, err := loadAllConfigs("config")
 	if err != nil {
-		log.Fatalf("Error loading configurations: %v", err)
+		ErrorLogger.Fatalf("Error loading configurations: %v", err)
 	}
 
 	// Create a WaitGroup to manage goroutines
@@ -53,14 +43,14 @@ func main() {
 			realClock := RealClock{}
 			bot, err := NewBot(db, cfg, realClock, nil)
 			if err != nil {
-				log.Printf("Error creating bot %s: %v", cfg.ID, err)
+				ErrorLogger.Printf("Error creating bot %s: %v", cfg.ID, err)
 				return
 			}
 
 			// Initialize TelegramClient with the bot's handleUpdate method
 			tgClient, err := initTelegramBot(cfg.TelegramToken, bot.handleUpdate)
 			if err != nil {
-				log.Printf("Error initializing Telegram client for bot %s: %v", cfg.ID, err)
+				ErrorLogger.Printf("Error initializing Telegram client for bot %s: %v", cfg.ID, err)
 				return
 			}
 
@@ -68,21 +58,13 @@ func main() {
 			bot.tgBot = tgClient
 
 			// Start the bot
-			log.Printf("Starting bot %s...", cfg.ID)
+			InfoLogger.Printf("Starting bot %s...", cfg.ID)
 			bot.Start(ctx)
 		}(config)
 	}
 
 	// Wait for all bots to finish
 	wg.Wait()
-}
 
-func initLogger() (*os.File, error) {
-	logFile, err := os.OpenFile("bot.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		return nil, err
-	}
-	mw := io.MultiWriter(os.Stdout, logFile)
-	log.SetOutput(mw)
-	return logFile, nil
+	InfoLogger.Println("All bots have stopped. Exiting application.")
 }

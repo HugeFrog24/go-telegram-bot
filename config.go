@@ -61,7 +61,7 @@ func loadAllConfigs(dir string) ([]BotConfig, error) {
 
 			// Skip inactive bots
 			if !config.Active {
-				fmt.Printf("Skipping inactive bot: %s\n", config.ID)
+				InfoLogger.Printf("Skipping inactive bot: %s", config.ID)
 				continue
 			}
 

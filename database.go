@@ -56,8 +56,10 @@ func createDefaultRoles(db *gorm.DB) error {
 	for _, roleName := range roles {
 		var role Role
 		if err := db.FirstOrCreate(&role, Role{Name: roleName}).Error; err != nil {
+			ErrorLogger.Printf("Failed to create default role %s: %v", roleName, err)
 			return fmt.Errorf("failed to create default role %s: %w", roleName, err)
 		}
+		InfoLogger.Printf("Created or confirmed default role: %s", roleName)
 	}
 	return nil
 }

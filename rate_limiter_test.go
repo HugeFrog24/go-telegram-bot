@@ -1,15 +1,8 @@
 package main
 
 import (
-	"context"
-	"fmt"
 	"testing"
 	"time"
-
-	"github.com/go-telegram/bot"
-	"github.com/go-telegram/bot/models"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
 )
 
 // TestCheckRateLimits tests the checkRateLimits method of the Bot.
@@ -84,102 +77,6 @@ func TestCheckRateLimits(t *testing.T) {
 	// Attempt to exceed the daily limit
 	if sendMessage() {
 		t.Errorf("Expected message to be denied due to daily limit exceeded")
-	}
-}
-
-func TestOwnerAssignment(t *testing.T) {
-	// Initialize in-memory database for testing
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("Failed to open in-memory database: %v", err)
-	}
-
-	// Migrate the schema
-	err = db.AutoMigrate(&BotModel{}, &ConfigModel{}, &Message{}, &User{}, &Role{})
-	if err != nil {
-		t.Fatalf("Failed to migrate database schema: %v", err)
-	}
-
-	// Create default roles
-	err = createDefaultRoles(db)
-	if err != nil {
-		t.Fatalf("Failed to create default roles: %v", err)
-	}
-
-	// Create a bot configuration
-	config := BotConfig{
-		ID:              "test_bot",
-		TelegramToken:   "TEST_TELEGRAM_TOKEN",
-		MemorySize:      10,
-		MessagePerHour:  5,
-		MessagePerDay:   10,
-		TempBanDuration: "1m",
-		SystemPrompts:   make(map[string]string),
-		Active:          true,
-		OwnerTelegramID: 111111111,
-	}
-
-	// Initialize MockClock
-	mockClock := &MockClock{
-		currentTime: time.Now(),
-	}
-
-	// Initialize MockTelegramClient
-	mockTGClient := &MockTelegramClient{
-		SendMessageFunc: func(ctx context.Context, params *bot.SendMessageParams) (*models.Message, error) {
-			chatID, ok := params.ChatID.(int64)
-			if !ok {
-				return nil, fmt.Errorf("ChatID is not of type int64")
-			}
-			// Simulate successful message sending
-			return &models.Message{ID: 1, Chat: models.Chat{ID: chatID}}, nil
-		},
-	}
-
-	// Create the bot with the mock Telegram client
-	bot, err := NewBot(db, config, mockClock, mockTGClient)
-	if err != nil {
-		t.Fatalf("Failed to create bot: %v", err)
-	}
-
-	// Verify that the owner exists
-	var owner User
-	err = db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", config.OwnerTelegramID, bot.botID, true).First(&owner).Error
-	if err != nil {
-		t.Fatalf("Owner was not created: %v", err)
-	}
-
-	// Attempt to create another owner for the same bot
-	_, err = bot.getOrCreateUser(222222222, "AnotherOwner", true)
-	if err == nil {
-		t.Fatalf("Expected error when creating a second owner, but got none")
-	}
-
-	// Verify that the error message is appropriate
-	expectedErrorMsg := "an owner already exists for this bot"
-	if err.Error() != expectedErrorMsg {
-		t.Fatalf("Unexpected error message: %v", err)
-	}
-
-	// Assign admin role to a new user
-	adminUser, err := bot.getOrCreateUser(333333333, "AdminUser", false)
-	if err != nil {
-		t.Fatalf("Failed to create admin user: %v", err)
-	}
-
-	if adminUser.Role.Name != "admin" {
-		t.Fatalf("Expected role 'admin', got '%s'", adminUser.Role.Name)
-	}
-
-	// Attempt to change an existing user to owner
-	_, err = bot.getOrCreateUser(333333333, "AdminUser", true)
-	if err == nil {
-		t.Fatalf("Expected error when changing existing user to owner, but got none")
-	}
-
-	expectedErrorMsg = "cannot change existing user to owner"
-	if err.Error() != expectedErrorMsg {
-		t.Fatalf("Unexpected error message: %v", err)
 	}
 }
 

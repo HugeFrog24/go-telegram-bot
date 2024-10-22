@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -282,7 +281,7 @@ func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, busin
 	// Pass the outgoing message through the centralized screen for storage
 	_, err := b.screenOutgoingMessage(chatID, text, businessConnectionID)
 	if err != nil {
-		log.Printf("Error storing assistant message: %v", err)
+		ErrorLogger.Printf("Error storing assistant message: %v", err)
 		return err
 	}
 
@@ -299,7 +298,7 @@ func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, busin
 	// Send the message via Telegram client
 	_, err = b.tgBot.SendMessage(ctx, params)
 	if err != nil {
-		log.Printf("[%s] [ERROR] Error sending message to chat %d with BusinessConnectionID %s: %v",
+		ErrorLogger.Printf("[%s] Error sending message to chat %d with BusinessConnectionID %s: %v",
 			b.config.ID, chatID, businessConnectionID, err)
 		return err
 	}
@@ -310,9 +309,9 @@ func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, busin
 func (b *Bot) sendStats(ctx context.Context, chatID int64, userID int64, username string, businessConnectionID string) {
 	totalUsers, totalMessages, err := b.getStats()
 	if err != nil {
-		fmt.Printf("Error fetching stats: %v\n", err)
+		ErrorLogger.Printf("Error fetching stats: %v\n", err)
 		if err := b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve the stats at this time.", businessConnectionID); err != nil {
-			log.Printf("Error sending response: %v", err)
+			ErrorLogger.Printf("Error sending response: %v", err)
 		}
 		return
 	}
@@ -328,7 +327,7 @@ func (b *Bot) sendStats(ctx context.Context, chatID int64, userID int64, usernam
 
 	// Send the response through the centralized screen
 	if err := b.sendResponse(ctx, chatID, statsMessage, businessConnectionID); err != nil {
-		log.Printf("Error sending stats message: %v", err)
+		ErrorLogger.Printf("Error sending stats message: %v", err)
 	}
 }
 
@@ -370,18 +369,18 @@ func isEmoji(r rune) bool {
 func (b *Bot) sendWhoAmI(ctx context.Context, chatID int64, userID int64, username string, businessConnectionID string) {
 	user, err := b.getOrCreateUser(userID, username, false)
 	if err != nil {
-		log.Printf("Error getting or creating user: %v", err)
+		ErrorLogger.Printf("Error getting or creating user: %v", err)
 		if err := b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve your information.", businessConnectionID); err != nil {
-			log.Printf("Error sending response: %v", err)
+			ErrorLogger.Printf("Error sending response: %v", err)
 		}
 		return
 	}
 
 	role, err := b.getRoleByName(user.Role.Name)
 	if err != nil {
-		log.Printf("Error getting role by name: %v", err)
+		ErrorLogger.Printf("Error getting role by name: %v", err)
 		if err := b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve your role information.", businessConnectionID); err != nil {
-			log.Printf("Error sending response: %v", err)
+			ErrorLogger.Printf("Error sending response: %v", err)
 		}
 		return
 	}
@@ -396,7 +395,7 @@ func (b *Bot) sendWhoAmI(ctx context.Context, chatID int64, userID int64, userna
 
 	// Send the response through the centralized screen
 	if err := b.sendResponse(ctx, chatID, whoAmIMessage, businessConnectionID); err != nil {
-		log.Printf("Error sending /whoami message: %v", err)
+		ErrorLogger.Printf("Error sending /whoami message: %v", err)
 	}
 }
 
@@ -439,4 +438,28 @@ func (b *Bot) screenOutgoingMessage(chatID int64, response string, businessConne
 	b.addMessageToChatMemory(chatMemory, assistantMessage)
 
 	return assistantMessage, nil
+}
+
+func (b *Bot) promoteUserToAdmin(promoterID, userToPromoteID int64) error {
+	// Check if the promoter is an owner or admin
+	if !b.isAdminOrOwner(promoterID) {
+		return errors.New("only admins or owners can promote users to admin")
+	}
+
+	// Get the user to promote
+	userToPromote, err := b.getOrCreateUser(userToPromoteID, "", false)
+	if err != nil {
+		return err
+	}
+
+	// Get the admin role
+	var adminRole Role
+	if err := b.db.Where("name = ?", "admin").First(&adminRole).Error; err != nil {
+		return err
+	}
+
+	// Update the user's role
+	userToPromote.RoleID = adminRole.ID
+	userToPromote.Role = adminRole
+	return b.db.Save(&userToPromote).Error
 }

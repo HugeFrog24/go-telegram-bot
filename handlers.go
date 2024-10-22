@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"strings"
 
 	"github.com/go-telegram/bot"
@@ -38,7 +37,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	// Pass the incoming message through the centralized screen for storage
 	_, err := b.screenIncomingMessage(message)
 	if err != nil {
-		log.Printf("Error storing user message: %v", err)
+		ErrorLogger.Printf("Error storing user message: %v", err)
 		return
 	}
 
@@ -73,7 +72,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 
 	// Proceed only if the message contains text
 	if text == "" {
-		log.Printf("Received a non-text message from user %d in chat %d", userID, chatID)
+		InfoLogger.Printf("Received a non-text message from user %d in chat %d", userID, chatID)
 		return
 	}
 
@@ -86,7 +85,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 
 	user, err := b.getOrCreateUser(userID, username, isOwner)
 	if err != nil {
-		log.Printf("Error getting or creating user: %v", err)
+		ErrorLogger.Printf("Error getting or creating user: %v", err)
 		return
 	}
 
@@ -94,7 +93,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	if user.Username != username {
 		user.Username = username
 		if err := b.db.Save(&user).Error; err != nil {
-			log.Printf("Error updating user username: %v", err)
+			ErrorLogger.Printf("Error updating user username: %v", err)
 		}
 	}
 
@@ -109,20 +108,20 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	// Get response from Anthropic
 	response, err := b.getAnthropicResponse(ctx, contextMessages, b.isNewChat(chatID), isOwner, isEmojiOnly)
 	if err != nil {
-		log.Printf("Error getting Anthropic response: %v", err)
+		ErrorLogger.Printf("Error getting Anthropic response: %v", err)
 		response = "I'm sorry, I'm having trouble processing your request right now."
 	}
 
 	// Send the response through the centralized screen
 	if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
-		log.Printf("Error sending response: %v", err)
+		ErrorLogger.Printf("Error sending response: %v", err)
 		return
 	}
 }
 
 func (b *Bot) sendRateLimitExceededMessage(ctx context.Context, chatID int64, businessConnectionID string) {
 	if err := b.sendResponse(ctx, chatID, "Rate limit exceeded. Please try again later.", businessConnectionID); err != nil {
-		log.Printf("Error sending rate limit exceeded message: %v", err)
+		ErrorLogger.Printf("Error sending rate limit exceeded message: %v", err)
 	}
 }
 
@@ -145,7 +144,7 @@ func (b *Bot) handleStickerMessage(ctx context.Context, chatID, userID int64, me
 	// Generate AI response about the sticker
 	response, err := b.generateStickerResponse(ctx, userMessage)
 	if err != nil {
-		log.Printf("Error generating sticker response: %v", err)
+		ErrorLogger.Printf("Error generating sticker response: %v", err)
 		// Provide a fallback dynamic response based on sticker type
 		if message.Sticker.IsAnimated {
 			response = "Wow, that's a cool animated sticker!"
@@ -158,7 +157,7 @@ func (b *Bot) handleStickerMessage(ctx context.Context, chatID, userID int64, me
 
 	// Send the response through the centralized screen
 	if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
-		log.Printf("Error sending response: %v", err)
+		ErrorLogger.Printf("Error sending response: %v", err)
 		return
 	}
 }
