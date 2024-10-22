@@ -1,8 +1,12 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
+
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 // TestCheckRateLimits tests the checkRateLimits method of the Bot.
@@ -77,6 +81,109 @@ func TestCheckRateLimits(t *testing.T) {
 	// Attempt to exceed the daily limit
 	if sendMessage() {
 		t.Errorf("Expected message to be denied due to daily limit exceeded")
+	}
+}
+
+func TestOwnerAssignment(t *testing.T) {
+	// Initialize in-memory database for testing
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("Failed to open in-memory database: %v", err)
+	}
+
+	// Migrate the schema
+	err = db.AutoMigrate(&BotModel{}, &ConfigModel{}, &Message{}, &User{}, &Role{})
+	if err != nil {
+		t.Fatalf("Failed to migrate database schema: %v", err)
+	}
+
+	// Create default roles
+	err = createDefaultRoles(db)
+	if err != nil {
+		t.Fatalf("Failed to create default roles: %v", err)
+	}
+
+	// Create a bot configuration
+	config := BotConfig{
+		ID:              "test_bot",
+		TelegramToken:   "TEST_TELEGRAM_TOKEN",
+		MemorySize:      10,
+		MessagePerHour:  5,
+		MessagePerDay:   10,
+		TempBanDuration: "1m",
+		SystemPrompts:   make(map[string]string),
+		Active:          true,
+		OwnerTelegramID: 111111111,
+	}
+
+	// Initialize MockClock
+	mockClock := &MockClock{
+		currentTime: time.Now(),
+	}
+
+	// Create the bot
+	bot, err := NewBot(db, config, mockClock)
+	if err != nil {
+		t.Fatalf("Failed to create bot: %v", err)
+	}
+
+	// Verify that the owner exists
+	var owner User
+	err = db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", config.OwnerTelegramID, bot.botID, true).First(&owner).Error
+	if err != nil {
+		t.Fatalf("Owner was not created: %v", err)
+	}
+
+	// Attempt to create another owner for the same bot
+	_, err = bot.getOrCreateUser(222222222, "AnotherOwner", true)
+	if err == nil {
+		t.Fatalf("Expected error when creating a second owner, but got none")
+	}
+
+	// Verify that the error message is appropriate
+	expectedErrorMsg := "an owner already exists for this bot"
+	if err.Error() != expectedErrorMsg && !strings.Contains(err.Error(), "unique index") {
+		t.Fatalf("Unexpected error message: %v", err)
+	}
+
+	// Assign admin role to a new user
+	adminUser, err := bot.getOrCreateUser(333333333, "AdminUser", false)
+	if err != nil {
+		t.Fatalf("Failed to create admin user: %v", err)
+	}
+
+	if adminUser.Role.Name != "admin" {
+		t.Fatalf("Expected role 'admin', got '%s'", adminUser.Role.Name)
+	}
+
+	// Assign owner role to a user from a different bot
+	otherBotConfig := BotConfig{
+		ID:              "other_bot",
+		TelegramToken:   "OTHER_TELEGRAM_TOKEN",
+		MemorySize:      10,
+		MessagePerHour:  5,
+		MessagePerDay:   10,
+		TempBanDuration: "1m",
+		SystemPrompts:   make(map[string]string),
+		Active:          true,
+		OwnerTelegramID: 444444444,
+	}
+
+	otherBot, err := NewBot(db, otherBotConfig, mockClock)
+	if err != nil {
+		t.Fatalf("Failed to create other bot: %v", err)
+	}
+
+	_, err = otherBot.getOrCreateUser(config.OwnerTelegramID, "OwnerOfOtherBot", true)
+	if err != nil {
+		t.Fatalf("Failed to assign existing owner to another bot: %v", err)
+	}
+
+	// Verify multiple bots can have the same owner telegram ID
+	var ownerOfOtherBot User
+	err = db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", config.OwnerTelegramID, otherBot.botID, true).First(&ownerOfOtherBot).Error
+	if err != nil {
+		t.Fatalf("Owner of other bot was not created: %v", err)
 	}
 }
 

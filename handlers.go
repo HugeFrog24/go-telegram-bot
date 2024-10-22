@@ -84,7 +84,10 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 
 	userMessage := b.createMessage(chatID, userID, username, user.Role.Name, text, true)
 	userMessage.UserRole = string(anthropic.RoleUser) // Convert to string
-	b.storeMessage(userMessage)
+	if err := b.storeMessage(userMessage); err != nil {
+		log.Printf("Error storing user message: %v", err)
+		return
+	}
 
 	chatMemory := b.getOrCreateChatMemory(chatID)
 	b.addMessageToChatMemory(chatMemory, userMessage)
@@ -98,10 +101,16 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		response = "I'm sorry, I'm having trouble processing your request right now."
 	}
 
-	b.sendResponse(ctx, chatID, response, businessConnectionID)
+	if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
+		log.Printf("Error sending response: %v", err)
+		return
+	}
 
-	assistantMessage := b.createMessage(chatID, 0, "", string(anthropic.RoleAssistant), response, false)
-	b.storeMessage(assistantMessage)
+	assistantMessage := b.createMessage(chatID, 0, "", "assistant", response, false)
+	if err := b.storeMessage(assistantMessage); err != nil {
+		log.Printf("Error storing assistant message: %v", err)
+		return
+	}
 	b.addMessageToChatMemory(chatMemory, assistantMessage)
 }
 

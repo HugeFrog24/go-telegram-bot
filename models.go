@@ -61,3 +61,8 @@ type User struct {
 	Role       Role `gorm:"foreignKey:RoleID"`
 	IsOwner    bool `gorm:"default:false"` // Indicates if the user is the owner
 }
+
+// Compound unique index to ensure only one owner per bot
+func (User) TableName() string {
+	return "users"
+}

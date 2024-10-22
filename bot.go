@@ -63,6 +63,10 @@ func NewBot(db *gorm.DB, config BotConfig, clock Clock) (*Bot, error) {
 		}
 
 		if err := db.Create(&owner).Error; err != nil {
+			// If unique constraint is violated, another owner already exists
+			if strings.Contains(err.Error(), "unique index") {
+				return nil, fmt.Errorf("an owner already exists for this bot")
+			}
 			return nil, fmt.Errorf("failed to create owner user: %w", err)
 		}
 	} else if err != nil {
@@ -123,6 +127,10 @@ func (b *Bot) getOrCreateUser(userID int64, username string, isOwner bool) (User
 			}
 
 			if err := b.db.Create(&user).Error; err != nil {
+				// Handle unique constraint for owner
+				if isOwner && strings.Contains(err.Error(), "unique index") {
+					return User{}, fmt.Errorf("an owner already exists for this bot")
+				}
 				return User{}, err
 			}
 		} else {
@@ -139,11 +147,11 @@ func (b *Bot) getOrCreateUser(userID int64, username string, isOwner bool) (User
 				return User{}, err
 			}
 			// Promote to owner
-			user.Role, err = b.getRoleByName("owner")
+			role, err := b.getRoleByName("owner")
 			if err != nil {
 				return User{}, err
 			}
-			user.RoleID = user.Role.ID
+			user.RoleID = role.ID
 			user.IsOwner = true
 			if err := b.db.Save(&user).Error; err != nil {
 				return User{}, err
