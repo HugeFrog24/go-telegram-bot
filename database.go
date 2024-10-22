@@ -27,9 +27,20 @@ func initDB() (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
+	// AutoMigrate the models
 	err = db.AutoMigrate(&BotModel{}, &ConfigModel{}, &Message{}, &User{}, &Role{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to migrate database schema: %w", err)
+	}
+
+	// Enforce unique owner per bot using raw SQL
+	// Note: SQLite doesn't support partial indexes, but we can simulate it by making a unique index on (BotID, IsOwner)
+	// and ensuring that IsOwner can only be true for one user per BotID.
+	// This approach allows multiple users with IsOwner=false for the same BotID,
+	// but only one user can have IsOwner=true per BotID.
+	err = db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_owner ON users (bot_id, is_owner) WHERE is_owner = 1;`).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to create unique index for bot owners: %w", err)
 	}
 
 	err = createDefaultRoles(db)

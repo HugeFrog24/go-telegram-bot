@@ -19,6 +19,7 @@ type BotConfig struct {
 	Model           anthropic.Model   `json:"model"` // Changed from string to anthropic.Model
 	SystemPrompts   map[string]string `json:"system_prompts"`
 	Active          bool              `json:"active"` // New field to control bot activity
+	OwnerTelegramID int64             `json:"owner_telegram_id"`
 }
 
 // Custom unmarshalling to handle anthropic.Model

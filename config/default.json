@@ -2,6 +2,7 @@
     "id": "default_bot",
     "active": false,
     "telegram_token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "owner_telegram_id": 111111111,
     "memory_size": 10,
     "messages_per_hour": 20,
     "messages_per_day": 100,

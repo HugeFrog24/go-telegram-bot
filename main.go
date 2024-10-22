@@ -52,13 +52,23 @@ func main() {
 		go func(cfg BotConfig) {
 			defer wg.Done()
 
-			// Create Bot instance with RealClock
+			// Create Bot instance without TelegramClient initially
 			realClock := RealClock{}
-			bot, err := NewBot(db, cfg, realClock)
+			bot, err := NewBot(db, cfg, realClock, nil)
 			if err != nil {
 				log.Printf("Error creating bot %s: %v", cfg.ID, err)
 				return
 			}
+
+			// Initialize TelegramClient with the bot's handleUpdate method
+			tgClient, err := initTelegramBot(cfg.TelegramToken, bot.handleUpdate)
+			if err != nil {
+				log.Printf("Error initializing Telegram client for bot %s: %v", cfg.ID, err)
+				return
+			}
+
+			// Assign the TelegramClient to the bot
+			bot.tgBot = tgClient
 
 			// Start the bot
 			log.Printf("Starting bot %s...", cfg.ID)

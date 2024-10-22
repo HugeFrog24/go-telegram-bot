@@ -42,6 +42,9 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 				case "/stats":
 					b.sendStats(ctx, chatID, userID, message.From.Username, businessConnectionID)
 					return
+				case "/whoami":
+					b.sendWhoAmI(ctx, chatID, userID, message.From.Username, businessConnectionID)
+					return
 				}
 			}
 		}
@@ -69,32 +72,55 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		return
 	}
 
-	user, err := b.getOrCreateUser(userID, username)
+	// Determine if the user is the owner
+	var isOwner bool
+	err := b.db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", userID, b.botID, true).First(&User{}).Error
+	if err == nil {
+		isOwner = true
+	}
+
+	user, err := b.getOrCreateUser(userID, username, isOwner)
 	if err != nil {
 		log.Printf("Error getting or creating user: %v", err)
 		return
 	}
 
+	// Update the username if it's empty or has changed
+	if user.Username != username {
+		user.Username = username
+		if err := b.db.Save(&user).Error; err != nil {
+			log.Printf("Error updating user username: %v", err)
+		}
+	}
+
 	userMessage := b.createMessage(chatID, userID, username, user.Role.Name, text, true)
 	userMessage.UserRole = string(anthropic.RoleUser) // Convert to string
-	b.storeMessage(userMessage)
+	if err := b.storeMessage(userMessage); err != nil {
+		log.Printf("Error storing user message: %v", err)
+		return
+	}
 
 	chatMemory := b.getOrCreateChatMemory(chatID)
 	b.addMessageToChatMemory(chatMemory, userMessage)
 
 	contextMessages := b.prepareContextMessages(chatMemory)
 
-	isEmojiOnly := isOnlyEmojis(text) // Ensure you have this variable defined
-	response, err := b.getAnthropicResponse(ctx, contextMessages, b.isNewChat(chatID), b.isAdminOrOwner(userID), isEmojiOnly)
+	isEmojiOnly := isOnlyEmojis(text)
+	response, err := b.getAnthropicResponse(ctx, contextMessages, b.isNewChat(chatID), isOwner, isEmojiOnly)
 	if err != nil {
 		log.Printf("Error getting Anthropic response: %v", err)
 		response = "I'm sorry, I'm having trouble processing your request right now."
 	}
 
-	b.sendResponse(ctx, chatID, response, businessConnectionID)
+	if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
+		log.Printf("Error sending response: %v", err)
+		return
+	}
 
-	assistantMessage := b.createMessage(chatID, 0, "", string(anthropic.RoleAssistant), response, false)
-	b.storeMessage(assistantMessage)
+	assistantMessage := b.createMessage(chatID, 0, "", "assistant", response, false)
+	if err := b.storeMessage(assistantMessage); err != nil {
+		log.Printf("Error storing assistant message: %v", err)
+	}
 	b.addMessageToChatMemory(chatMemory, assistantMessage)
 }
 
