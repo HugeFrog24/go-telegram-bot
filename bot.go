@@ -304,7 +304,9 @@ func (b *Bot) sendStats(ctx context.Context, chatID int64, userID int64, usernam
 	totalUsers, totalMessages, err := b.getStats()
 	if err != nil {
 		fmt.Printf("Error fetching stats: %v\n", err)
-		b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve the stats at this time.", businessConnectionID)
+		if err := b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve the stats at this time.", businessConnectionID); err != nil {
+			log.Printf("Error sending response: %v", err)
+		}
 		return
 	}
 
@@ -372,7 +374,9 @@ func (b *Bot) sendWhoAmI(ctx context.Context, chatID int64, userID int64, userna
 	user, err := b.getOrCreateUser(userID, username, false)
 	if err != nil {
 		log.Printf("Error getting or creating user: %v", err)
-		b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve your information.", businessConnectionID)
+		if err := b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve your information.", businessConnectionID); err != nil {
+			log.Printf("Error sending response: %v", err)
+		}
 		return
 	}
 

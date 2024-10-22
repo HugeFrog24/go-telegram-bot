@@ -140,7 +140,9 @@ func (b *Bot) handleStickerMessage(ctx context.Context, chatID, userID int64, me
 		userMessage.StickerPNGFile = message.Sticker.Thumbnail.FileID
 	}
 
-	b.storeMessage(userMessage)
+	if err := b.storeMessage(userMessage); err != nil {
+		log.Printf("Error storing user message: %v", err)
+	}
 
 	// Update chat memory
 	chatMemory := b.getOrCreateChatMemory(chatID)
