@@ -58,8 +58,9 @@ func validateConfigPath(configDir, filename string) (string, error) {
 		return "", fmt.Errorf("failed to get absolute path for config file: %w", err)
 	}
 
-	// Check if the file path is within the config directory
-	if !isSubPath(absConfigDir, absPath) {
+	// Use filepath.Rel to check if the path is within the config directory
+	rel, err := filepath.Rel(absConfigDir, absPath)
+	if err != nil || strings.HasPrefix(rel, "..") || strings.Contains(rel, "..") {
 		return "", fmt.Errorf("invalid config path: file must be within the config directory")
 	}
 
@@ -69,15 +70,6 @@ func validateConfigPath(configDir, filename string) (string, error) {
 	}
 
 	return absPath, nil
-}
-
-// isSubPath checks if childPath is a subdirectory of parentPath
-func isSubPath(parentPath, childPath string) bool {
-	rel, err := filepath.Rel(parentPath, childPath)
-	if err != nil {
-		return false
-	}
-	return !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".."
 }
 
 func loadAllConfigs(dir string) ([]BotConfig, error) {
@@ -94,27 +86,34 @@ func loadAllConfigs(dir string) ([]BotConfig, error) {
 		if filepath.Ext(file.Name()) == ".json" {
 			validPath, err := validateConfigPath(dir, file.Name())
 			if err != nil {
-				return nil, fmt.Errorf("invalid config path: %w", err)
+				InfoLogger.Printf("Invalid config path for %s: %v", file.Name(), err)
+				continue
 			}
 
 			config, err := loadConfig(validPath)
 			if err != nil {
-				return nil, fmt.Errorf("failed to load config %s: %w", validPath, err)
+				InfoLogger.Printf("Failed to load config %s: %v", validPath, err)
+				continue
 			}
 
-			// Validation checks...
 			if !config.Active {
 				InfoLogger.Printf("Skipping inactive bot: %s", config.ID)
 				continue
 			}
 
 			if err := validateConfig(&config, ids, tokens); err != nil {
-				return nil, fmt.Errorf("config validation failed for %s: %w", validPath, err)
+				InfoLogger.Printf("Config validation failed for %s: %v", validPath, err)
+				continue
 			}
 
 			configs = append(configs, config)
 		}
 	}
+
+	if len(configs) == 0 {
+		return nil, fmt.Errorf("no valid configs found")
+	}
+
 	return configs, nil
 }
 
@@ -158,14 +157,8 @@ func loadConfig(filename string) (BotConfig, error) {
 	return config, nil
 }
 
-func (c *BotConfig) Reload(filename string) error {
-	// Get the directory of the current executable
-	execDir, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to get executable directory: %w", err)
-	}
-	configDir := filepath.Dir(execDir)
-
+// Reload reloads the BotConfig from the specified filename within the given config directory
+func (c *BotConfig) Reload(configDir, filename string) error {
 	// Validate the config path
 	validPath, err := validateConfigPath(configDir, filename)
 	if err != nil {
