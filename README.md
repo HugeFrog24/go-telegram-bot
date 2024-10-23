@@ -119,3 +119,11 @@ However, you can run the tests locally using:
 ```bash
 go test -race -v ./...
 ```
+
+## Storage
+
+At the moment, a SQLite database (`bot.db`) is used for persistent storage.
+
+Remember to back it up regularly.
+
+Future versions will support more robust storage backends.
