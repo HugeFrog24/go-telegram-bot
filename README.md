@@ -46,7 +46,7 @@ A scalable, multi-bot solution for Telegram using Go, GORM, and the Anthropic AP
 
 3. Build the application:
    ```bash
-   go build -o telegram-multibot
+   go build -o telegram-bot
    ```
 
 ## Systemd Unit Setup
