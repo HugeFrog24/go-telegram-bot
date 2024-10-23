@@ -477,8 +477,12 @@ func TestLoadAllConfigs(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Clear the tempDir before each test
-			os.RemoveAll(tempDir)
-			os.MkdirAll(tempDir, 0755)
+			if err := os.RemoveAll(tempDir); err != nil {
+				t.Fatalf("Failed to remove temp dir: %v", err)
+			}
+			if err := os.MkdirAll(tempDir, 0755); err != nil {
+				t.Fatalf("Failed to create temp dir: %v", err)
+			}
 
 			// Write the test files directly
 			for filename, content := range tt.setupFiles {

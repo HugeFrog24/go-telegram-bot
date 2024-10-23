@@ -143,9 +143,11 @@ func validateConfig(config *BotConfig, ids, tokens map[string]bool) error {
 
 func loadConfig(filename string) (BotConfig, error) {
 	var config BotConfig
-	file, err := os.OpenFile(filename, os.O_RDONLY, 0)
+	// Use filepath.Clean before opening the file
+	cleanPath := filepath.Clean(filename)
+	file, err := os.OpenFile(cleanPath, os.O_RDONLY, 0)
 	if err != nil {
-		return config, fmt.Errorf("failed to open config file %s: %w", filename, err)
+		return config, fmt.Errorf("failed to open config file %s: %w", cleanPath, err)
 	}
 	defer file.Close()
 
@@ -165,9 +167,11 @@ func (c *BotConfig) Reload(configDir, filename string) error {
 		return fmt.Errorf("invalid config path: %w", err)
 	}
 
-	file, err := os.OpenFile(validPath, os.O_RDONLY, 0)
+	// Use filepath.Clean before opening the file
+	cleanPath := filepath.Clean(validPath)
+	file, err := os.OpenFile(cleanPath, os.O_RDONLY, 0)
 	if err != nil {
-		return fmt.Errorf("failed to open config file %s: %w", validPath, err)
+		return fmt.Errorf("failed to open config file %s: %w", cleanPath, err)
 	}
 	defer file.Close()
 

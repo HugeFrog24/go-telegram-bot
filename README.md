@@ -108,3 +108,14 @@ View errors:
 ```bash
 journalctl -u telegram-bot -p err
 ```
+
+## Testing
+
+The GitHub actions workflow already runs tests on every commit:
+
+> [![CI](https://github.com/HugeFrog24/go-telegram-bot/actions/workflows/go-ci.yaml/badge.svg?branch=main)](https://github.com/HugeFrog24/go-telegram-bot/actions/workflows/go-ci.yaml)
+
+However, you can run the tests locally using:
+```bash
+go test -race -v ./...
+```

@@ -279,7 +279,7 @@ func initTelegramBot(token string, handleUpdate func(ctx context.Context, tgBot 
 
 func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, businessConnectionID string) error {
 	// Pass the outgoing message through the centralized screen for storage
-	_, err := b.screenOutgoingMessage(chatID, text, businessConnectionID)
+	_, err := b.screenOutgoingMessage(chatID, text)
 	if err != nil {
 		ErrorLogger.Printf("Error storing assistant message: %v", err)
 		return err
@@ -306,7 +306,7 @@ func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, busin
 }
 
 // sendStats sends the bot statistics to the specified chat.
-func (b *Bot) sendStats(ctx context.Context, chatID int64, userID int64, username string, businessConnectionID string) {
+func (b *Bot) sendStats(ctx context.Context, chatID int64, businessConnectionID string) {
 	totalUsers, totalMessages, err := b.getStats()
 	if err != nil {
 		ErrorLogger.Printf("Error fetching stats: %v\n", err)
@@ -425,7 +425,7 @@ func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
 }
 
 // screenOutgoingMessage handles storing of outgoing messages.
-func (b *Bot) screenOutgoingMessage(chatID int64, response string, businessConnectionID string) (Message, error) {
+func (b *Bot) screenOutgoingMessage(chatID int64, response string) (Message, error) {
 	assistantMessage := b.createMessage(chatID, 0, "", string(anthropic.RoleAssistant), response, false)
 
 	// Store the message.
