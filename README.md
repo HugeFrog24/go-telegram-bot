@@ -61,13 +61,13 @@ To enable the bot to start automatically on system boot and run in the backgroun
 
    Edit the service file:
    ```bash
-   nano /etc/systemd/system/telegram-bot.service
+   sudo nano /etc/systemd/system/telegram-bot.service
    ```
 
    Adjust the following parameters:
-   - `WorkingDirectory`
-   - `ExecStart`
-   - `User`
+   - WorkingDirectory
+   - ExecStart
+   - User
 
 3. Enable and start the service:
 
