@@ -10,7 +10,7 @@ import (
 	"github.com/liushuangls/go-anthropic/v2"
 )
 
-// Add this at the beginning of the file, after the imports
+// Set up loggers
 func TestMain(m *testing.M) {
 	initLoggers()
 	os.Exit(m.Run())
