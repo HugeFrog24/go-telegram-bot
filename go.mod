@@ -3,8 +3,8 @@ module github.com/HugeFrog24/go-telegram-bot
 go 1.23
 
 require (
-	github.com/go-telegram/bot v1.9.1
-	github.com/liushuangls/go-anthropic/v2 v2.8.2
+	github.com/go-telegram/bot v1.10.0
+	github.com/liushuangls/go-anthropic/v2 v2.9.1
 	golang.org/x/time v0.7.0
 	gorm.io/driver/sqlite v1.5.6
 	gorm.io/gorm v1.25.12
