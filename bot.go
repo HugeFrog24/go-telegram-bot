@@ -87,6 +87,15 @@ func NewBot(db *gorm.DB, config BotConfig, clock Clock, tgClient TelegramClient)
 		tgBot:           tgClient,
 	}
 
+	if tgClient == nil {
+		var err error
+		tgClient, err = initTelegramBot(config.TelegramToken, b)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize Telegram bot: %w", err)
+		}
+		b.tgBot = tgClient
+	}
+
 	return b, nil
 }
 
@@ -194,10 +203,16 @@ func (b *Bot) getOrCreateChatMemory(chatID int64) *ChatMemory {
 		chatMemory, exists = b.chatMemories[chatID]
 		if !exists {
 			var messages []Message
-			b.db.Where("chat_id = ? AND bot_id = ?", chatID, b.botID).
+			err := b.db.Where("chat_id = ? AND bot_id = ?", chatID, b.botID).
 				Order("timestamp asc").
 				Limit(b.memorySize * 2).
-				Find(&messages)
+				Find(&messages).Error
+
+			if err != nil {
+				ErrorLogger.Printf("Error fetching messages from database: %v", err)
+				// Handle the error appropriately, e.g., return an empty ChatMemory or log the error
+				messages = []Message{} // Initialize an empty slice to avoid nil pointer issues
+			}
 
 			chatMemory = &ChatMemory{
 				Messages: messages,
@@ -252,7 +267,7 @@ func (b *Bot) prepareContextMessages(chatMemory *ChatMemory) []anthropic.Message
 func (b *Bot) isNewChat(chatID int64) bool {
 	var count int64
 	b.db.Model(&Message{}).Where("chat_id = ? AND bot_id = ?", chatID, b.botID).Count(&count)
-	return count == 1
+	return count <= 1 // More robust check
 }
 
 func (b *Bot) isAdminOrOwner(userID int64) bool {
@@ -264,13 +279,42 @@ func (b *Bot) isAdminOrOwner(userID int64) bool {
 	return user.Role.Name == "admin" || user.Role.Name == "owner"
 }
 
-func initTelegramBot(token string, handleUpdate func(ctx context.Context, tgBot *bot.Bot, update *models.Update)) (TelegramClient, error) {
+func initTelegramBot(token string, b *Bot) (TelegramClient, error) {
 	opts := []bot.Option{
-		bot.WithDefaultHandler(handleUpdate),
+		bot.WithDefaultHandler(b.handleUpdate),
 	}
 
 	tgBot, err := bot.New(token, opts...)
 	if err != nil {
+		return nil, err
+	}
+
+	// Define bot commands
+	commands := []models.BotCommand{
+		{
+			Command:     "stats",
+			Description: "Get bot statistics",
+		},
+		{
+			Command:     "whoami",
+			Description: "Get your user information",
+		},
+		{
+			Command:     "clear",
+			Description: "Clear chat history (soft delete)",
+		},
+		{
+			Command:     "clear_hard",
+			Description: "Clear chat history (permanently delete)",
+		},
+	}
+
+	// Set bot commands
+	_, err = tgBot.SetMyCommands(context.Background(), &bot.SetMyCommandsParams{
+		Commands: commands,
+	})
+	if err != nil {
+		ErrorLogger.Printf("Error setting bot commands: %v", err)
 		return nil, err
 	}
 
@@ -416,10 +460,6 @@ func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
 	if err := b.storeMessage(userMessage); err != nil {
 		return Message{}, err
 	}
-
-	// Update chat memory.
-	chatMemory := b.getOrCreateChatMemory(message.Chat.ID)
-	b.addMessageToChatMemory(chatMemory, userMessage)
 
 	return userMessage, nil
 }

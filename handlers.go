@@ -34,45 +34,26 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	username := message.From.Username
 	text := message.Text
 
+	// Check if it's a new chat
+	if b.isNewChat(chatID) {
+		// Get initial response for a new chat from Anthropic
+		response, err := b.getAnthropicResponse(ctx, []anthropic.Message{}, true, false, false) // Empty context for new chat
+		if err != nil {
+			ErrorLogger.Printf("Error getting initial Anthropic response: %v", err)
+			response = "Hello! I'm your new assistant."
+		}
+
+		// Send the initial response
+		if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
+			ErrorLogger.Printf("Error sending initial response: %v", err)
+			return
+		}
+	}
+
 	// Pass the incoming message through the centralized screen for storage
 	_, err := b.screenIncomingMessage(message)
 	if err != nil {
 		ErrorLogger.Printf("Error storing user message: %v", err)
-		return
-	}
-
-	// Check if the message is a command
-	if message.Entities != nil {
-		for _, entity := range message.Entities {
-			if entity.Type == "bot_command" {
-				command := strings.TrimSpace(message.Text[entity.Offset : entity.Offset+entity.Length])
-				switch command {
-				case "/stats":
-					b.sendStats(ctx, chatID, businessConnectionID)
-					return
-				case "/whoami":
-					b.sendWhoAmI(ctx, chatID, userID, username, businessConnectionID)
-					return
-				}
-			}
-		}
-	}
-
-	// Check if the message contains a sticker
-	if message.Sticker != nil {
-		b.handleStickerMessage(ctx, chatID, userID, message, businessConnectionID)
-		return
-	}
-
-	// Rate limit check
-	if !b.checkRateLimits(userID) {
-		b.sendRateLimitExceededMessage(ctx, chatID, businessConnectionID)
-		return
-	}
-
-	// Proceed only if the message contains text
-	if text == "" {
-		InfoLogger.Printf("Received a non-text message from user %d in chat %d", userID, chatID)
 		return
 	}
 
@@ -97,16 +78,59 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		}
 	}
 
+	// Check if the message is a command
+	if message.Entities != nil {
+		for _, entity := range message.Entities {
+			if entity.Type == "bot_command" {
+				command := strings.TrimSpace(message.Text[entity.Offset : entity.Offset+entity.Length])
+				switch command {
+				case "/stats":
+					b.sendStats(ctx, chatID, businessConnectionID)
+					return
+				case "/whoami":
+					b.sendWhoAmI(ctx, chatID, userID, username, businessConnectionID)
+					return
+				case "/clear":
+					b.clearChatHistory(ctx, chatID, businessConnectionID, false)
+					return
+				case "/clear_hard":
+					b.clearChatHistory(ctx, chatID, businessConnectionID, true)
+					return
+				}
+			}
+		}
+	}
+
+	// Check if the message contains a sticker
+	if message.Sticker != nil {
+		b.handleStickerMessage(ctx, chatID, userID, message, businessConnectionID)
+		return
+	}
+
+	// Rate limit check
+	if !b.checkRateLimits(userID) {
+		b.sendRateLimitExceededMessage(ctx, chatID, businessConnectionID)
+		return
+	}
+
+	// Proceed only if the message contains text
+	if text == "" {
+		InfoLogger.Printf("Received a non-text message from user %d in chat %d", userID, chatID)
+		return
+	}
+
 	// Determine if the text contains only emojis
 	isEmojiOnly := isOnlyEmojis(text)
 
-	// Prepare context messages for Anthropic
+	// Now, process the user's message and add it to chat memory
 	chatMemory := b.getOrCreateChatMemory(chatID)
-	b.addMessageToChatMemory(chatMemory, b.createMessage(chatID, userID, username, user.Role.Name, text, true))
+	// userMessage := b.createMessage(chatID, userID, username, user.Role.Name, text, true) // this line is now handled in screenIncomingMessage
+
+	// Prepare context messages for Anthropic
 	contextMessages := b.prepareContextMessages(chatMemory)
 
 	// Get response from Anthropic
-	response, err := b.getAnthropicResponse(ctx, contextMessages, b.isNewChat(chatID), isOwner, isEmojiOnly)
+	response, err := b.getAnthropicResponse(ctx, contextMessages, false, isOwner, isEmojiOnly) // isNewChat is false here
 	if err != nil {
 		ErrorLogger.Printf("Error getting Anthropic response: %v", err)
 		response = "I'm sorry, I'm having trouble processing your request right now."
@@ -185,4 +209,34 @@ func (b *Bot) generateStickerResponse(ctx context.Context, message Message) (str
 	}
 
 	return "Hmm, that's interesting!", nil
+}
+
+func (b *Bot) clearChatHistory(ctx context.Context, chatID int64, businessConnectionID string, hardDelete bool) {
+	// Soft delete messages from the database
+	var err error
+	if hardDelete {
+		// Permanently delete messages
+		err = b.db.Unscoped().Where("chat_id = ? AND bot_id = ?", chatID, b.botID).Delete(&Message{}).Error
+	} else {
+		// Soft delete messages
+		err = b.db.Where("chat_id = ? AND bot_id = ?", chatID, b.botID).Delete(&Message{}).Error
+	}
+
+	if err != nil {
+		ErrorLogger.Printf("Error clearing chat history: %v", err)
+		if err := b.sendResponse(ctx, chatID, "Sorry, I couldn't clear the chat history.", businessConnectionID); err != nil {
+			ErrorLogger.Printf("Error sending response: %v", err)
+		}
+		return
+	}
+
+	// Reset the chat memory
+	b.chatMemoriesMu.Lock()
+	delete(b.chatMemories, chatID)
+	b.chatMemoriesMu.Unlock()
+
+	// Send a confirmation message
+	if err := b.sendResponse(ctx, chatID, "Chat history cleared.", businessConnectionID); err != nil {
+		ErrorLogger.Printf("Error sending response: %v", err)
+	}
 }
