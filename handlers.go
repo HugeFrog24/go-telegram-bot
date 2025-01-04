@@ -43,103 +43,99 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 			response = "Hello! I'm your new assistant."
 		}
 
-		// Send the initial response
+		// Send the initial response and handle outgoing message
 		if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
 			ErrorLogger.Printf("Error sending initial response: %v", err)
 			return
 		}
-	}
-
-	// Pass the incoming message through the centralized screen for storage
-	_, err := b.screenIncomingMessage(message)
-	if err != nil {
-		ErrorLogger.Printf("Error storing user message: %v", err)
-		return
-	}
-
-	// Determine if the user is the owner
-	var isOwner bool
-	err = b.db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", userID, b.botID, true).First(&User{}).Error
-	if err == nil {
-		isOwner = true
-	}
-
-	user, err := b.getOrCreateUser(userID, username, isOwner)
-	if err != nil {
-		ErrorLogger.Printf("Error getting or creating user: %v", err)
-		return
-	}
-
-	// Update the username if it's empty or has changed
-	if user.Username != username {
-		user.Username = username
-		if err := b.db.Save(&user).Error; err != nil {
-			ErrorLogger.Printf("Error updating user username: %v", err)
+	} else {
+		// Process incoming message through centralized screening
+		if _, err := b.screenIncomingMessage(message); err != nil {
+			ErrorLogger.Printf("Error storing user message: %v", err)
+			return
 		}
-	}
 
-	// Check if the message is a command
-	if message.Entities != nil {
-		for _, entity := range message.Entities {
-			if entity.Type == "bot_command" {
-				command := strings.TrimSpace(message.Text[entity.Offset : entity.Offset+entity.Length])
-				switch command {
-				case "/stats":
-					b.sendStats(ctx, chatID, businessConnectionID)
-					return
-				case "/whoami":
-					b.sendWhoAmI(ctx, chatID, userID, username, businessConnectionID)
-					return
-				case "/clear":
-					b.clearChatHistory(ctx, chatID, businessConnectionID, false)
-					return
-				case "/clear_hard":
-					b.clearChatHistory(ctx, chatID, businessConnectionID, true)
-					return
+		// Determine if the user is the owner
+		var isOwner bool
+		err := b.db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", userID, b.botID, true).First(&User{}).Error
+		if err == nil {
+			isOwner = true
+		}
+
+		user, err := b.getOrCreateUser(userID, username, isOwner)
+		if err != nil {
+			ErrorLogger.Printf("Error getting or creating user: %v", err)
+			return
+		}
+
+		// Update the username if it's empty or has changed
+		if user.Username != username {
+			user.Username = username
+			if err := b.db.Save(&user).Error; err != nil {
+				ErrorLogger.Printf("Error updating user username: %v", err)
+			}
+		}
+
+		// Check if the message is a command
+		if message.Entities != nil {
+			for _, entity := range message.Entities {
+				if entity.Type == "bot_command" {
+					command := strings.TrimSpace(message.Text[entity.Offset : entity.Offset+entity.Length])
+					switch command {
+					case "/stats":
+						b.sendStats(ctx, chatID, businessConnectionID)
+						return
+					case "/whoami":
+						b.sendWhoAmI(ctx, chatID, userID, username, businessConnectionID)
+						return
+					case "/clear":
+						b.clearChatHistory(ctx, chatID, businessConnectionID, false)
+						return
+					case "/clear_hard":
+						b.clearChatHistory(ctx, chatID, businessConnectionID, true)
+						return
+					}
 				}
 			}
 		}
-	}
 
-	// Check if the message contains a sticker
-	if message.Sticker != nil {
-		b.handleStickerMessage(ctx, chatID, userID, message, businessConnectionID)
-		return
-	}
+		// Check if the message contains a sticker
+		if message.Sticker != nil {
+			b.handleStickerMessage(ctx, chatID, message, businessConnectionID)
+			return
+		}
 
-	// Rate limit check
-	if !b.checkRateLimits(userID) {
-		b.sendRateLimitExceededMessage(ctx, chatID, businessConnectionID)
-		return
-	}
+		// Rate limit check
+		if !b.checkRateLimits(userID) {
+			b.sendRateLimitExceededMessage(ctx, chatID, businessConnectionID)
+			return
+		}
 
-	// Proceed only if the message contains text
-	if text == "" {
-		InfoLogger.Printf("Received a non-text message from user %d in chat %d", userID, chatID)
-		return
-	}
+		// Proceed only if the message contains text
+		if text == "" {
+			InfoLogger.Printf("Received a non-text message from user %d in chat %d", userID, chatID)
+			return
+		}
 
-	// Determine if the text contains only emojis
-	isEmojiOnly := isOnlyEmojis(text)
+		// Determine if the text contains only emojis
+		isEmojiOnly := isOnlyEmojis(text)
 
-	// Now, process the user's message and add it to chat memory
-	chatMemory := b.getOrCreateChatMemory(chatID)
-	// userMessage := b.createMessage(chatID, userID, username, user.Role.Name, text, true) // this line is now handled in screenIncomingMessage
+		// Prepare context messages for Anthropic
+		chatMemory := b.getOrCreateChatMemory(chatID)
+		contextMessages := b.prepareContextMessages(chatMemory)
 
-	// Prepare context messages for Anthropic
-	contextMessages := b.prepareContextMessages(chatMemory)
+		// Get response from Anthropic
+		response, err := b.getAnthropicResponse(ctx, contextMessages, false, isOwner, isEmojiOnly) // isNewChat is false here
+		if err != nil {
+			ErrorLogger.Printf("Error getting Anthropic response: %v", err)
+			response = "I'm sorry, I'm having trouble processing your request right now."
+		}
 
-	// Get response from Anthropic
-	response, err := b.getAnthropicResponse(ctx, contextMessages, false, isOwner, isEmojiOnly) // isNewChat is false here
-	if err != nil {
-		ErrorLogger.Printf("Error getting Anthropic response: %v", err)
-		response = "I'm sorry, I'm having trouble processing your request right now."
-	}
-
-	// Send the response through the centralized screen
-	if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
-		ErrorLogger.Printf("Error sending response: %v", err)
-		return
+		// Send the response and handle outgoing message
+		if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
+			ErrorLogger.Printf("Error sending response: %v", err)
+			return
+		}
 	}
 }
 
@@ -149,21 +145,13 @@ func (b *Bot) sendRateLimitExceededMessage(ctx context.Context, chatID int64, bu
 	}
 }
 
-func (b *Bot) handleStickerMessage(ctx context.Context, chatID, userID int64, message *models.Message, businessConnectionID string) {
-	username := message.From.Username
-
-	// Create the user message (without storing it manually)
-	userMessage := b.createMessage(chatID, userID, username, "user", "Sent a sticker.", true)
-	userMessage.StickerFileID = message.Sticker.FileID
-
-	// Safely store the Thumbnail's FileID if available
-	if message.Sticker.Thumbnail != nil {
-		userMessage.StickerPNGFile = message.Sticker.Thumbnail.FileID
+func (b *Bot) handleStickerMessage(ctx context.Context, chatID int64, message *models.Message, businessConnectionID string) {
+	// Process sticker through centralized screening
+	userMessage, err := b.screenIncomingMessage(message)
+	if err != nil {
+		ErrorLogger.Printf("Error processing sticker message: %v", err)
+		return
 	}
-
-	// Update chat memory with the user message
-	chatMemory := b.getOrCreateChatMemory(chatID)
-	b.addMessageToChatMemory(chatMemory, userMessage)
 
 	// Generate AI response about the sticker
 	response, err := b.generateStickerResponse(ctx, userMessage)
@@ -212,7 +200,7 @@ func (b *Bot) generateStickerResponse(ctx context.Context, message Message) (str
 }
 
 func (b *Bot) clearChatHistory(ctx context.Context, chatID int64, businessConnectionID string, hardDelete bool) {
-	// Soft delete messages from the database
+	// Delete messages from the database
 	var err error
 	if hardDelete {
 		// Permanently delete messages
@@ -230,12 +218,14 @@ func (b *Bot) clearChatHistory(ctx context.Context, chatID int64, businessConnec
 		return
 	}
 
-	// Reset the chat memory
+	// Reset the chat memory through the centralized memory management
+	chatMemory := b.getOrCreateChatMemory(chatID)
+	chatMemory.Messages = []Message{} // Clear the messages
 	b.chatMemoriesMu.Lock()
-	delete(b.chatMemories, chatID)
+	b.chatMemories[chatID] = chatMemory
 	b.chatMemoriesMu.Unlock()
 
-	// Send a confirmation message
+	// Send a confirmation message through the centralized screen
 	if err := b.sendResponse(ctx, chatID, "Chat history cleared.", businessConnectionID); err != nil {
 		ErrorLogger.Printf("Error sending response: %v", err)
 	}

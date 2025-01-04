@@ -22,6 +22,7 @@ type BotConfig struct {
 	Active          bool              `json:"active"`
 	OwnerTelegramID int64             `json:"owner_telegram_id"`
 	AnthropicAPIKey string            `json:"anthropic_api_key"`
+	DebugScreening  bool              `json:"debug_screening"` // Enable detailed screening logs
 }
 
 // Custom unmarshalling to handle anthropic.Model

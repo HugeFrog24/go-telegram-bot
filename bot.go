@@ -28,6 +28,14 @@ type Bot struct {
 	botID           uint // Reference to BotModel.ID
 }
 
+// Helper function to determine message type
+func messageType(msg *models.Message) string {
+	if msg.Sticker != nil {
+		return "sticker"
+	}
+	return "text"
+}
+
 // NewBot initializes and returns a new Bot instance.
 func NewBot(db *gorm.DB, config BotConfig, clock Clock, tgClient TelegramClient) (*Bot, error) {
 	// Retrieve or create Bot entry in the database
@@ -187,9 +195,10 @@ func (b *Bot) createMessage(chatID, userID int64, username, userRole, text strin
 	return message
 }
 
-func (b *Bot) storeMessage(message Message) error {
-	message.BotID = b.botID // Associate the message with the correct bot
-	return b.db.Create(&message).Error
+// storeMessage stores a message in the database and updates its ID
+func (b *Bot) storeMessage(message *Message) error {
+	message.BotID = b.botID           // Associate the message with the correct bot
+	return b.db.Create(message).Error // This will update the message with its new ID
 }
 
 func (b *Bot) getOrCreateChatMemory(chatID int64) *ChatMemory {
@@ -199,19 +208,29 @@ func (b *Bot) getOrCreateChatMemory(chatID int64) *ChatMemory {
 
 	if !exists {
 		b.chatMemoriesMu.Lock()
-		// Double-check to prevent race condition
+		defer b.chatMemoriesMu.Unlock()
+
 		chatMemory, exists = b.chatMemories[chatID]
 		if !exists {
-			var messages []Message
-			err := b.db.Where("chat_id = ? AND bot_id = ?", chatID, b.botID).
-				Order("timestamp asc").
-				Limit(b.memorySize * 2).
-				Find(&messages).Error
+			// Check if this is a new chat by querying the database
+			var count int64
+			b.db.Model(&Message{}).Where("chat_id = ? AND bot_id = ?", chatID, b.botID).Count(&count)
+			isNewChat := count == 0 // Truly new chat if no messages exist
 
-			if err != nil {
-				ErrorLogger.Printf("Error fetching messages from database: %v", err)
-				// Handle the error appropriately, e.g., return an empty ChatMemory or log the error
-				messages = []Message{} // Initialize an empty slice to avoid nil pointer issues
+			var messages []Message
+			if !isNewChat {
+				// Fetch existing messages only if it's not a new chat
+				err := b.db.Where("chat_id = ? AND bot_id = ?", chatID, b.botID).
+					Order("timestamp asc").
+					Limit(b.memorySize * 2).
+					Find(&messages).Error
+
+				if err != nil {
+					ErrorLogger.Printf("Error fetching messages from database: %v", err)
+					messages = []Message{} // Initialize an empty slice on error
+				}
+			} else {
+				messages = []Message{} // Ensure messages is initialized for new chats
 			}
 
 			chatMemory = &ChatMemory{
@@ -221,19 +240,22 @@ func (b *Bot) getOrCreateChatMemory(chatID int64) *ChatMemory {
 
 			b.chatMemories[chatID] = chatMemory
 		}
-		b.chatMemoriesMu.Unlock()
 	}
 
 	return chatMemory
 }
 
+// addMessageToChatMemory adds a new message to the chat memory, ensuring the memory size is maintained.
 func (b *Bot) addMessageToChatMemory(chatMemory *ChatMemory, message Message) {
 	b.chatMemoriesMu.Lock()
 	defer b.chatMemoriesMu.Unlock()
 
+	// Add the new message
 	chatMemory.Messages = append(chatMemory.Messages, message)
+
+	// Maintain the memory size
 	if len(chatMemory.Messages) > chatMemory.Size {
-		chatMemory.Messages = chatMemory.Messages[2:]
+		chatMemory.Messages = chatMemory.Messages[len(chatMemory.Messages)-chatMemory.Size:]
 	}
 }
 
@@ -322,7 +344,7 @@ func initTelegramBot(token string, b *Bot) (TelegramClient, error) {
 }
 
 func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, businessConnectionID string) error {
-	// Pass the outgoing message through the centralized screen for storage
+	// Pass the outgoing message through the centralized screen for storage and chat memory update
 	_, err := b.screenOutgoingMessage(chatID, text)
 	if err != nil {
 		ErrorLogger.Printf("Error storing assistant message: %v", err)
@@ -443,12 +465,33 @@ func (b *Bot) sendWhoAmI(ctx context.Context, chatID int64, userID int64, userna
 	}
 }
 
-// screenIncomingMessage handles storing of incoming messages.
+// screenIncomingMessage centralizes all incoming message processing: storing messages and updating chat memory.
 func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
-	userRole := string(anthropic.RoleUser) // Convert RoleUser to string
-	userMessage := b.createMessage(message.Chat.ID, message.From.ID, message.From.Username, userRole, message.Text, true)
+	if b.config.DebugScreening {
+		start := time.Now()
+		defer func() {
+			InfoLogger.Printf(
+				"[Screen] Incoming: chat=%d user=%d type=%s memory_size=%d duration=%v",
+				message.Chat.ID,
+				message.From.ID,
+				messageType(message),
+				len(b.getOrCreateChatMemory(message.Chat.ID).Messages),
+				time.Since(start),
+			)
+		}()
+	}
 
-	// If the message contains a sticker, include its details.
+	userRole := string(anthropic.RoleUser)
+
+	// Determine message text based on message type
+	messageText := message.Text
+	if message.Sticker != nil {
+		messageText = "Sent a sticker."
+	}
+
+	userMessage := b.createMessage(message.Chat.ID, message.From.ID, message.From.Username, userRole, messageText, true)
+
+	// Handle sticker-specific details if present
 	if message.Sticker != nil {
 		userMessage.StickerFileID = message.Sticker.FileID
 		if message.Sticker.Thumbnail != nil {
@@ -456,24 +499,41 @@ func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
 		}
 	}
 
-	// Store the message.
-	if err := b.storeMessage(userMessage); err != nil {
+	// Store the message and get its ID
+	if err := b.storeMessage(&userMessage); err != nil {
 		return Message{}, err
 	}
+
+	// Update chat memory with the message that now has an ID
+	chatMemory := b.getOrCreateChatMemory(message.Chat.ID)
+	b.addMessageToChatMemory(chatMemory, userMessage)
 
 	return userMessage, nil
 }
 
-// screenOutgoingMessage handles storing of outgoing messages.
+// screenOutgoingMessage handles storing of outgoing messages and updating chat memory.
 func (b *Bot) screenOutgoingMessage(chatID int64, response string) (Message, error) {
+	if b.config.DebugScreening {
+		start := time.Now()
+		defer func() {
+			InfoLogger.Printf(
+				"[Screen] Outgoing: chat=%d len=%d memory_size=%d duration=%v",
+				chatID,
+				len(response),
+				len(b.getOrCreateChatMemory(chatID).Messages),
+				time.Since(start),
+			)
+		}()
+	}
+
 	assistantMessage := b.createMessage(chatID, 0, "", string(anthropic.RoleAssistant), response, false)
 
-	// Store the message.
-	if err := b.storeMessage(assistantMessage); err != nil {
+	// Store the message and get its ID
+	if err := b.storeMessage(&assistantMessage); err != nil {
 		return Message{}, err
 	}
 
-	// Update chat memory.
+	// Update chat memory with the message that now has an ID
 	chatMemory := b.getOrCreateChatMemory(chatID)
 	b.addMessageToChatMemory(chatMemory, assistantMessage)
 
