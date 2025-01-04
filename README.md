@@ -30,13 +30,13 @@ A scalable, multi-bot solution for Telegram using Go, GORM, and the Anthropic AP
 
 2. Copy the default config template and edit it:
    ```bash
-   cp config/default.json config/config-mybot.json
+   cp config/default.json config/mybot.json
    ```
 
-   Replace `config-mybot.json` with the name of your bot.
+   Replace `mybot.json` with the name of your bot.
 
    ```bash
-   nano config/config-mybot.json
+   nano config/mybot.json
    ```
 
    You can set up as many bots as you want. Just copy the template and edit the parameters.
