@@ -36,11 +36,35 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 
 	// Check if it's a new chat
 	if b.isNewChat(chatID) {
+		// Screen incoming message
+		if _, err := b.screenIncomingMessage(message); err != nil {
+			ErrorLogger.Printf("Error storing user message: %v", err)
+			return
+		}
+
+		// Determine if the user is the owner
+		var isOwner bool
+		err := b.db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", userID, b.botID, true).First(&User{}).Error
+		if err == nil {
+			isOwner = true
+		}
+
 		// Get initial response for a new chat from Anthropic
-		response, err := b.getAnthropicResponse(ctx, []anthropic.Message{}, true, false, false) // Empty context for new chat
+		response, err := b.getAnthropicResponse(ctx, []anthropic.Message{}, true, isOwner, false)
 		if err != nil {
 			ErrorLogger.Printf("Error getting initial Anthropic response: %v", err)
-			response = "Hello! I'm your new assistant."
+			// Use different fallback messages based on user type
+			if isOwner {
+				response = "Hello! I'm your new AI assistant, ready to help you as the owner of this bot."
+			} else {
+				response = "Hello! I'm an AI assistant. How can I help you today?"
+			}
+		}
+
+		// Screen outgoing message
+		if _, err := b.screenOutgoingMessage(chatID, response); err != nil {
+			ErrorLogger.Printf("Error storing bot message: %v", err)
+			return
 		}
 
 		// Send the initial response and handle outgoing message
@@ -131,6 +155,12 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 			response = "I'm sorry, I'm having trouble processing your request right now."
 		}
 
+		// Screen outgoing message
+		if _, err := b.screenOutgoingMessage(chatID, response); err != nil {
+			ErrorLogger.Printf("Error storing bot message: %v", err)
+			return
+		}
+
 		// Send the response and handle outgoing message
 		if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
 			ErrorLogger.Printf("Error sending response: %v", err)
@@ -165,6 +195,12 @@ func (b *Bot) handleStickerMessage(ctx context.Context, chatID int64, message *m
 		} else {
 			response = "That's a cool sticker!"
 		}
+	}
+
+	// Screen outgoing message
+	if _, err := b.screenOutgoingMessage(chatID, response); err != nil {
+		ErrorLogger.Printf("Error storing bot message: %v", err)
+		return
 	}
 
 	// Send the response through the centralized screen
