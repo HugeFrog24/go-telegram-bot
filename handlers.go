@@ -35,33 +35,41 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	text := message.Text
 
 	// Check if it's a new chat
-	if b.isNewChat(chatID) {
-		// Get initial response for a new chat from Anthropic
-		response, err := b.getAnthropicResponse(ctx, []anthropic.Message{}, true, false, false) // Empty context for new chat
+	isNewChatFlag := b.isNewChat(chatID)
+
+	// Screen incoming message
+	if _, err := b.screenIncomingMessage(message); err != nil {
+		ErrorLogger.Printf("Error storing user message: %v", err)
+		return
+	}
+
+	// Determine if the user is the owner
+	var isOwner bool
+	err := b.db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", userID, b.botID, true).First(&User{}).Error
+	if err == nil {
+		isOwner = true
+	}
+
+	// Get the chat memory which now contains the user's message
+	chatMemory := b.getOrCreateChatMemory(chatID)
+	contextMessages := b.prepareContextMessages(chatMemory)
+
+	if isNewChatFlag {
+
+		// Get response from Anthropic using the context messages
+		response, err := b.getAnthropicResponse(ctx, contextMessages, true, isOwner, false, username)
 		if err != nil {
-			ErrorLogger.Printf("Error getting initial Anthropic response: %v", err)
-			response = "Hello! I'm your new assistant."
+			ErrorLogger.Printf("Error getting Anthropic response: %v", err)
+			// Use the same error message as in the non-new chat case
+			response = "I'm sorry, I'm having trouble processing your request right now."
 		}
 
-		// Send the initial response and handle outgoing message
+		// Send the AI-generated response or error message
 		if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
-			ErrorLogger.Printf("Error sending initial response: %v", err)
+			ErrorLogger.Printf("Error sending response: %v", err)
 			return
 		}
 	} else {
-		// Process incoming message through centralized screening
-		if _, err := b.screenIncomingMessage(message); err != nil {
-			ErrorLogger.Printf("Error storing user message: %v", err)
-			return
-		}
-
-		// Determine if the user is the owner
-		var isOwner bool
-		err := b.db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", userID, b.botID, true).First(&User{}).Error
-		if err == nil {
-			isOwner = true
-		}
-
 		user, err := b.getOrCreateUser(userID, username, isOwner)
 		if err != nil {
 			ErrorLogger.Printf("Error getting or creating user: %v", err)
@@ -125,13 +133,13 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		contextMessages := b.prepareContextMessages(chatMemory)
 
 		// Get response from Anthropic
-		response, err := b.getAnthropicResponse(ctx, contextMessages, false, isOwner, isEmojiOnly) // isNewChat is false here
+		response, err := b.getAnthropicResponse(ctx, contextMessages, false, isOwner, isEmojiOnly, username) // isNewChat is false here
 		if err != nil {
 			ErrorLogger.Printf("Error getting Anthropic response: %v", err)
 			response = "I'm sorry, I'm having trouble processing your request right now."
 		}
 
-		// Send the response and handle outgoing message
+		// Send the response
 		if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
 			ErrorLogger.Printf("Error sending response: %v", err)
 			return
@@ -167,7 +175,7 @@ func (b *Bot) handleStickerMessage(ctx context.Context, chatID int64, message *m
 		}
 	}
 
-	// Send the response through the centralized screen
+	// Send the response
 	if err := b.sendResponse(ctx, chatID, response, businessConnectionID); err != nil {
 		ErrorLogger.Printf("Error sending response: %v", err)
 		return
@@ -188,7 +196,7 @@ func (b *Bot) generateStickerResponse(ctx context.Context, message Message) (str
 		}
 
 		// Since this is a sticker message, isEmojiOnly is false
-		response, err := b.getAnthropicResponse(ctx, contextMessages, false, false, false)
+		response, err := b.getAnthropicResponse(ctx, contextMessages, false, false, false, message.Username)
 		if err != nil {
 			return "", err
 		}

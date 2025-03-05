@@ -263,6 +263,12 @@ func (b *Bot) prepareContextMessages(chatMemory *ChatMemory) []anthropic.Message
 	b.chatMemoriesMu.RLock()
 	defer b.chatMemoriesMu.RUnlock()
 
+	// Debug logging
+	InfoLogger.Printf("Chat memory contains %d messages", len(chatMemory.Messages))
+	for i, msg := range chatMemory.Messages {
+		InfoLogger.Printf("Message %d: IsUser=%v, Text=%q", i, msg.IsUser, msg.Text)
+	}
+
 	var contextMessages []anthropic.Message
 	for _, msg := range chatMemory.Messages {
 		role := anthropic.RoleUser
@@ -289,7 +295,7 @@ func (b *Bot) prepareContextMessages(chatMemory *ChatMemory) []anthropic.Message
 func (b *Bot) isNewChat(chatID int64) bool {
 	var count int64
 	b.db.Model(&Message{}).Where("chat_id = ? AND bot_id = ?", chatID, b.botID).Count(&count)
-	return count <= 1 // More robust check
+	return count == 0 // Only consider a chat new if it has 0 messages
 }
 
 func (b *Bot) isAdminOrOwner(userID int64) bool {
@@ -499,19 +505,22 @@ func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
 		}
 	}
 
+	// Get the chat memory before storing the message
+	chatMemory := b.getOrCreateChatMemory(message.Chat.ID)
+
 	// Store the message and get its ID
 	if err := b.storeMessage(&userMessage); err != nil {
 		return Message{}, err
 	}
 
-	// Update chat memory with the message that now has an ID
-	chatMemory := b.getOrCreateChatMemory(message.Chat.ID)
+	// Add the message to the chat memory
 	b.addMessageToChatMemory(chatMemory, userMessage)
 
 	return userMessage, nil
 }
 
 // screenOutgoingMessage handles storing of outgoing messages and updating chat memory.
+// It also marks the most recent unanswered user message as answered.
 func (b *Bot) screenOutgoingMessage(chatID int64, response string) (Message, error) {
 	if b.config.DebugScreening {
 		start := time.Now()
@@ -526,11 +535,24 @@ func (b *Bot) screenOutgoingMessage(chatID int64, response string) (Message, err
 		}()
 	}
 
+	// Create and store the assistant message
 	assistantMessage := b.createMessage(chatID, 0, "", string(anthropic.RoleAssistant), response, false)
-
-	// Store the message and get its ID
 	if err := b.storeMessage(&assistantMessage); err != nil {
 		return Message{}, err
+	}
+
+	// Find and mark the most recent unanswered user message as answered
+	now := time.Now()
+	err := b.db.Model(&Message{}).
+		Where("chat_id = ? AND bot_id = ? AND is_user = ? AND answered_on IS NULL",
+			chatID, b.botID, true).
+		Order("timestamp DESC").
+		Limit(1).
+		Update("answered_on", now).Error
+
+	if err != nil {
+		ErrorLogger.Printf("Error marking user message as answered: %v", err)
+		// Continue even if there's an error updating the user message
 	}
 
 	// Update chat memory with the message that now has an ID

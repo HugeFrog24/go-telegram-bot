@@ -40,6 +40,7 @@ type Message struct {
 	StickerFileID  string
 	StickerPNGFile string
 	DeletedAt      gorm.DeletedAt `gorm:"index"` // Add soft delete field
+	AnsweredOn     *time.Time     `gorm:"index"` // Tracks when a user message was answered (NULL for assistant messages and unanswered user messages)
 }
 
 type ChatMemory struct {

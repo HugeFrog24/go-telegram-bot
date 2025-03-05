@@ -6,13 +6,14 @@ import (
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+	"github.com/stretchr/testify/mock"
 )
 
 // MockTelegramClient is a mock implementation of TelegramClient for testing.
 type MockTelegramClient struct {
-	// You can add fields to keep track of calls if needed.
+	mock.Mock
 	SendMessageFunc func(ctx context.Context, params *bot.SendMessageParams) (*models.Message, error)
-	StartFunc       func(ctx context.Context) // Optional: track Start calls
+	StartFunc       func(ctx context.Context)
 }
 
 // SendMessage mocks sending a message.
@@ -20,16 +21,18 @@ func (m *MockTelegramClient) SendMessage(ctx context.Context, params *bot.SendMe
 	if m.SendMessageFunc != nil {
 		return m.SendMessageFunc(ctx, params)
 	}
-	// Default behavior: return an empty message without error.
-	return &models.Message{}, nil
+	args := m.Called(ctx, params)
+	if msg, ok := args.Get(0).(*models.Message); ok {
+		return msg, args.Error(1)
+	}
+	return nil, args.Error(1)
 }
 
 // Start mocks starting the Telegram client.
 func (m *MockTelegramClient) Start(ctx context.Context) {
 	if m.StartFunc != nil {
 		m.StartFunc(ctx)
+		return
 	}
-	// Default behavior: do nothing.
+	m.Called(ctx)
 }
-
-// Add other mocked methods if your Bot uses more TelegramClient methods.

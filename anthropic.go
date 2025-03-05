@@ -3,11 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/liushuangls/go-anthropic/v2"
 )
 
-func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Message, isNewChat, isAdminOrOwner, isEmojiOnly bool) (string, error) {
+func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Message, isNewChat, isAdminOrOwner, isEmojiOnly bool, username string) (string, error) {
 	// Use prompts from config
 	var systemMessage string
 	if isNewChat {
@@ -19,12 +20,27 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Mes
 	// Combine default prompt with custom instructions
 	systemMessage = b.config.SystemPrompts["default"] + " " + b.config.SystemPrompts["custom_instructions"] + " " + systemMessage
 
+	// Replace username placeholder if present
+	if username != "" {
+		systemMessage = strings.ReplaceAll(systemMessage, "{username}", username)
+	}
+
 	if !isAdminOrOwner {
 		systemMessage += " " + b.config.SystemPrompts["avoid_sensitive"]
 	}
 
 	if isEmojiOnly {
 		systemMessage += " " + b.config.SystemPrompts["respond_with_emojis"]
+	}
+
+	// Debug logging
+	InfoLogger.Printf("Sending %d messages to Anthropic", len(messages))
+	for i, msg := range messages {
+		for _, content := range msg.Content {
+			if content.Type == anthropic.MessagesContentTypeText {
+				InfoLogger.Printf("Message %d: Role=%v, Text=%v", i, msg.Role, content.Text)
+			}
+		}
 	}
 
 	// Ensure the roles are correct
