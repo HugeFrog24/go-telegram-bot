@@ -321,7 +321,7 @@ func initTelegramBot(token string, b *Bot) (TelegramClient, error) {
 	commands := []models.BotCommand{
 		{
 			Command:     "stats",
-			Description: "Get bot statistics",
+			Description: "Get bot statistics. Usage: /stats or /stats user [user_id]",
 		},
 		{
 			Command:     "whoami",
@@ -378,28 +378,75 @@ func (b *Bot) sendResponse(ctx context.Context, chatID int64, text string, busin
 }
 
 // sendStats sends the bot statistics to the specified chat.
-func (b *Bot) sendStats(ctx context.Context, chatID int64, businessConnectionID string) {
-	totalUsers, totalMessages, err := b.getStats()
+func (b *Bot) sendStats(ctx context.Context, chatID int64, userID int64, targetUserID int64, businessConnectionID string) {
+	// If targetUserID is 0, show global stats
+	if targetUserID == 0 {
+		totalUsers, totalMessages, err := b.getStats()
+		if err != nil {
+			ErrorLogger.Printf("Error fetching stats: %v\n", err)
+			if err := b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve the stats at this time.", businessConnectionID); err != nil {
+				ErrorLogger.Printf("Error sending response: %v", err)
+			}
+			return
+		}
+
+		// Do NOT manually escape hyphens here
+		statsMessage := fmt.Sprintf(
+			"📊 Bot Statistics:\n\n"+
+				"- Total Users: %d\n"+
+				"- Total Messages: %d",
+			totalUsers,
+			totalMessages,
+		)
+
+		// Send the response through the centralized screen
+		if err := b.sendResponse(ctx, chatID, statsMessage, businessConnectionID); err != nil {
+			ErrorLogger.Printf("Error sending stats message: %v", err)
+		}
+		return
+	}
+
+	// If targetUserID is not 0, show user-specific stats
+	// Check permissions if the user is trying to view someone else's stats
+	if targetUserID != userID {
+		if !b.isAdminOrOwner(userID) {
+			InfoLogger.Printf("User %d attempted to view stats for user %d without permission", userID, targetUserID)
+			if err := b.sendResponse(ctx, chatID, "Permission denied. Only admins and owners can view other users' statistics.", businessConnectionID); err != nil {
+				ErrorLogger.Printf("Error sending response: %v", err)
+			}
+			return
+		}
+	}
+
+	// Get user stats
+	username, messagesIn, messagesOut, totalMessages, err := b.getUserStats(targetUserID)
 	if err != nil {
-		ErrorLogger.Printf("Error fetching stats: %v\n", err)
-		if err := b.sendResponse(ctx, chatID, "Sorry, I couldn't retrieve the stats at this time.", businessConnectionID); err != nil {
+		ErrorLogger.Printf("Error fetching user stats: %v\n", err)
+		if err := b.sendResponse(ctx, chatID, fmt.Sprintf("Sorry, I couldn't retrieve statistics for user ID %d.", targetUserID), businessConnectionID); err != nil {
 			ErrorLogger.Printf("Error sending response: %v", err)
 		}
 		return
 	}
 
-	// Do NOT manually escape hyphens here
+	// Build the user stats message
+	userInfo := fmt.Sprintf("@%s (ID: %d)", username, targetUserID)
+	if username == "" {
+		userInfo = fmt.Sprintf("User ID: %d", targetUserID)
+	}
+
 	statsMessage := fmt.Sprintf(
-		"📊 Bot Statistics:\n\n"+
-			"- Total Users: %d\n"+
+		"👤 User Statistics for %s:\n\n"+
+			"- Messages Sent: %d\n"+
+			"- Messages Received: %d\n"+
 			"- Total Messages: %d",
-		totalUsers,
+		userInfo,
+		messagesIn,
+		messagesOut,
 		totalMessages,
 	)
 
-	// Send the response through the centralized screen
 	if err := b.sendResponse(ctx, chatID, statsMessage, businessConnectionID); err != nil {
-		ErrorLogger.Printf("Error sending stats message: %v", err)
+		ErrorLogger.Printf("Error sending user stats message: %v", err)
 	}
 }
 
@@ -416,6 +463,35 @@ func (b *Bot) getStats() (int64, int64, error) {
 	}
 
 	return totalUsers, totalMessages, nil
+}
+
+// getUserStats retrieves statistics for a specific user
+func (b *Bot) getUserStats(userID int64) (string, int64, int64, int64, error) {
+	// Get user information from database
+	var user User
+	err := b.db.Where("telegram_id = ? AND bot_id = ?", userID, b.botID).First(&user).Error
+	if err != nil {
+		return "", 0, 0, 0, fmt.Errorf("user not found: %w", err)
+	}
+
+	// Count messages sent by the user (IN)
+	var messagesIn int64
+	if err := b.db.Model(&Message{}).Where("user_id = ? AND bot_id = ? AND is_user = ?",
+		userID, b.botID, true).Count(&messagesIn).Error; err != nil {
+		return "", 0, 0, 0, err
+	}
+
+	// Count responses to the user (OUT)
+	var messagesOut int64
+	if err := b.db.Model(&Message{}).Where("chat_id IN (SELECT DISTINCT chat_id FROM messages WHERE user_id = ? AND bot_id = ?) AND bot_id = ? AND is_user = ?",
+		userID, b.botID, b.botID, false).Count(&messagesOut).Error; err != nil {
+		return "", 0, 0, 0, err
+	}
+
+	// Total messages is the sum
+	totalMessages := messagesIn + messagesOut
+
+	return user.Username, messagesIn, messagesOut, totalMessages, nil
 }
 
 // isOnlyEmojis checks if the string consists solely of emojis.

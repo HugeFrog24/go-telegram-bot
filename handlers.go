@@ -93,7 +93,36 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 					command := strings.TrimSpace(message.Text[entity.Offset : entity.Offset+entity.Length])
 					switch command {
 					case "/stats":
-						b.sendStats(ctx, chatID, businessConnectionID)
+						// Parse command parameters
+						parts := strings.Fields(message.Text)
+
+						// Default: show global stats
+						if len(parts) == 1 {
+							b.sendStats(ctx, chatID, userID, 0, businessConnectionID)
+							return
+						}
+
+						// Check for "user" parameter
+						if len(parts) >= 2 && parts[1] == "user" {
+							var targetUserID int64 = userID // Default to current user
+
+							// If a user ID is provided, parse it
+							if len(parts) >= 3 {
+								var parseErr error
+								targetUserID, parseErr = strconv.ParseInt(parts[2], 10, 64)
+								if parseErr != nil {
+									InfoLogger.Printf("User %d provided invalid user ID format: %s", userID, parts[2])
+									b.sendResponse(ctx, chatID, "Invalid user ID format. Usage: /stats user [user_id]", businessConnectionID)
+									return
+								}
+							}
+
+							b.sendStats(ctx, chatID, userID, targetUserID, businessConnectionID)
+							return
+						}
+
+						// Invalid parameter
+						b.sendResponse(ctx, chatID, "Invalid command format. Usage: /stats or /stats user [user_id]", businessConnectionID)
 						return
 					case "/whoami":
 						b.sendWhoAmI(ctx, chatID, userID, username, businessConnectionID)
