@@ -329,11 +329,11 @@ func initTelegramBot(token string, b *Bot) (TelegramClient, error) {
 		},
 		{
 			Command:     "clear",
-			Description: "Clear chat history (soft delete)",
+			Description: "Clear chat history (soft delete). Admins: /clear [user_id]",
 		},
 		{
 			Command:     "clear_hard",
-			Description: "Clear chat history (permanently delete)",
+			Description: "Clear chat history (permanently delete). Admins: /clear_hard [user_id]",
 		},
 	}
 

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/go-telegram/bot"
@@ -97,10 +99,38 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 						b.sendWhoAmI(ctx, chatID, userID, username, businessConnectionID)
 						return
 					case "/clear":
-						b.clearChatHistory(ctx, chatID, businessConnectionID, false)
+						// Extract optional user ID parameter
+						parts := strings.Fields(message.Text)
+						var targetUserID int64 = 0
+						if len(parts) > 1 {
+							// Parse the user ID
+							var parseErr error
+							targetUserID, parseErr = strconv.ParseInt(parts[1], 10, 64)
+							if parseErr != nil {
+								// Invalid user ID format
+								InfoLogger.Printf("User %d provided invalid user ID format: %s", userID, parts[1])
+								b.sendResponse(ctx, chatID, "Invalid user ID format. Usage: /clear [user_id]", businessConnectionID)
+								return
+							}
+						}
+						b.clearChatHistory(ctx, chatID, userID, targetUserID, businessConnectionID, false)
 						return
 					case "/clear_hard":
-						b.clearChatHistory(ctx, chatID, businessConnectionID, true)
+						// Extract optional user ID parameter
+						parts := strings.Fields(message.Text)
+						var targetUserID int64 = 0
+						if len(parts) > 1 {
+							// Parse the user ID
+							var parseErr error
+							targetUserID, parseErr = strconv.ParseInt(parts[1], 10, 64)
+							if parseErr != nil {
+								// Invalid user ID format
+								InfoLogger.Printf("User %d provided invalid user ID format: %s", userID, parts[1])
+								b.sendResponse(ctx, chatID, "Invalid user ID format. Usage: /clear_hard [user_id]", businessConnectionID)
+								return
+							}
+						}
+						b.clearChatHistory(ctx, chatID, userID, targetUserID, businessConnectionID, true)
 						return
 					}
 				}
@@ -207,15 +237,57 @@ func (b *Bot) generateStickerResponse(ctx context.Context, message Message) (str
 	return "Hmm, that's interesting!", nil
 }
 
-func (b *Bot) clearChatHistory(ctx context.Context, chatID int64, businessConnectionID string, hardDelete bool) {
+func (b *Bot) clearChatHistory(ctx context.Context, chatID int64, currentUserID int64, targetUserID int64, businessConnectionID string, hardDelete bool) {
+	// If targetUserID is provided and different from currentUserID, check permissions
+	if targetUserID != 0 && targetUserID != currentUserID {
+		// Check if the current user is an admin or owner
+		if !b.isAdminOrOwner(currentUserID) {
+			InfoLogger.Printf("User %d attempted to clear history for user %d without permission", currentUserID, targetUserID)
+			if err := b.sendResponse(ctx, chatID, "Permission denied. Only admins and owners can clear other users' histories.", businessConnectionID); err != nil {
+				ErrorLogger.Printf("Error sending response: %v", err)
+			}
+			return
+		}
+
+		// Check if the target user exists
+		var targetUser User
+		err := b.db.Where("telegram_id = ? AND bot_id = ?", targetUserID, b.botID).First(&targetUser).Error
+		if err != nil {
+			ErrorLogger.Printf("Error finding target user %d: %v", targetUserID, err)
+			if err := b.sendResponse(ctx, chatID, fmt.Sprintf("User with ID %d not found.", targetUserID), businessConnectionID); err != nil {
+				ErrorLogger.Printf("Error sending response: %v", err)
+			}
+			return
+		}
+	} else {
+		// If no targetUserID is provided, set it to currentUserID
+		targetUserID = currentUserID
+	}
+
 	// Delete messages from the database
 	var err error
 	if hardDelete {
 		// Permanently delete messages
-		err = b.db.Unscoped().Where("chat_id = ? AND bot_id = ?", chatID, b.botID).Delete(&Message{}).Error
+		if targetUserID == currentUserID {
+			// Deleting own messages
+			err = b.db.Unscoped().Where("chat_id = ? AND bot_id = ? AND user_id = ?", chatID, b.botID, targetUserID).Delete(&Message{}).Error
+			InfoLogger.Printf("User %d permanently deleted their own chat history in chat %d", currentUserID, chatID)
+		} else {
+			// Deleting another user's messages
+			err = b.db.Unscoped().Where("chat_id = ? AND bot_id = ? AND user_id = ?", chatID, b.botID, targetUserID).Delete(&Message{}).Error
+			InfoLogger.Printf("Admin/owner %d permanently deleted chat history for user %d in chat %d", currentUserID, targetUserID, chatID)
+		}
 	} else {
 		// Soft delete messages
-		err = b.db.Where("chat_id = ? AND bot_id = ?", chatID, b.botID).Delete(&Message{}).Error
+		if targetUserID == currentUserID {
+			// Deleting own messages
+			err = b.db.Where("chat_id = ? AND bot_id = ? AND user_id = ?", chatID, b.botID, targetUserID).Delete(&Message{}).Error
+			InfoLogger.Printf("User %d soft deleted their own chat history in chat %d", currentUserID, chatID)
+		} else {
+			// Deleting another user's messages
+			err = b.db.Where("chat_id = ? AND bot_id = ? AND user_id = ?", chatID, b.botID, targetUserID).Delete(&Message{}).Error
+			InfoLogger.Printf("Admin/owner %d soft deleted chat history for user %d in chat %d", currentUserID, targetUserID, chatID)
+		}
 	}
 
 	if err != nil {
@@ -226,15 +298,31 @@ func (b *Bot) clearChatHistory(ctx context.Context, chatID int64, businessConnec
 		return
 	}
 
-	// Reset the chat memory through the centralized memory management
-	chatMemory := b.getOrCreateChatMemory(chatID)
-	chatMemory.Messages = []Message{} // Clear the messages
-	b.chatMemoriesMu.Lock()
-	b.chatMemories[chatID] = chatMemory
-	b.chatMemoriesMu.Unlock()
+	// Reset the chat memory if clearing own history
+	if targetUserID == currentUserID {
+		chatMemory := b.getOrCreateChatMemory(chatID)
+		chatMemory.Messages = []Message{} // Clear the messages
+		b.chatMemoriesMu.Lock()
+		b.chatMemories[chatID] = chatMemory
+		b.chatMemoriesMu.Unlock()
+	}
 
-	// Send a confirmation message through the centralized screen
-	if err := b.sendResponse(ctx, chatID, "Chat history cleared.", businessConnectionID); err != nil {
+	// Send a confirmation message
+	var confirmationMessage string
+	if targetUserID == currentUserID {
+		confirmationMessage = "Your chat history has been cleared."
+	} else {
+		// Get the username of the target user if available
+		var targetUser User
+		err := b.db.Where("telegram_id = ? AND bot_id = ?", targetUserID, b.botID).First(&targetUser).Error
+		if err == nil && targetUser.Username != "" {
+			confirmationMessage = fmt.Sprintf("Chat history for user @%s (ID: %d) has been cleared.", targetUser.Username, targetUserID)
+		} else {
+			confirmationMessage = fmt.Sprintf("Chat history for user with ID %d has been cleared.", targetUserID)
+		}
+	}
+
+	if err := b.sendResponse(ctx, chatID, confirmationMessage, businessConnectionID); err != nil {
 		ErrorLogger.Printf("Error sending response: %v", err)
 	}
 }
