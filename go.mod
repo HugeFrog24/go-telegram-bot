@@ -6,7 +6,7 @@ toolchain go1.24.0
 
 require (
 	github.com/go-telegram/bot v1.14.1
-	github.com/liushuangls/go-anthropic/v2 v2.14.1
+	github.com/liushuangls/go-anthropic/v2 v2.15.0
 	github.com/stretchr/testify v1.10.0
 	golang.org/x/time v0.11.0
 	gorm.io/driver/sqlite v1.5.7
