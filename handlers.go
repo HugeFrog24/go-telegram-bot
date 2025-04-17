@@ -34,6 +34,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	chatID := message.Chat.ID
 	userID := message.From.ID
 	username := message.From.Username
+	firstName := message.From.FirstName
 	text := message.Text
 
 	// Check if it's a new chat
@@ -59,7 +60,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	if isNewChatFlag {
 
 		// Get response from Anthropic using the context messages
-		response, err := b.getAnthropicResponse(ctx, contextMessages, true, isOwner, false, username)
+		response, err := b.getAnthropicResponse(ctx, contextMessages, true, isOwner, false, username, firstName)
 		if err != nil {
 			ErrorLogger.Printf("Error getting Anthropic response: %v", err)
 			// Use the same error message as in the non-new chat case
@@ -192,7 +193,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		contextMessages := b.prepareContextMessages(chatMemory)
 
 		// Get response from Anthropic
-		response, err := b.getAnthropicResponse(ctx, contextMessages, false, isOwner, isEmojiOnly, username) // isNewChat is false here
+		response, err := b.getAnthropicResponse(ctx, contextMessages, false, isOwner, isEmojiOnly, username, firstName) // isNewChat is false here
 		if err != nil {
 			ErrorLogger.Printf("Error getting Anthropic response: %v", err)
 			response = "I'm sorry, I'm having trouble processing your request right now."
@@ -255,7 +256,7 @@ func (b *Bot) generateStickerResponse(ctx context.Context, message Message) (str
 		}
 
 		// Since this is a sticker message, isEmojiOnly is false
-		response, err := b.getAnthropicResponse(ctx, contextMessages, false, false, false, message.Username)
+		response, err := b.getAnthropicResponse(ctx, contextMessages, false, false, false, message.Username, "")
 		if err != nil {
 			return "", err
 		}

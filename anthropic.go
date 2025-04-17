@@ -8,7 +8,7 @@ import (
 	"github.com/liushuangls/go-anthropic/v2"
 )
 
-func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Message, isNewChat, isAdminOrOwner, isEmojiOnly bool, username string) (string, error) {
+func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Message, isNewChat, isAdminOrOwner, isEmojiOnly bool, username string, firstName string) (string, error) {
 	// Use prompts from config
 	var systemMessage string
 	if isNewChat {
@@ -20,10 +20,19 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Mes
 	// Combine default prompt with custom instructions
 	systemMessage = b.config.SystemPrompts["default"] + " " + b.config.SystemPrompts["custom_instructions"] + " " + systemMessage
 
-	// Replace username placeholder if present
-	if username != "" {
-		systemMessage = strings.ReplaceAll(systemMessage, "{username}", username)
+	// Handle username placeholder
+	usernameValue := username
+	if username == "" {
+		usernameValue = "unknown" // Use "unknown" when username is not available
 	}
+	systemMessage = strings.ReplaceAll(systemMessage, "{username}", usernameValue)
+
+	// Handle firstname placeholder
+	firstnameValue := firstName
+	if firstName == "" {
+		firstnameValue = "unknown" // Use "unknown" when first name is not available
+	}
+	systemMessage = strings.ReplaceAll(systemMessage, "{firstname}", firstnameValue)
 
 	if !isAdminOrOwner {
 		systemMessage += " " + b.config.SystemPrompts["avoid_sensitive"]
