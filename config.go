@@ -150,7 +150,11 @@ func loadConfig(filename string) (BotConfig, error) {
 	if err != nil {
 		return config, fmt.Errorf("failed to open config file %s: %w", cleanPath, err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			InfoLogger.Printf("Failed to close config file: %v", err)
+		}
+	}()
 
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&config); err != nil {
@@ -174,7 +178,11 @@ func (c *BotConfig) Reload(configDir, filename string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open config file %s: %w", cleanPath, err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			InfoLogger.Printf("Failed to close config file: %v", err)
+		}
+	}()
 
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(c); err != nil {

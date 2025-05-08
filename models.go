@@ -39,6 +39,7 @@ type Message struct {
 	IsUser         bool
 	StickerFileID  string
 	StickerPNGFile string
+	StickerEmoji   string    // Store the emoji associated with the sticker
 	DeletedAt      gorm.DeletedAt `gorm:"index"` // Add soft delete field
 	AnsweredOn     *time.Time     `gorm:"index"` // Tracks when a user message was answered (NULL for assistant messages and unanswered user messages)
 }
