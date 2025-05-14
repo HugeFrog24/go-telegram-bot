@@ -568,7 +568,11 @@ func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
 	// Determine message text based on message type
 	messageText := message.Text
 	if message.Sticker != nil {
-		messageText = "Sent a sticker."
+		if message.Sticker.Emoji != "" {
+			messageText = fmt.Sprintf("Sent a sticker: %s", message.Sticker.Emoji)
+		} else {
+			messageText = "Sent a sticker."
+		}
 	}
 
 	userMessage := b.createMessage(message.Chat.ID, message.From.ID, message.From.Username, userRole, messageText, true)
@@ -576,6 +580,7 @@ func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
 	// Handle sticker-specific details if present
 	if message.Sticker != nil {
 		userMessage.StickerFileID = message.Sticker.FileID
+		userMessage.StickerEmoji = message.Sticker.Emoji // Store the sticker emoji
 		if message.Sticker.Thumbnail != nil {
 			userMessage.StickerPNGFile = message.Sticker.Thumbnail.FileID
 		}

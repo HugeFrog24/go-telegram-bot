@@ -100,7 +100,11 @@ func TestValidateConfigPath(t *testing.T) {
 	if err := os.MkdirAll(subDir, 0755); err != nil {
 		t.Fatalf("Failed to create subdir: %v", err)
 	}
-	defer os.RemoveAll(subDir)
+	defer func() {
+		if err := os.RemoveAll(subDir); err != nil {
+			t.Errorf("Failed to remove test subdirectory: %v", err)
+		}
+	}()
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -124,7 +128,11 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			t.Errorf("Failed to remove temp directory: %v", err)
+		}
+	}()
 
 	// Valid config JSON
 	validConfig := `{
@@ -318,7 +326,11 @@ func TestLoadAllConfigs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			t.Errorf("Failed to remove temp directory: %v", err)
+		}
+	}()
 
 	tests := []struct {
 		name           string
@@ -511,7 +523,11 @@ func TestBotConfig_Reload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			t.Errorf("Failed to remove temp directory: %v", err)
+		}
+	}()
 
 	// Create initial config file
 	config1 := `{

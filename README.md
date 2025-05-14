@@ -76,11 +76,11 @@ To enable the bot to start automatically on system boot and run in the backgroun
    ```
 
    ```bash
-   sudo systemctl enable telegram-bot.service
+   sudo systemctl enable telegram-bot
    ```
 
    ```bash
-   sudo systemctl start telegram-bot.service
+   sudo systemctl start telegram-bot
    ```
 
 4. Check the status:

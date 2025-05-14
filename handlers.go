@@ -34,6 +34,11 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	chatID := message.Chat.ID
 	userID := message.From.ID
 	username := message.From.Username
+	firstName := message.From.FirstName
+	lastName := message.From.LastName
+	languageCode := message.From.LanguageCode
+	isPremium := message.From.IsPremium
+	messageTime := message.Date
 	text := message.Text
 
 	// Check if it's a new chat
@@ -59,7 +64,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	if isNewChatFlag {
 
 		// Get response from Anthropic using the context messages
-		response, err := b.getAnthropicResponse(ctx, contextMessages, true, isOwner, false, username)
+		response, err := b.getAnthropicResponse(ctx, contextMessages, true, isOwner, false, username, firstName, lastName, isPremium, languageCode, messageTime)
 		if err != nil {
 			ErrorLogger.Printf("Error getting Anthropic response: %v", err)
 			// Use the same error message as in the non-new chat case
@@ -104,7 +109,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 
 						// Check for "user" parameter
 						if len(parts) >= 2 && parts[1] == "user" {
-							var targetUserID int64 = userID // Default to current user
+							targetUserID := userID // Default to current user
 
 							// If a user ID is provided, parse it
 							if len(parts) >= 3 {
@@ -112,7 +117,9 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 								targetUserID, parseErr = strconv.ParseInt(parts[2], 10, 64)
 								if parseErr != nil {
 									InfoLogger.Printf("User %d provided invalid user ID format: %s", userID, parts[2])
-									b.sendResponse(ctx, chatID, "Invalid user ID format. Usage: /stats user [user_id]", businessConnectionID)
+									if err := b.sendResponse(ctx, chatID, "Invalid user ID format. Usage: /stats user [user_id]", businessConnectionID); err != nil {
+										ErrorLogger.Printf("Error sending response: %v", err)
+									}
 									return
 								}
 							}
@@ -122,7 +129,9 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 						}
 
 						// Invalid parameter
-						b.sendResponse(ctx, chatID, "Invalid command format. Usage: /stats or /stats user [user_id]", businessConnectionID)
+						if err := b.sendResponse(ctx, chatID, "Invalid command format. Usage: /stats or /stats user [user_id]", businessConnectionID); err != nil {
+							ErrorLogger.Printf("Error sending response: %v", err)
+						}
 						return
 					case "/whoami":
 						b.sendWhoAmI(ctx, chatID, userID, username, businessConnectionID)
@@ -138,7 +147,9 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 							if parseErr != nil {
 								// Invalid user ID format
 								InfoLogger.Printf("User %d provided invalid user ID format: %s", userID, parts[1])
-								b.sendResponse(ctx, chatID, "Invalid user ID format. Usage: /clear [user_id]", businessConnectionID)
+								if err := b.sendResponse(ctx, chatID, "Invalid user ID format. Usage: /clear [user_id]", businessConnectionID); err != nil {
+									ErrorLogger.Printf("Error sending response: %v", err)
+								}
 								return
 							}
 						}
@@ -155,7 +166,9 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 							if parseErr != nil {
 								// Invalid user ID format
 								InfoLogger.Printf("User %d provided invalid user ID format: %s", userID, parts[1])
-								b.sendResponse(ctx, chatID, "Invalid user ID format. Usage: /clear_hard [user_id]", businessConnectionID)
+								if err := b.sendResponse(ctx, chatID, "Invalid user ID format. Usage: /clear_hard [user_id]", businessConnectionID); err != nil {
+									ErrorLogger.Printf("Error sending response: %v", err)
+								}
 								return
 							}
 						}
@@ -192,7 +205,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		contextMessages := b.prepareContextMessages(chatMemory)
 
 		// Get response from Anthropic
-		response, err := b.getAnthropicResponse(ctx, contextMessages, false, isOwner, isEmojiOnly, username) // isNewChat is false here
+		response, err := b.getAnthropicResponse(ctx, contextMessages, false, isOwner, isEmojiOnly, username, firstName, lastName, isPremium, languageCode, messageTime) // isNewChat is false here
 		if err != nil {
 			ErrorLogger.Printf("Error getting Anthropic response: %v", err)
 			response = "I'm sorry, I'm having trouble processing your request right now."
@@ -244,18 +257,28 @@ func (b *Bot) handleStickerMessage(ctx context.Context, chatID int64, message *m
 func (b *Bot) generateStickerResponse(ctx context.Context, message Message) (string, error) {
 	// Example: Use the sticker type to generate a response
 	if message.StickerFileID != "" {
+		// Create message content with emoji information if available
+		var messageContent string
+		if message.StickerEmoji != "" {
+			messageContent = fmt.Sprintf("User sent a sticker: %s", message.StickerEmoji)
+		} else {
+			messageContent = "User sent a sticker."
+		}
+
 		// Prepare context with information about the sticker
 		contextMessages := []anthropic.Message{
 			{
 				Role: anthropic.RoleUser,
 				Content: []anthropic.MessageContent{
-					anthropic.NewTextMessageContent("User sent a sticker."),
+					anthropic.NewTextMessageContent(messageContent),
 				},
 			},
 		}
 
-		// Since this is a sticker message, isEmojiOnly is false
-		response, err := b.getAnthropicResponse(ctx, contextMessages, false, false, false, message.Username)
+		// Treat sticker messages like emoji messages to get emoji responses
+		// Convert the timestamp to Unix time for the messageTime parameter
+		messageTime := int(message.Timestamp.Unix())
+		response, err := b.getAnthropicResponse(ctx, contextMessages, false, false, true, message.Username, "", "", false, "", messageTime)
 		if err != nil {
 			return "", err
 		}
