@@ -90,7 +90,7 @@ func TestTimeContextCalculation(t *testing.T) {
 			}
 
 			// Calculate time context using the same logic as in anthropic.go
-			timeContext := "day"
+			var timeContext string
 			if actualHour >= 5 && actualHour < 12 {
 				timeContext = "morning"
 			} else if actualHour >= 12 && actualHour < 18 {
@@ -166,7 +166,7 @@ func TestSystemMessagePlaceholderReplacement(t *testing.T) {
 	// Handle time awareness
 	timeObj := time.Unix(int64(messageTime), 0)
 	hour := timeObj.Hour()
-	timeContext := "day"
+	var timeContext string
 	if hour >= 5 && hour < 12 {
 		timeContext = "morning"
 	} else if hour >= 12 && hour < 18 {
