@@ -104,12 +104,20 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Mes
 
 	model := anthropic.Model(b.config.Model)
 
-	resp, err := b.anthropicClient.CreateMessages(ctx, anthropic.MessagesRequest{
+	// Create the request
+	request := anthropic.MessagesRequest{
 		Model:     model, // Now `model` is of type anthropic.Model
 		Messages:  messages,
 		System:    systemMessage,
 		MaxTokens: 1000,
-	})
+	}
+
+	// Apply temperature if set in config
+	if b.config.Temperature != nil {
+		request.Temperature = b.config.Temperature
+	}
+
+	resp, err := b.anthropicClient.CreateMessages(ctx, request)
 	if err != nil {
 		return "", fmt.Errorf("error creating Anthropic message: %w", err)
 	}

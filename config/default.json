@@ -9,6 +9,7 @@
     "messages_per_day": 100,
     "temp_ban_duration": "24h",
     "model": "claude-3-5-haiku-latest",
+    "temperature": 0.7,
     "debug_screening": false,
     "system_prompts": {
         "default": "You are a helpful assistant.",

@@ -18,6 +18,7 @@ type BotConfig struct {
 	MessagePerDay   int               `json:"messages_per_day"`
 	TempBanDuration string            `json:"temp_ban_duration"`
 	Model           anthropic.Model   `json:"model"`
+	Temperature     *float32          `json:"temperature,omitempty"` // Controls creativity vs determinism (0.0-1.0)
 	SystemPrompts   map[string]string `json:"system_prompts"`
 	Active          bool              `json:"active"`
 	OwnerTelegramID int64             `json:"owner_telegram_id"`
