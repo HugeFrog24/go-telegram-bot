@@ -184,6 +184,89 @@ func TestPromoteUserToAdmin(t *testing.T) {
 	}
 }
 
+// TestGetOrCreateUser tests the getOrCreateUser method of the Bot.
+// It verifies that a new user is created when one does not exist,
+// and an existing user is returned when one does exist.
+func TestGetOrCreateUser(t *testing.T) {
+	// Initialize the database
+	db, err := initDB()
+	if err != nil {
+		t.Fatalf("Failed to initialize database: %v", err)
+	}
+
+	// Create a mock clock starting at a fixed time
+	mockClock := &MockClock{
+		currentTime: time.Date(2023, 10, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	// Create a mock configuration
+	config := BotConfig{
+		ID:              "bot1",
+		MemorySize:      10,
+		MessagePerHour:  5,
+		MessagePerDay:   10,
+		TempBanDuration: "1m",
+		SystemPrompts:   make(map[string]string),
+		TelegramToken:   "YOUR_TELEGRAM_BOT_TOKEN",
+		OwnerTelegramID: 123456789,
+	}
+
+	// Initialize MockTelegramClient
+	mockTGClient := &MockTelegramClient{
+		SendMessageFunc: func(ctx context.Context, params *bot.SendMessageParams) (*models.Message, error) {
+			chatID, ok := params.ChatID.(int64)
+			if !ok {
+				return nil, fmt.Errorf("ChatID is not of type int64")
+			}
+			// Simulate successful message sending
+			return &models.Message{ID: 1, Chat: models.Chat{ID: chatID}}, nil
+		},
+	}
+
+	// Create the bot with the mock Telegram client
+	bot, err := NewBot(db, config, mockClock, mockTGClient)
+	if err != nil {
+		t.Fatalf("Failed to create bot: %v", err)
+	}
+
+	// Verify that the owner exists
+	var owner User
+	err = db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", config.OwnerTelegramID, bot.botID, true).First(&owner).Error
+	if err != nil {
+		t.Fatalf("Owner was not created: %v", err)
+	}
+
+	// Attempt to create another owner for the same bot
+	_, err = bot.getOrCreateUser(222222222, "AnotherOwner", true)
+	if err == nil {
+		t.Fatalf("Expected error when creating a second owner, but got none")
+	}
+
+	// Create a new user
+	newUser, err := bot.getOrCreateUser(987654321, "TestUser", false)
+	if err != nil {
+		t.Fatalf("Failed to create a new user: %v", err)
+	}
+
+	// Verify that the new user was created
+	var userInDB User
+	err = db.Where("telegram_id = ?", newUser.TelegramID).First(&userInDB).Error
+	if err != nil {
+		t.Fatalf("New user was not created in the database: %v", err)
+	}
+
+	// Get the existing user
+	existingUser, err := bot.getOrCreateUser(987654321, "TestUser", false)
+	if err != nil {
+		t.Fatalf("Failed to get existing user: %v", err)
+	}
+
+	// Verify that the existing user is the same as the new user
+	if existingUser.ID != userInDB.ID {
+		t.Fatalf("Expected to get the existing user, but got a different user")
+	}
+}
+
 // To ensure thread safety and avoid race conditions during testing,
 // you can run the tests with the `-race` flag:
 // go test -race -v

@@ -10,7 +10,7 @@ import (
 	"github.com/liushuangls/go-anthropic/v2"
 )
 
-// Add this at the beginning of the file, after the imports
+// Set up loggers
 func TestMain(m *testing.M) {
 	initLoggers()
 	os.Exit(m.Run())
@@ -26,6 +26,7 @@ func TestBotConfig_UnmarshalJSON(t *testing.T) {
 		"messages_per_day": 100,
 		"temp_ban_duration": "1h",
 		"model": "claude-v1",
+		"temperature": 0.7,
 		"system_prompts": {"welcome": "Hello!"},
 		"active": true,
 		"owner_telegram_id": 123456789,
@@ -100,7 +101,11 @@ func TestValidateConfigPath(t *testing.T) {
 	if err := os.MkdirAll(subDir, 0755); err != nil {
 		t.Fatalf("Failed to create subdir: %v", err)
 	}
-	defer os.RemoveAll(subDir)
+	defer func() {
+		if err := os.RemoveAll(subDir); err != nil {
+			t.Errorf("Failed to remove test subdirectory: %v", err)
+		}
+	}()
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -124,7 +129,11 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			t.Errorf("Failed to remove temp directory: %v", err)
+		}
+	}()
 
 	// Valid config JSON
 	validConfig := `{
@@ -135,6 +144,7 @@ func TestLoadConfig(t *testing.T) {
 		"messages_per_day": 100,
 		"temp_ban_duration": "1h",
 		"model": "claude-v1",
+		"temperature": 0.7,
 		"system_prompts": {"welcome": "Hello!"},
 		"active": true,
 		"owner_telegram_id": 123456789,
@@ -318,7 +328,11 @@ func TestLoadAllConfigs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			t.Errorf("Failed to remove temp directory: %v", err)
+		}
+	}()
 
 	tests := []struct {
 		name           string
@@ -338,6 +352,7 @@ func TestLoadAllConfigs(t *testing.T) {
 					"messages_per_day": 100,
 					"temp_ban_duration": "1h",
 					"model": "claude-v1",
+					"temperature": 0.7,
 					"system_prompts": {"welcome": "Hello!"},
 					"active": true,
 					"owner_telegram_id": 123456789,
@@ -371,6 +386,7 @@ func TestLoadAllConfigs(t *testing.T) {
 					"messages_per_day": 50,
 					"temp_ban_duration": "30m",
 					"model": "claude-v2",
+					"temperature": 0.5,
 					"system_prompts": {"welcome": "Hi!"},
 					"active": false,
 					"owner_telegram_id": 987654321,
@@ -404,6 +420,7 @@ func TestLoadAllConfigs(t *testing.T) {
 					"messages_per_day": 20,
 					"temp_ban_duration": "15m",
 					"model": "claude-v3",
+					"temperature": 0.3,
 					"system_prompts": {"welcome": "Hey!"},
 					"active": true,
 					"owner_telegram_id": 1122334455,
@@ -437,6 +454,7 @@ func TestLoadAllConfigs(t *testing.T) {
 					"messages_per_day": 10,
 					"temp_ban_duration": "5m",
 					"model": "claude-v4",
+					"temperature": 0.2,
 					"system_prompts": {"welcome": "Greetings!"},
 					"active": true,
 					"owner_telegram_id": 5566778899,
@@ -511,7 +529,11 @@ func TestBotConfig_Reload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
+	defer func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			t.Errorf("Failed to remove temp directory: %v", err)
+		}
+	}()
 
 	// Create initial config file
 	config1 := `{
@@ -522,6 +544,7 @@ func TestBotConfig_Reload(t *testing.T) {
 		"messages_per_day": 100,
 		"temp_ban_duration": "1h",
 		"model": "claude-v1",
+		"temperature": 0.7,
 		"system_prompts": {"welcome": "Hello!"},
 		"active": true,
 		"owner_telegram_id": 123456789,
@@ -555,6 +578,7 @@ func TestBotConfig_Reload(t *testing.T) {
 		"messages_per_day": 200,
 		"temp_ban_duration": "2h",
 		"model": "claude-v2",
+		"temperature": 0.3,
 		"system_prompts": {"welcome": "Hi there!"},
 		"active": true,
 		"owner_telegram_id": 987654321,
@@ -594,6 +618,7 @@ func TestBotConfig_UnmarshalJSON_Invalid(t *testing.T) {
 		"messages_per_day": 100,
 		"temp_ban_duration": "1h",
 		"model": "",
+		"temperature": 0.7,
 		"system_prompts": {"welcome": "Hello!"},
 		"active": true,
 		"owner_telegram_id": 123456789,
@@ -614,6 +639,86 @@ func TestBotConfig_UnmarshalJSON_Invalid(t *testing.T) {
 // Helper function to check substring
 func contains(s, substr string) bool {
 	return strings.Contains(s, substr)
+}
+
+// TestTemperatureConfig tests that the temperature value is correctly loaded
+func TestTemperatureConfig(t *testing.T) {
+	// Create a temporary directory
+	tempDir, err := os.MkdirTemp("", "temperature_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			t.Errorf("Failed to remove temp directory: %v", err)
+		}
+	}()
+
+	// Create config with temperature
+	configWithTemp := `{
+		"id": "bot123",
+		"telegram_token": "token123",
+		"memory_size": 1024,
+		"messages_per_hour": 10,
+		"messages_per_day": 100,
+		"temp_ban_duration": "1h",
+		"model": "claude-v1",
+		"temperature": 0.42,
+		"system_prompts": {"welcome": "Hello!"},
+		"active": true,
+		"owner_telegram_id": 123456789,
+		"anthropic_api_key": "api_key_123"
+	}`
+
+	// Create config without temperature
+	configWithoutTemp := `{
+		"id": "bot124",
+		"telegram_token": "token124",
+		"memory_size": 1024,
+		"messages_per_hour": 10,
+		"messages_per_day": 100,
+		"temp_ban_duration": "1h",
+		"model": "claude-v1",
+		"system_prompts": {"welcome": "Hello!"},
+		"active": true,
+		"owner_telegram_id": 123456789,
+		"anthropic_api_key": "api_key_123"
+	}`
+
+	// Write config files
+	withTempPath := filepath.Join(tempDir, "with_temp.json")
+	if err := os.WriteFile(withTempPath, []byte(configWithTemp), 0644); err != nil {
+		t.Fatalf("Failed to write config with temperature: %v", err)
+	}
+
+	withoutTempPath := filepath.Join(tempDir, "without_temp.json")
+	if err := os.WriteFile(withoutTempPath, []byte(configWithoutTemp), 0644); err != nil {
+		t.Fatalf("Failed to write config without temperature: %v", err)
+	}
+
+	// Test loading config with temperature
+	configWithTempObj, err := loadConfig(withTempPath)
+	if err != nil {
+		t.Fatalf("Failed to load config with temperature: %v", err)
+	}
+
+	// Verify temperature is set correctly
+	if configWithTempObj.Temperature == nil {
+		t.Errorf("Expected Temperature to be set, got nil")
+	} else if *configWithTempObj.Temperature != 0.42 {
+		t.Errorf("Expected Temperature 0.42, got %f", *configWithTempObj.Temperature)
+	}
+
+	// Test loading config without temperature
+	configWithoutTempObj, err := loadConfig(withoutTempPath)
+	if err != nil {
+		t.Fatalf("Failed to load config without temperature: %v", err)
+	}
+
+	// Verify temperature is nil when not specified
+	if configWithoutTempObj.Temperature != nil {
+		t.Errorf("Expected Temperature to be nil, got %f", *configWithoutTempObj.Temperature)
+	}
 }
 
 // Additional tests can be added here to cover more scenarios
