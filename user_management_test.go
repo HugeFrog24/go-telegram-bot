@@ -188,10 +188,25 @@ func TestPromoteUserToAdmin(t *testing.T) {
 // It verifies that a new user is created when one does not exist,
 // and an existing user is returned when one does exist.
 func TestGetOrCreateUser(t *testing.T) {
-	// Initialize the database
-	db, err := initDB()
+	// Initialize loggers
+	initLoggers()
+
+	// Initialize in-memory database for testing
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
-		t.Fatalf("Failed to initialize database: %v", err)
+		t.Fatalf("Failed to open in-memory database: %v", err)
+	}
+
+	// Migrate the schema
+	err = db.AutoMigrate(&BotModel{}, &ConfigModel{}, &Message{}, &User{}, &Role{})
+	if err != nil {
+		t.Fatalf("Failed to migrate database schema: %v", err)
+	}
+
+	// Create default roles
+	err = createDefaultRoles(db)
+	if err != nil {
+		t.Fatalf("Failed to create default roles: %v", err)
 	}
 
 	// Create a mock clock starting at a fixed time
