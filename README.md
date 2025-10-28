@@ -115,9 +115,7 @@ go test -race -v ./...
 
 ## Storage
 
-At the moment, a SQLite database (`bot.db`) is used for persistent storage:
-- **Docker**: `./data/bot.db` (bind mounted)
-- **Native**: `bot.db` in application directory
+At the moment, a SQLite database (`./data/bot.db`) is used for persistent storage.
 
 Remember to back it up regularly.
 

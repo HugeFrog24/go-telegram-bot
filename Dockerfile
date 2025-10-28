@@ -53,9 +53,5 @@ USER appuser
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD pgrep telegram-bot || exit 1
 
-# Set environment variables
-ENV CONFIG_DIR=/app/config
-ENV DATA_DIR=/app/data
-
 # Run the application
 CMD ["/app/telegram-bot"]

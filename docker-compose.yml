@@ -10,11 +10,8 @@ services:
     container_name: go-telegram-bot
     restart: unless-stopped
     
-    # Environment variables (can be overridden with .env file)
-    environment:
-      - CONFIG_DIR=/app/config
-      - DATA_DIR=/app/data
-      # Optional: Override specific config values via environment
+    # Optional: Environment variables (can be overridden with .env file)
+    # environment:
       # - BOT_LOG_LEVEL=info
     
     # Volume mounts
