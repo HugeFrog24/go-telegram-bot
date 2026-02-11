@@ -20,7 +20,7 @@ func initDB() (*gorm.DB, error) {
 		},
 	)
 
-	db, err := gorm.Open(sqlite.Open("bot.db"), &gorm.Config{
+	db, err := gorm.Open(sqlite.Open("data/bot.db"), &gorm.Config{
 		Logger: newLogger,
 	})
 	if err != nil {

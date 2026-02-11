@@ -29,16 +29,19 @@ type ConfigModel struct {
 
 type Message struct {
 	gorm.Model
-	BotID          uint
-	ChatID         int64
-	UserID         int64
-	Username       string
-	UserRole       string
-	Text           string
-	StickerFileID  string `json:"sticker_file_id,omitempty"`  // New field to store Sticker File ID
-	StickerPNGFile string `json:"sticker_png_file,omitempty"` // Optionally store PNG file ID if needed
-	Timestamp      time.Time
+	BotID          uint      `gorm:"index"`
+	ChatID         int64     `gorm:"index"`
+	UserID         int64     `gorm:"index"`
+	Username       string    `gorm:"index"`
+	UserRole       string    // Store the role as a string
+	Text           string    `gorm:"type:text"`
+	Timestamp      time.Time `gorm:"index"`
 	IsUser         bool
+	StickerFileID  string
+	StickerPNGFile string
+	StickerEmoji   string    // Store the emoji associated with the sticker
+	DeletedAt      gorm.DeletedAt `gorm:"index"` // Add soft delete field
+	AnsweredOn     *time.Time     `gorm:"index"` // Tracks when a user message was answered (NULL for assistant messages and unanswered user messages)
 }
 
 type ChatMemory struct {

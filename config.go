@@ -18,10 +18,12 @@ type BotConfig struct {
 	MessagePerDay   int               `json:"messages_per_day"`
 	TempBanDuration string            `json:"temp_ban_duration"`
 	Model           anthropic.Model   `json:"model"`
+	Temperature     *float32          `json:"temperature,omitempty"` // Controls creativity vs determinism (0.0-1.0)
 	SystemPrompts   map[string]string `json:"system_prompts"`
 	Active          bool              `json:"active"`
 	OwnerTelegramID int64             `json:"owner_telegram_id"`
 	AnthropicAPIKey string            `json:"anthropic_api_key"`
+	DebugScreening  bool              `json:"debug_screening"` // Enable detailed screening logs
 }
 
 // Custom unmarshalling to handle anthropic.Model
@@ -144,12 +146,15 @@ func validateConfig(config *BotConfig, ids, tokens map[string]bool) error {
 func loadConfig(filename string) (BotConfig, error) {
 	var config BotConfig
 	// Use filepath.Clean before opening the file
-	cleanPath := filepath.Clean(filename)
-	file, err := os.OpenFile(cleanPath, os.O_RDONLY, 0)
+	file, err := os.OpenFile(filepath.Clean(filename), os.O_RDONLY, 0)
 	if err != nil {
-		return config, fmt.Errorf("failed to open config file %s: %w", cleanPath, err)
+		return config, fmt.Errorf("failed to open config file %s: %w", filename, err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			InfoLogger.Printf("Failed to close config file: %v", err)
+		}
+	}()
 
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&config); err != nil {
@@ -173,7 +178,11 @@ func (c *BotConfig) Reload(configDir, filename string) error {
 	if err != nil {
 		return fmt.Errorf("failed to open config file %s: %w", cleanPath, err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			InfoLogger.Printf("Failed to close config file: %v", err)
+		}
+	}()
 
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(c); err != nil {

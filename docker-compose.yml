@@ -1,0 +1,39 @@
+services:
+  telegram-bot:
+    image: bogerserge/go-telegram-bot:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    container_name: go-telegram-bot
+    restart: unless-stopped
+    
+    # Optional: Environment variables (can be overridden with .env file)
+    # environment:
+      # - BOT_LOG_LEVEL=info
+    
+    # Volume mounts
+    volumes:
+      # Bind mount config directory for live configuration updates
+      - ./config:/app/config:ro
+      # Named volume for persistent database storage
+      - ./data:/app/data
+      # Optional: Bind mount for log access (uncomment if needed)
+      # - ./logs:/app/logs
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "pgrep", "telegram-bot"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
