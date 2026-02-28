@@ -1,3 +1,6 @@
+# Local IDE config & user settings
+.vscode/
+
 # Go vendor directory
 vendor/
 
