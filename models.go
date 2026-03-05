@@ -29,16 +29,19 @@ type ConfigModel struct {
 
 type Message struct {
 	gorm.Model
-	BotID          uint
-	ChatID         int64
-	UserID         int64
-	Username       string
-	UserRole       string
-	Text           string
-	StickerFileID  string `json:"sticker_file_id,omitempty"`  // New field to store Sticker File ID
-	StickerPNGFile string `json:"sticker_png_file,omitempty"` // Optionally store PNG file ID if needed
-	Timestamp      time.Time
+	BotID          uint      `gorm:"index"`
+	ChatID         int64     `gorm:"index"`
+	UserID         int64     `gorm:"index"`
+	Username       string    `gorm:"index"`
+	UserRole       string    // Store the role as a string
+	Text           string    `gorm:"type:text"`
+	Timestamp      time.Time `gorm:"index"`
 	IsUser         bool
+	StickerFileID  string
+	StickerPNGFile string
+	StickerEmoji   string         // Store the emoji associated with the sticker
+	DeletedAt      gorm.DeletedAt `gorm:"index"` // Add soft delete field
+	AnsweredOn     *time.Time     `gorm:"index"` // Tracks when a user message was answered (NULL for assistant messages and unanswered user messages)
 }
 
 type ChatMemory struct {
@@ -47,22 +50,41 @@ type ChatMemory struct {
 	BusinessConnectionID string // New field to store the business connection ID
 }
 
-type Role struct {
+// Scope name constants — used in DB seeding, hasScope checks, and tests.
+const (
+	ScopeStatsViewOwn        = "stats:view:own"
+	ScopeStatsViewAny        = "stats:view:any"
+	ScopeHistoryClearOwn     = "history:clear:own"
+	ScopeHistoryClearAny     = "history:clear:any"
+	ScopeHistoryClearHardOwn = "history:clear_hard:own"
+	ScopeHistoryClearHardAny = "history:clear_hard:any"
+	ScopeModelSet            = "model:set"
+	ScopeUserPromote         = "user:promote"
+)
+
+type Scope struct {
 	gorm.Model
 	Name string `gorm:"uniqueIndex"`
 }
 
+type Role struct {
+	gorm.Model
+	Name   string  `gorm:"uniqueIndex"`
+	Scopes []Scope `gorm:"many2many:role_scopes;"`
+}
+
 type User struct {
 	gorm.Model
-	BotID      uint  `gorm:"index"`                // Foreign key to BotModel
-	TelegramID int64 `gorm:"uniqueIndex;not null"` // Unique per user
+	BotID      uint  `gorm:"uniqueIndex:idx_user_bot;index"`    // Foreign key to BotModel
+	TelegramID int64 `gorm:"uniqueIndex:idx_user_bot;not null"` // Unique per (telegram_id, bot_id) pair
 	Username   string
 	RoleID     uint
 	Role       Role `gorm:"foreignKey:RoleID"`
 	IsOwner    bool `gorm:"default:false"` // Indicates if the user is the owner
 }
 
-// Compound unique index to ensure only one owner per bot
+// idx_user_bot is a composite unique index on (bot_id, telegram_id),
+// allowing the same Telegram user to be registered independently on each bot.
 func (User) TableName() string {
 	return "users"
 }

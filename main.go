@@ -47,19 +47,13 @@ func main() {
 				return
 			}
 
-			// Initialize TelegramClient with the bot's handleUpdate method
-			tgClient, err := initTelegramBot(cfg.TelegramToken, bot.handleUpdate)
-			if err != nil {
-				ErrorLogger.Printf("Error initializing Telegram client for bot %s: %v", cfg.ID, err)
-				return
-			}
+			// Start the bot in a separate goroutine
+			go bot.Start(ctx)
 
-			// Assign the TelegramClient to the bot
-			bot.tgBot = tgClient
+			// Keep the bot running until the context is cancelled
+			<-ctx.Done()
 
-			// Start the bot
-			InfoLogger.Printf("Starting bot %s...", cfg.ID)
-			bot.Start(ctx)
+			InfoLogger.Printf("Bot %s stopped", cfg.ID)
 		}(config)
 	}
 

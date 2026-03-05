@@ -12,26 +12,38 @@ import (
 	"gorm.io/gorm"
 )
 
+const (
+	errOpenDB        = "Failed to open in-memory database: %v"
+	errMigrateSchema = "Failed to migrate database schema: %v"
+	errCreateRoles   = "Failed to create default roles: %v"
+	errCreateScopes  = "Failed to create default scopes: %v"
+	errCreateBot     = "Failed to create bot: %v"
+	memoryDSN        = ":memory:"
+)
+
 func TestOwnerAssignment(t *testing.T) {
 	// Initialize loggers
 	initLoggers()
 
 	// Initialize in-memory database for testing
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(memoryDSN), &gorm.Config{})
 	if err != nil {
-		t.Fatalf("Failed to open in-memory database: %v", err)
+		t.Fatalf(errOpenDB, err)
 	}
 
 	// Migrate the schema
-	err = db.AutoMigrate(&BotModel{}, &ConfigModel{}, &Message{}, &User{}, &Role{})
+	err = db.AutoMigrate(&BotModel{}, &ConfigModel{}, &Message{}, &User{}, &Role{}, &Scope{})
 	if err != nil {
-		t.Fatalf("Failed to migrate database schema: %v", err)
+		t.Fatalf(errMigrateSchema, err)
 	}
 
-	// Create default roles
+	// Create default roles and scopes
 	err = createDefaultRoles(db)
 	if err != nil {
-		t.Fatalf("Failed to create default roles: %v", err)
+		t.Fatalf(errCreateRoles, err)
+	}
+	if err := createDefaultScopes(db); err != nil {
+		t.Fatalf(errCreateScopes, err)
 	}
 
 	// Create a bot configuration
@@ -67,7 +79,7 @@ func TestOwnerAssignment(t *testing.T) {
 	// Create the bot with the mock Telegram client
 	bot, err := NewBot(db, config, mockClock, mockTGClient)
 	if err != nil {
-		t.Fatalf("Failed to create bot: %v", err)
+		t.Fatalf(errCreateBot, err)
 	}
 
 	// Verify that the owner exists
@@ -119,21 +131,24 @@ func TestPromoteUserToAdmin(t *testing.T) {
 	initLoggers()
 
 	// Initialize in-memory database for testing
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(memoryDSN), &gorm.Config{})
 	if err != nil {
-		t.Fatalf("Failed to open in-memory database: %v", err)
+		t.Fatalf(errOpenDB, err)
 	}
 
 	// Migrate the schema
-	err = db.AutoMigrate(&BotModel{}, &ConfigModel{}, &Message{}, &User{}, &Role{})
+	err = db.AutoMigrate(&BotModel{}, &ConfigModel{}, &Message{}, &User{}, &Role{}, &Scope{})
 	if err != nil {
-		t.Fatalf("Failed to migrate database schema: %v", err)
+		t.Fatalf(errMigrateSchema, err)
 	}
 
-	// Create default roles
+	// Create default roles and scopes
 	err = createDefaultRoles(db)
 	if err != nil {
-		t.Fatalf("Failed to create default roles: %v", err)
+		t.Fatalf(errCreateRoles, err)
+	}
+	if err := createDefaultScopes(db); err != nil {
+		t.Fatalf(errCreateScopes, err)
 	}
 
 	config := BotConfig{
@@ -153,7 +168,7 @@ func TestPromoteUserToAdmin(t *testing.T) {
 
 	bot, err := NewBot(db, config, mockClock, mockTGClient)
 	if err != nil {
-		t.Fatalf("Failed to create bot: %v", err)
+		t.Fatalf(errCreateBot, err)
 	}
 
 	// Create an owner
@@ -181,6 +196,107 @@ func TestPromoteUserToAdmin(t *testing.T) {
 
 	if promotedUser.Role.Name != "admin" {
 		t.Fatalf("Expected role 'admin', got '%s'", promotedUser.Role.Name)
+	}
+}
+
+// TestGetOrCreateUser tests the getOrCreateUser method of the Bot.
+// It verifies that a new user is created when one does not exist,
+// and an existing user is returned when one does exist.
+func TestGetOrCreateUser(t *testing.T) {
+	// Initialize loggers
+	initLoggers()
+
+	// Initialize in-memory database for testing
+	db, err := gorm.Open(sqlite.Open(memoryDSN), &gorm.Config{})
+	if err != nil {
+		t.Fatalf(errOpenDB, err)
+	}
+
+	// Migrate the schema
+	err = db.AutoMigrate(&BotModel{}, &ConfigModel{}, &Message{}, &User{}, &Role{}, &Scope{})
+	if err != nil {
+		t.Fatalf(errMigrateSchema, err)
+	}
+
+	// Create default roles and scopes
+	err = createDefaultRoles(db)
+	if err != nil {
+		t.Fatalf(errCreateRoles, err)
+	}
+	if err := createDefaultScopes(db); err != nil {
+		t.Fatalf(errCreateScopes, err)
+	}
+
+	// Create a mock clock starting at a fixed time
+	mockClock := &MockClock{
+		currentTime: time.Date(2023, 10, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	// Create a mock configuration
+	config := BotConfig{
+		ID:              "bot1",
+		MemorySize:      10,
+		MessagePerHour:  5,
+		MessagePerDay:   10,
+		TempBanDuration: "1m",
+		SystemPrompts:   make(map[string]string),
+		TelegramToken:   "YOUR_TELEGRAM_BOT_TOKEN",
+		OwnerTelegramID: 123456789,
+	}
+
+	// Initialize MockTelegramClient
+	mockTGClient := &MockTelegramClient{
+		SendMessageFunc: func(ctx context.Context, params *bot.SendMessageParams) (*models.Message, error) {
+			chatID, ok := params.ChatID.(int64)
+			if !ok {
+				return nil, fmt.Errorf("ChatID is not of type int64")
+			}
+			// Simulate successful message sending
+			return &models.Message{ID: 1, Chat: models.Chat{ID: chatID}}, nil
+		},
+	}
+
+	// Create the bot with the mock Telegram client
+	bot, err := NewBot(db, config, mockClock, mockTGClient)
+	if err != nil {
+		t.Fatalf(errCreateBot, err)
+	}
+
+	// Verify that the owner exists
+	var owner User
+	err = db.Where("telegram_id = ? AND bot_id = ? AND is_owner = ?", config.OwnerTelegramID, bot.botID, true).First(&owner).Error
+	if err != nil {
+		t.Fatalf("Owner was not created: %v", err)
+	}
+
+	// Attempt to create another owner for the same bot
+	_, err = bot.getOrCreateUser(222222222, "AnotherOwner", true)
+	if err == nil {
+		t.Fatalf("Expected error when creating a second owner, but got none")
+	}
+
+	// Create a new user
+	newUser, err := bot.getOrCreateUser(987654321, "TestUser", false)
+	if err != nil {
+		t.Fatalf("Failed to create a new user: %v", err)
+	}
+
+	// Verify that the new user was created
+	var userInDB User
+	err = db.Where("telegram_id = ?", newUser.TelegramID).First(&userInDB).Error
+	if err != nil {
+		t.Fatalf("New user was not created in the database: %v", err)
+	}
+
+	// Get the existing user
+	existingUser, err := bot.getOrCreateUser(987654321, "TestUser", false)
+	if err != nil {
+		t.Fatalf("Failed to get existing user: %v", err)
+	}
+
+	// Verify that the existing user is the same as the new user
+	if existingUser.ID != userInDB.ID {
+		t.Fatalf("Expected to get the existing user, but got a different user")
 	}
 }
 

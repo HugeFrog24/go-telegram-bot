@@ -11,6 +11,6 @@ import (
 // TelegramClient defines the methods required from the Telegram bot.
 type TelegramClient interface {
 	SendMessage(ctx context.Context, params *bot.SendMessageParams) (*models.Message, error)
+	SetMyCommands(ctx context.Context, params *bot.SetMyCommandsParams) (bool, error)
 	Start(ctx context.Context)
-	// Add other methods if needed.
 }

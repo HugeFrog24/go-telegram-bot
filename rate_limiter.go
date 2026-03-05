@@ -50,8 +50,14 @@ func (b *Bot) checkRateLimits(userID int64) bool {
 		limiter.lastDailyReset = now
 	}
 
-	// Check if the message exceeds rate limits
-	if !limiter.hourlyLimiter.Allow() || !limiter.dailyLimiter.Allow() {
+	// Check if the message exceeds rate limits.
+	// Reserve from both limiters first, then cancel both if either is over budget.
+	// This prevents consuming a token from one limiter when the other rejects.
+	dailyRes := limiter.dailyLimiter.ReserveN(now, 1)
+	hourlyRes := limiter.hourlyLimiter.ReserveN(now, 1)
+	if dailyRes.DelayFrom(now) > 0 || hourlyRes.DelayFrom(now) > 0 {
+		dailyRes.CancelAt(now)
+		hourlyRes.CancelAt(now)
 		banDuration, err := time.ParseDuration(b.config.TempBanDuration)
 		if err != nil {
 			// If parsing fails, default to a 24-hour ban

@@ -5,22 +5,26 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/liushuangls/go-anthropic/v2"
 )
 
 type BotConfig struct {
-	ID              string            `json:"id"`             // Unique identifier for the bot
-	TelegramToken   string            `json:"telegram_token"` // Telegram Bot Token
+	ID              string            `json:"id"`
+	TelegramToken   string            `json:"telegram_token"`
 	MemorySize      int               `json:"memory_size"`
 	MessagePerHour  int               `json:"messages_per_hour"`
 	MessagePerDay   int               `json:"messages_per_day"`
 	TempBanDuration string            `json:"temp_ban_duration"`
-	Model           anthropic.Model   `json:"model"` // Changed from string to anthropic.Model
+	Model           anthropic.Model   `json:"model"`
+	Temperature     *float32          `json:"temperature,omitempty"` // Controls creativity vs determinism (0.0-1.0)
 	SystemPrompts   map[string]string `json:"system_prompts"`
-	Active          bool              `json:"active"` // New field to control bot activity
+	Active          bool              `json:"active"`
 	OwnerTelegramID int64             `json:"owner_telegram_id"`
-	AnthropicAPIKey string            `json:"anthropic_api_key"` // Add this line
+	AnthropicAPIKey string            `json:"anthropic_api_key"`
+	DebugScreening  bool              `json:"debug_screening"` // Enable detailed screening logs
+	ConfigFilePath  string            `json:"-"`               // Set at load time; not serialized
 }
 
 // Custom unmarshalling to handle anthropic.Model
@@ -32,13 +36,43 @@ func (c *BotConfig) UnmarshalJSON(data []byte) error {
 	}{
 		Alias: (*Alias)(c),
 	}
-
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
 	}
-
 	c.Model = anthropic.Model(aux.Model)
 	return nil
+}
+
+// validateConfigPath ensures the file path is within the allowed directory
+func validateConfigPath(configDir, filename string) (string, error) {
+	// Clean the paths to remove any . or .. components
+	configDir = filepath.Clean(configDir)
+	filename = filepath.Clean(filename)
+
+	// Get absolute paths
+	absConfigDir, err := filepath.Abs(configDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to get absolute path for config directory: %w", err)
+	}
+
+	fullPath := filepath.Join(absConfigDir, filename)
+	absPath, err := filepath.Abs(fullPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to get absolute path for config file: %w", err)
+	}
+
+	// Use filepath.Rel to check if the path is within the config directory
+	rel, err := filepath.Rel(absConfigDir, absPath)
+	if err != nil || strings.HasPrefix(rel, "..") || strings.Contains(rel, "..") {
+		return "", fmt.Errorf("invalid config path: file must be within the config directory")
+	}
+
+	// Verify file extension
+	if filepath.Ext(absPath) != ".json" {
+		return "", fmt.Errorf("invalid file extension: must be .json")
+	}
+
+	return absPath, nil
 }
 
 func loadAllConfigs(dir string) ([]BotConfig, error) {
@@ -53,59 +87,84 @@ func loadAllConfigs(dir string) ([]BotConfig, error) {
 
 	for _, file := range files {
 		if filepath.Ext(file.Name()) == ".json" {
-			configPath := filepath.Join(dir, file.Name())
-			config, err := loadConfig(configPath)
+			validPath, err := validateConfigPath(dir, file.Name())
 			if err != nil {
-				return nil, fmt.Errorf("failed to load config %s: %w", configPath, err)
+				InfoLogger.Printf("Invalid config path for %s: %v", file.Name(), err)
+				continue
 			}
 
-			// Skip inactive bots
+			config, err := loadConfig(validPath)
+			if err != nil {
+				InfoLogger.Printf("Failed to load config %s: %v", validPath, err)
+				continue
+			}
+
 			if !config.Active {
 				InfoLogger.Printf("Skipping inactive bot: %s", config.ID)
 				continue
 			}
 
-			// Validate that ID is present
-			if config.ID == "" {
-				return nil, fmt.Errorf("config %s is missing 'id' field", configPath)
+			if err := validateConfig(&config, ids, tokens); err != nil {
+				InfoLogger.Printf("Config validation failed for %s: %v", validPath, err)
+				continue
 			}
 
-			// Check for unique ID
-			if _, exists := ids[config.ID]; exists {
-				return nil, fmt.Errorf("duplicate bot id '%s' found in %s", config.ID, configPath)
-			}
-			ids[config.ID] = true
-
-			// Validate Telegram Token
-			if config.TelegramToken == "" {
-				return nil, fmt.Errorf("config %s is missing 'telegram_token' field", configPath)
-			}
-
-			// Check for unique Telegram Token
-			if _, exists := tokens[config.TelegramToken]; exists {
-				return nil, fmt.Errorf("duplicate telegram_token '%s' found in %s", config.TelegramToken, configPath)
-			}
-			tokens[config.TelegramToken] = true
-
-			// Validate Model
-			if config.Model == "" {
-				return nil, fmt.Errorf("config %s is missing 'model' field", configPath)
-			}
-
+			config.ConfigFilePath = validPath
 			configs = append(configs, config)
 		}
+	}
+
+	if len(configs) == 0 {
+		return nil, fmt.Errorf("no valid configs found")
 	}
 
 	return configs, nil
 }
 
+func validateConfig(config *BotConfig, ids, tokens map[string]bool) error {
+	if config.ID == "" {
+		return fmt.Errorf("missing 'id' field")
+	}
+	if _, exists := ids[config.ID]; exists {
+		return fmt.Errorf("duplicate bot id '%s'", config.ID)
+	}
+	ids[config.ID] = true
+
+	if config.TelegramToken == "" {
+		return fmt.Errorf("missing 'telegram_token' field")
+	}
+	if _, exists := tokens[config.TelegramToken]; exists {
+		return fmt.Errorf("duplicate telegram_token")
+	}
+	tokens[config.TelegramToken] = true
+
+	if config.Model == "" {
+		return fmt.Errorf("missing 'model' field")
+	}
+
+	if config.MessagePerHour <= 0 {
+		return fmt.Errorf("'messages_per_hour' must be greater than 0")
+	}
+
+	if config.MessagePerDay <= 0 {
+		return fmt.Errorf("'messages_per_day' must be greater than 0")
+	}
+
+	return nil
+}
+
 func loadConfig(filename string) (BotConfig, error) {
 	var config BotConfig
-	file, err := os.Open(filename)
+	// Use filepath.Clean before opening the file
+	file, err := os.OpenFile(filepath.Clean(filename), os.O_RDONLY, 0)
 	if err != nil {
 		return config, fmt.Errorf("failed to open config file %s: %w", filename, err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			InfoLogger.Printf("Failed to close config file: %v", err)
+		}
+	}()
 
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&config); err != nil {
@@ -115,20 +174,63 @@ func loadConfig(filename string) (BotConfig, error) {
 	return config, nil
 }
 
-func (c *BotConfig) Reload(filename string) error {
-	file, err := os.Open(filename)
+// Reload reloads the BotConfig from the specified filename within the given config directory
+func (c *BotConfig) Reload(configDir, filename string) error {
+	// Validate the config path
+	validPath, err := validateConfigPath(configDir, filename)
 	if err != nil {
-		return fmt.Errorf("failed to open config file %s: %w", filename, err)
+		return fmt.Errorf("invalid config path: %w", err)
 	}
-	defer file.Close()
+
+	// Use filepath.Clean before opening the file
+	cleanPath := filepath.Clean(validPath)
+	file, err := os.OpenFile(cleanPath, os.O_RDONLY, 0)
+	if err != nil {
+		return fmt.Errorf("failed to open config file %s: %w", cleanPath, err)
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			InfoLogger.Printf("Failed to close config file: %v", err)
+		}
+	}()
 
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(c); err != nil {
-		return fmt.Errorf("failed to decode JSON from %s: %w", filename, err)
+		return fmt.Errorf("failed to decode JSON from %s: %w", validPath, err)
 	}
 
-	// Ensure the Model is correctly casted
 	c.Model = anthropic.Model(c.Model)
+	return nil
+}
 
+// PersistModel updates the model field in memory and writes it back to the config file on disk.
+// Only the "model" key is changed; all other fields are preserved verbatim.
+func (c *BotConfig) PersistModel(newModel string) error {
+	if c.ConfigFilePath == "" {
+		return fmt.Errorf("config file path not set; cannot persist model")
+	}
+
+	data, err := os.ReadFile(c.ConfigFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to read config for update: %w", err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("failed to parse config for update: %w", err)
+	}
+
+	raw["model"] = newModel
+
+	updated, err := json.MarshalIndent(raw, "", "\t")
+	if err != nil {
+		return fmt.Errorf("failed to re-encode config: %w", err)
+	}
+
+	if err := os.WriteFile(c.ConfigFilePath, updated, 0600); err != nil {
+		return fmt.Errorf("failed to write config: %w", err)
+	}
+
+	c.Model = anthropic.Model(newModel)
 	return nil
 }
