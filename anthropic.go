@@ -90,7 +90,7 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, messages []anthropic.Mes
 	for i, msg := range messages {
 		for _, content := range msg.Content {
 			if content.Type == anthropic.MessagesContentTypeText {
-				InfoLogger.Printf("Message %d: Role=%v, Text=%v", i, msg.Role, content.Text)
+				InfoLogger.Printf("Message %d: Role=%v, Text=%v", i, msg.Role, *content.Text)
 			}
 		}
 	}
