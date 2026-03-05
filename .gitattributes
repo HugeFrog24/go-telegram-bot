@@ -1,0 +1,13 @@
+# Enforce LF line endings for all files
+* text eol=lf
+
+# Specific file types that should always have LF line endings
+*.go text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+
+# Example: Binary files should not be modified
+*.jpg binary
+*.png binary
+*.gif binary

@@ -1,11 +1,18 @@
+# Local IDE config & user settings
+.vscode/
+
 # Go vendor directory
 vendor/
 
 # Environment variables
 .env
 
-# Log file
-bot.log
+# Any log files
+*.log
 
 # Database file
 bot.db
+
+# All config files except for the default
+config/*
+!config/default.json

@@ -2,72 +2,63 @@ package main
 
 import (
 	"context"
-	"io"
-	"log"
 	"os"
 	"os/signal"
-
-	"github.com/joho/godotenv"
+	"sync"
 )
 
 func main() {
-	// Initialize logger
-	logFile, err := initLogger()
-	if err != nil {
-		log.Fatalf("Error initializing logger: %v", err)
-	}
-	defer logFile.Close()
+	// Initialize custom loggers
+	initLoggers()
 
-	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Printf("Error loading .env file: %v", err)
-	}
-
-	// Check for required environment variables
-	checkRequiredEnvVars()
+	// Log the start of the application
+	InfoLogger.Println("Starting Telegram Bot Application")
 
 	// Initialize database
 	db, err := initDB()
 	if err != nil {
-		log.Fatalf("Error initializing database: %v", err)
+		ErrorLogger.Fatalf("Error initializing database: %v", err)
 	}
 
-	// Load configuration
-	config, err := loadConfig("config.json")
+	// Load all bot configurations
+	configs, err := loadAllConfigs("config")
 	if err != nil {
-		log.Fatalf("Error loading configuration: %v", err)
+		ErrorLogger.Fatalf("Error loading configurations: %v", err)
 	}
 
-	// Create Bot instance
-	b, err := NewBot(db, config)
-	if err != nil {
-		log.Fatalf("Error creating bot: %v", err)
-	}
+	// Create a WaitGroup to manage goroutines
+	var wg sync.WaitGroup
 
 	// Set up context with cancellation
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	// Start the bot
-	log.Println("Starting bot...")
-	b.Start(ctx)
-}
+	// Initialize and start each bot
+	for _, config := range configs {
+		wg.Add(1)
+		go func(cfg BotConfig) {
+			defer wg.Done()
 
-func initLogger() (*os.File, error) {
-	logFile, err := os.OpenFile("bot.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		return nil, err
-	}
-	mw := io.MultiWriter(os.Stdout, logFile)
-	log.SetOutput(mw)
-	return logFile, nil
-}
+			// Create Bot instance without TelegramClient initially
+			realClock := RealClock{}
+			bot, err := NewBot(db, cfg, realClock, nil)
+			if err != nil {
+				ErrorLogger.Printf("Error creating bot %s: %v", cfg.ID, err)
+				return
+			}
 
-func checkRequiredEnvVars() {
-	requiredEnvVars := []string{"TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY"}
-	for _, envVar := range requiredEnvVars {
-		if os.Getenv(envVar) == "" {
-			log.Fatalf("%s environment variable is not set", envVar)
-		}
+			// Start the bot in a separate goroutine
+			go bot.Start(ctx)
+
+			// Keep the bot running until the context is cancelled
+			<-ctx.Done()
+
+			InfoLogger.Printf("Bot %s stopped", cfg.ID)
+		}(config)
 	}
+
+	// Wait for all bots to finish
+	wg.Wait()
+
+	InfoLogger.Println("All bots have stopped. Exiting application.")
 }

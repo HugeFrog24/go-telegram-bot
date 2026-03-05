@@ -1,0 +1,35 @@
+[Unit]
+# A concise description of the service
+Description=Telegram Bot Service
+# Postpone starting until network is available
+After=network.target
+
+[Service]
+# The user that runs the bot
+User=tibik
+# The directory where the bot is located
+WorkingDirectory=/home/tibik/go-telegram-bot
+# The command to start the bot
+ExecStart=/home/tibik/go-telegram-bot/telegram-bot
+# Restart if crashed
+Restart=always
+# Delay between restarts to avoid resource exhaustion
+RestartSec=5
+# Capture stdout (INFO logs)
+StandardOutput=journal
+# Capture stderr (ERROR logs)
+StandardError=journal
+# Identifier for journalctl filtering
+SyslogIdentifier=telegram-bot
+
+[Install]
+# The bot will start automatically at system boot
+WantedBy=multi-user.target
+
+# NOTE:
+# New line comments: good
+# Inline comments: no good, they mess up the service file
+
+# View logs: journalctl -u telegram-bot
+# Follow logs: journalctl -u telegram-bot -f
+# View errors: journalctl -u telegram-bot -p err
