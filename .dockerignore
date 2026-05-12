@@ -1,0 +1,77 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# Documentation
+README.md
+*.md
+
+# Docker files
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Environment files
+.env
+.env.*
+
+# Log files
+*.log
+logs/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+bot.db
+
+# Config files (except default template)
+config/*
+!config/default.json
+
+# Test files
+*_test.go
+test/
+tests/
+
+# Build artifacts
+telegram-bot
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Go specific
+vendor/
+*.mod.backup
+*.sum.backup
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Coverage files
+*.out
+coverage.html
+
+# CI/CD files
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Examples and documentation
+examples/
+docs/
