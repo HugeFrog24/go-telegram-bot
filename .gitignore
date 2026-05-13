@@ -16,3 +16,6 @@ bot.db
 # All config files except for the default
 config/*
 !config/default.json
+
+# test-prompt.ps1 conversation history
+.test-prompt-history.json
