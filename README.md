@@ -40,12 +40,7 @@ A scalable, multi-bot solution for Telegram using Go, GORM, and the Anthropic AP
 
 ### Native Deployment
 
-1. Install using `go get`:
-
-   ```bash
-   go get -u github.com/HugeFrog24/go-telegram-bot
-   cd go-telegram-bot
-   ```
+1. Clone the repository as above. Building needs Go 1.27 or later and a C compiler, because the SQLite driver uses cgo.
 
 2. Configure as above, then build:
    ```bash
@@ -73,10 +68,11 @@ Each bot is one JSON file in `config/` (see `config/default.json` for the templa
 
 | Key                | Type   | Default     | Description |
 | ------------------ | ------ | ----------- | ----------- |
-| `max_tokens`       | number | `1000`      | Maximum output tokens per reply. **Thinking tokens count toward this limit** — raise it (e.g. `4000`+) whenever `thinking` is `"adaptive"`, or a turn can spend the whole budget on reasoning and produce no text. |
+| `max_tokens`       | number | `1000`      | Maximum output tokens per reply. **Thinking tokens count toward this limit** — raise it (e.g. `4000`+) whenever `thinking` is `"adaptive"`, or a turn can spend the whole budget on reasoning and produce no text. Claude 5-generation models (Haiku 5.5, Sonnet 5 and later, Opus 5 and later, Fable) think even when `thinking` is omitted; on those, keep `effort` low or raise this limit. |
+| `temperature`      | number | *(ignored)* | No longer sent: since API version `2026-10-21` the Claude API rejects `temperature`, `top_p` and `top_k` on every model. Old configs still load, and the bot logs a startup notice; remove the key. |
 | `thinking`         | string | *(omitted)* | Reasoning mode: `"adaptive"` (the model decides when and how much to think) or `"disabled"`. Omit the key entirely to use the model's own API default. If the configured model doesn't support the chosen mode, the API rejects the request with a 400 — owners/admins see the raw error, regular users get the generic fallback. Check [Anthropic's model docs](https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking) for per-model support. |
 | `thinking_display` | string | *(omitted)* | `"summarized"` or `"omitted"`. Only valid together with `"thinking": "adaptive"`. Controls whether the API returns a readable summary of the reasoning (logged, never sent to chat). Thinking is billed the same either way; when omitted, the API's per-model default applies. |
-| `effort`           | string | *(omitted)* | `"low"`, `"medium"`, `"high"`, `"xhigh"` or `"max"`. Caps how much reasoning and token spend a turn may use; the API default is `high`. For short-reply chat bots `"low"` or `"medium"` cuts cost noticeably. Rejected with a 400 on models older than Claude 4.6 (Haiku 4.5, Sonnet 4.5) — omit it there. |
+| `effort`           | string | *(omitted)* | `"low"`, `"medium"`, `"high"`, `"xhigh"` or `"max"`. Caps how much reasoning and token spend a turn may use; the API default is `high` on most models and `medium` on Haiku 5.5 and Opus 5.5. For short-reply chat bots `"low"` or `"medium"` cuts cost noticeably. Rejected with a 400 on models older than Claude 4.6 (Haiku 4.5, Sonnet 4.5) — omit it there. |
 | `debounce_ms`      | number | *(omitted)* | Quiet window, in milliseconds, for coalescing rapid follow-up messages into a single turn. Omit or set `0` to disable. See [Coalescing rapid messages](#coalescing-rapid-messages) below. |
 | `stream_drafts`    | bool   | `false`     | Streams each reply into one Telegram draft that grows in place, with a native Stop button, and sends it as a single message when done. Private chats only. See [Draft streaming and the Stop button](#draft-streaming-and-the-stop-button) below. |
 | `cache_history`    | bool   | `true`      | Places a prompt-cache breakpoint on the trailing conversation block, so each turn reads the prior history from cache instead of reprocessing it at full price. Set `false` to cache only the system prompt. |

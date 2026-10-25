@@ -76,7 +76,7 @@ type BotConfig struct {
 	MessagePerDay     int               `json:"messages_per_day"`
 	TempBanDuration   string            `json:"temp_ban_duration"`
 	Model             string            `json:"model"`
-	Temperature       *float32          `json:"temperature,omitempty"`
+	Temperature       *float32          `json:"temperature,omitempty"` // never sent (rejected since API 2026-10-21); parsed only to flag stale configs
 	MaxTokens         int               `json:"max_tokens,omitempty"`
 	Thinking          string            `json:"thinking,omitempty"`
 	ThinkingDisplay   string            `json:"thinking_display,omitempty"`
@@ -175,6 +175,11 @@ func loadAllConfigs(dir string) ([]BotConfig, error) {
 // logConfigAdvisories emits non-fatal boot-time notes about settings that are
 // valid but likely to surprise: silently ineffective, or costlier than intended.
 func logConfigAdvisories(config *BotConfig) {
+	if config.Temperature != nil {
+		InfoLogger.Printf("[%s] temperature=%g is ignored: the Claude API no longer accepts sampling parameters; remove the key",
+			config.ID, *config.Temperature)
+	}
+
 	if config.Thinking == ThinkingModeAdaptive && config.MaxTokens > 0 && config.MaxTokens < 4000 {
 		InfoLogger.Printf("[%s] thinking=adaptive with max_tokens=%d: thinking tokens count toward max_tokens; consider >= 4000",
 			config.ID, config.MaxTokens)

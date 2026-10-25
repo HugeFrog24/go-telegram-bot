@@ -7,28 +7,28 @@ on:
     branches: [ main ]
 
 env:
-  GO_VERSION: '1.27.1'
+  GO_VERSION: '1.27.3'
 
 jobs:
   # Lint job
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
       - uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13.2
+          version: v2.15.0
           args: --timeout 5m
 
   # Test job
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
       - run: go test ./... -v
@@ -37,13 +37,13 @@ jobs:
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: ${{ env.GO_VERSION }}
       # gosec is installed rather than run as its container action: the
       # published image ships its own Go, which lags behind and fails to load
       # the module ("go.mod requires go >= X"). Installing it here builds gosec
       # with the toolchain above, so CI's Go version is ours to choose.
-      - run: go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+      - run: go install github.com/securego/gosec/v2/cmd/gosec@v2.30.0
       - run: gosec ./...

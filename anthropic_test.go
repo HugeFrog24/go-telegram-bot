@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/v2"
 )
 
 func TestTimeContextFor(t *testing.T) {
@@ -295,16 +295,22 @@ func TestFetchHosts(t *testing.T) {
 }
 
 func TestEmptyStreamError(t *testing.T) {
-	err := emptyStreamError("max_tokens", 3900, 4000)
+	err := emptyStreamError("max_tokens", "", 3900, 4000)
 	for _, want := range []string{"output budget exhausted", "3900", "4000"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("max_tokens case: %q missing %q", err.Error(), want)
 		}
 	}
-	if got := emptyStreamError("end_turn", 0, 1000).Error(); got != "unexpected response format from Anthropic" {
+	if got := emptyStreamError("refusal", "cyber", 0, 1000).Error(); got != "the model declined the request (refusal, category cyber)" {
+		t.Errorf("refusal case = %q", got)
+	}
+	if got := emptyStreamError("refusal", "", 0, 1000).Error(); got != "the model declined the request (refusal)" {
+		t.Errorf("uncategorized refusal case = %q", got)
+	}
+	if got := emptyStreamError("end_turn", "", 0, 1000).Error(); got != "unexpected response format from Anthropic" {
 		t.Errorf("generic case = %q", got)
 	}
-	if got := emptyStreamError("", 0, 1000).Error(); got != "unexpected response format from Anthropic" {
+	if got := emptyStreamError("", "", 0, 1000).Error(); got != "unexpected response format from Anthropic" {
 		t.Errorf("no-stop-reason case = %q", got)
 	}
 }

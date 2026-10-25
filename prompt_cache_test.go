@@ -3,8 +3,8 @@ package main
 import (
 	"testing"
 
-	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/packages/param"
+	"github.com/anthropics/anthropic-sdk-go/v2"
+	"github.com/anthropics/anthropic-sdk-go/v2/packages/param"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -21,14 +21,14 @@ func TestMarkTrailingCacheBreakpoint(t *testing.T) {
 
 		markTrailingCacheBreakpoint(msgs)
 
-		last := msgs[1].Content[1].OfText
+		last := msgs[1].OfUser.Content[1].OfText
 		require.NotNil(t, last)
 		assert.False(t, param.IsOmitted(last.CacheControl),
 			"the trailing block carries the breakpoint")
 
 		// Everything earlier stays unmarked: one breakpoint, not one per block.
-		assert.True(t, param.IsOmitted(msgs[1].Content[0].OfText.CacheControl))
-		assert.True(t, param.IsOmitted(msgs[0].Content[0].OfText.CacheControl))
+		assert.True(t, param.IsOmitted(msgs[1].OfUser.Content[0].OfText.CacheControl))
+		assert.True(t, param.IsOmitted(msgs[0].OfUser.Content[0].OfText.CacheControl))
 	})
 
 	t.Run("marks a trailing image block", func(t *testing.T) {
@@ -40,8 +40,8 @@ func TestMarkTrailingCacheBreakpoint(t *testing.T) {
 
 		markTrailingCacheBreakpoint(msgs)
 
-		require.NotNil(t, msgs[0].Content[0].OfImage)
-		assert.False(t, param.IsOmitted(msgs[0].Content[0].OfImage.CacheControl))
+		require.NotNil(t, msgs[0].OfUser.Content[0].OfImage)
+		assert.False(t, param.IsOmitted(msgs[0].OfUser.Content[0].OfImage.CacheControl))
 	})
 
 	t.Run("tolerates empty input", func(t *testing.T) {
@@ -65,7 +65,9 @@ func TestPrepareContextMessages_CacheHistoryToggle(t *testing.T) { //NOSONAR go:
 	t.Run("enabled by default", func(t *testing.T) {
 		msgs := b.prepareContextMessages(memory)
 		require.Len(t, msgs, 2)
-		assert.False(t, param.IsOmitted(msgs[1].Content[0].OfText.CacheControl))
+		require.NotNil(t, msgs[0].OfUser, "user memory becomes a user turn")
+		require.NotNil(t, msgs[1].OfAssistant, "bot memory becomes an assistant turn")
+		assert.False(t, param.IsOmitted(msgs[1].OfAssistant.Content[0].OfText.CacheControl))
 	})
 
 	t.Run("opt-out leaves history unmarked", func(t *testing.T) {
@@ -75,7 +77,7 @@ func TestPrepareContextMessages_CacheHistoryToggle(t *testing.T) { //NOSONAR go:
 
 		msgs := b.prepareContextMessages(memory)
 		require.Len(t, msgs, 2)
-		assert.True(t, param.IsOmitted(msgs[1].Content[0].OfText.CacheControl))
+		assert.True(t, param.IsOmitted(msgs[1].OfAssistant.Content[0].OfText.CacheControl))
 	})
 }
 

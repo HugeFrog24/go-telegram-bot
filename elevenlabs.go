@@ -56,7 +56,7 @@ func (b *Bot) transcribeVoice(ctx context.Context, fileID string) (string, error
 
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
-	if err := mw.WriteField("model_id", "scribe_v1"); err != nil {
+	if err := mw.WriteField("model_id", "scribe_v2"); err != nil {
 		return "", fmt.Errorf("multipart write error: %w", err)
 	}
 	part, err := mw.CreateFormFile("file", "audio.ogg")

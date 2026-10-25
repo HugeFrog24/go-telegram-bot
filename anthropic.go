@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/packages/param"
+	"github.com/anthropics/anthropic-sdk-go/v2"
+	"github.com/anthropics/anthropic-sdk-go/v2/packages/param"
 )
 
 var ErrModelNotFound = errors.New("model not found or deprecated")
@@ -56,10 +56,6 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, chatID int64, messages [
 			blocks = append(blocks, anthropic.BetaTextBlockParam{Text: tail})
 		}
 		params.System = blocks
-	}
-
-	if b.config.Temperature != nil {
-		params.Temperature = param.NewOpt(float64(*b.config.Temperature))
 	}
 
 	if thinking, ok := thinkingParamFromConfig(b.config.Thinking, b.config.ThinkingDisplay); ok {
@@ -159,7 +155,7 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, chatID int64, messages [
 	}
 
 	if full == "" {
-		return "", emptyStreamError(string(lastMsg.StopReason),
+		return "", emptyStreamError(string(lastMsg.StopReason), string(lastMsg.StopDetails.Category),
 			lastMsg.Usage.OutputTokensDetails.ThinkingTokens, params.MaxTokens)
 	}
 	return full, nil
@@ -466,10 +462,16 @@ func joinNonEmpty(a, b string) string {
 	}
 }
 
-func emptyStreamError(stopReason string, thinkingTokens, maxTokens int64) error {
-	if stopReason == "max_tokens" {
+func emptyStreamError(stopReason, refusalCategory string, thinkingTokens, maxTokens int64) error {
+	switch stopReason {
+	case "max_tokens":
 		return fmt.Errorf("output budget exhausted before any text (thinking used %d of %d max_tokens) - raise max_tokens",
 			thinkingTokens, maxTokens)
+	case "refusal":
+		if refusalCategory == "" {
+			return fmt.Errorf("the model declined the request (refusal)")
+		}
+		return fmt.Errorf("the model declined the request (refusal, category %s)", refusalCategory)
 	}
 	return fmt.Errorf("unexpected response format from Anthropic")
 }

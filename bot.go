@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/anthropics/anthropic-sdk-go/v2"
+	"github.com/anthropics/anthropic-sdk-go/v2/option"
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 	"gorm.io/gorm"
@@ -83,7 +83,13 @@ func NewBot(db *gorm.DB, config BotConfig, clock Clock, tgClient TelegramClient)
 		return nil, err
 	}
 
-	anthropicClient := anthropic.NewClient(option.WithAPIKey(config.AnthropicAPIKey))
+	// An explicitly passed credential is used as is, so an empty key would go
+	// out as an empty bearer token; leave it out to use the SDK's default chain.
+	var anthropicOpts []option.RequestOption
+	if config.AnthropicAPIKey != "" {
+		anthropicOpts = append(anthropicOpts, option.WithAPIKey(config.AnthropicAPIKey))
+	}
+	anthropicClient := anthropic.NewClient(anthropicOpts...)
 
 	b := &Bot{
 		db:              db,
@@ -339,10 +345,9 @@ func (b *Bot) buildContextMessages(chatMemory *ChatMemory) []anthropic.BetaMessa
 		if msg.IsUser {
 			param = anthropic.NewBetaUserMessage(blocks...)
 		} else {
-			param = anthropic.BetaMessageParam{
-				Role:    anthropic.BetaMessageParamRoleAssistant,
+			param = anthropic.BetaMessageParam{OfAssistant: &anthropic.BetaAssistantMessageParam{
 				Content: blocks,
-			}
+			}}
 		}
 		contextMessages = append(contextMessages, param)
 	}
@@ -366,7 +371,13 @@ func markTrailingCacheBreakpoint(messages []anthropic.BetaMessageParam) {
 	if len(messages) == 0 {
 		return
 	}
-	blocks := messages[len(messages)-1].Content
+	var blocks []anthropic.BetaContentBlockParamUnion
+	switch last := messages[len(messages)-1]; {
+	case last.OfUser != nil:
+		blocks = last.OfUser.Content
+	case last.OfAssistant != nil:
+		blocks = last.OfAssistant.Content
+	}
 	if len(blocks) == 0 {
 		return
 	}
