@@ -769,7 +769,7 @@ func TestKernelUIDTasks(t *testing.T) {
 	require.NoError(t, syscall.Getrlimit(unix.RLIMIT_NPROC, &before))
 	visible, err := uidTasks(os.Getuid())
 	require.NoError(t, err)
-	n, err := kernelUIDTasks(visible, before.Max)
+	n, err := kernelUIDTasks(visible, before.Max, func(limit uint64) (bool, error) { return forksUnder(limit, before.Max) })
 	require.NoError(t, err)
 	assert.Positive(t, n)
 	require.NoError(t, syscall.Getrlimit(unix.RLIMIT_NPROC, &after))
@@ -785,6 +785,42 @@ func TestKernelUIDTasks(t *testing.T) {
 	assert.True(t, ok, "the user's own hard limit lets it fork")
 	require.NoError(t, syscall.Getrlimit(unix.RLIMIT_NPROC, &after))
 	assert.Equal(t, before, after, "the probes leave the caller's limit alone")
+}
+
+// The task count's search ends, whatever the forks answer (Ruling 19 item
+// 5). A fake fork stands in for the kernel: with a full pids cgroup every
+// fork is refused, whatever the limit, so the bracket never finds one that
+// lets a fork through; under a hard limit of RLIM_INFINITY its doubling
+// must stop all the same, with an error. A fork refused at the hard limit
+// is the user out of tasks; one allowed at every limit is a user the limit
+// does not bind; a well-behaved fake gives the count.
+func TestKernelUIDTasks_Terminates(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	const infinity = ^uint64(0) // RLIM_INFINITY
+	fake := func(t *testing.T, ok func(limit uint64) bool) (func(uint64) (bool, error), *int) {
+		calls := 0
+		return func(limit uint64) (bool, error) {
+			calls++
+			if calls > 1000 {
+				t.Fatalf("still probing after %d forks (limit %d)", calls, limit)
+			}
+			return ok(limit), nil
+		}, &calls
+	}
+	const count, k = 40, 30 // the user's tasks; no fork above k
+	forks, calls := fake(t, func(limit uint64) bool { return limit >= count+2 && limit <= k })
+	_, err := kernelUIDTasks(10, infinity, forks)
+	require.Error(t, err, "a fork refused under every limit is no count")
+	assert.LessOrEqual(t, *calls, 128)
+
+	forks, _ = fake(t, func(limit uint64) bool { return limit >= count+2 })
+	_, err = kernelUIDTasks(10, 35, forks)
+	require.ErrorContains(t, err, "task limit (35)", "refused at the hard limit: out of tasks")
+
+	forks, calls = fake(t, func(limit uint64) bool { return limit >= count+2 })
+	n, err := kernelUIDTasks(10, infinity, forks)
+	require.NoError(t, err)
+	assert.Equal(t, count, n)
+	assert.LessOrEqual(t, *calls, 128)
 }
 
 // A tool cannot exhaust the uid's tasks: RLIMIT_NPROC holds it to the

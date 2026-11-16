@@ -439,7 +439,7 @@ func setToolLimits(memory, cpu uint64) (lastLimits, error) {
 	if err != nil {
 		return lastLimits{}, fmt.Errorf("counting the user's tasks: %w", err)
 	}
-	running, err := kernelUIDTasks(visible, tasks.Max)
+	running, err := kernelUIDTasks(visible, tasks.Max, func(limit uint64) (bool, error) { return forksUnder(limit, tasks.Max) })
 	if err != nil {
 		return lastLimits{}, err
 	}
@@ -498,24 +498,42 @@ func uidTasks(uid int) (int, error) {
 	return count, nil
 }
 
+// maxUserTasks bounds the task-count search: no user has more tasks than
+// the kernel has PIDs (PID_MAX_LIMIT, 4,194,304 on 64-bit systems).
+const maxUserTasks = 1 << 22
+
+// maxTaskProbes caps the forks one count may take: the doubling reaches
+// maxUserTasks in at most 16, and the binary search takes no more.
+const maxTaskProbes = 64
+
 // kernelUIDTasks is the kernel's own count of the user's tasks, which is
 // what RLIMIT_NPROC compares with. /proc shows only this PID namespace's
 // tasks (visible, a lower bound), while a container shares its uid with the
 // host and other containers: in Docker, uid 1000 with 1 visible task could
-// not fork under a limit of 40. So the count is found by trying (see
-// forksUnder), by doubling and then a binary search. A limit that never
-// lets a fork through means the user is out of tasks already.
-func kernelUIDTasks(visible int, hard uint64) (int, error) {
-	lo, hi, err := taskBracket(uint64(visible), hard) // #nosec G115 -- a count
+// not fork under a limit of 40. So the count is found by trying: forks
+// reports whether a probe can fork under a soft limit (forksUnder), by
+// doubling and then a binary search. The search ends whatever the answers
+// (Ruling 19 item 5): a limit that never lets a fork through, up to the
+// hard limit or to maxUserTasks, and a search over maxTaskProbes forks are
+// errors, and so fail closed.
+func kernelUIDTasks(visible int, hard uint64, forks func(limit uint64) (bool, error)) (int, error) {
+	probes := 0
+	try := func(limit uint64) (bool, error) {
+		if probes++; probes > maxTaskProbes {
+			return false, fmt.Errorf("the task count did not settle in %d forks", maxTaskProbes)
+		}
+		return forks(limit)
+	}
+	lo, hi, err := taskBracket(uint64(visible), hard, try) // #nosec G115 -- a count
 	if err != nil {
 		return 0, err
 	}
-	if ok, err := forksUnder(lo, hard); err != nil || ok {
+	if ok, err := try(lo); err != nil || ok {
 		return visible, err // the limit is not enforced (a privileged user): the count is moot
 	}
 	for hi-lo > 1 {
 		mid := lo + (hi-lo)/2
-		ok, err := forksUnder(mid, hard)
+		ok, err := try(mid)
 		if err != nil {
 			return 0, err
 		}
@@ -531,21 +549,27 @@ func kernelUIDTasks(visible int, hard uint64) (int, error) {
 }
 
 // taskBracket finds limits lo, which does not let a fork through (the count
-// is at least visible), and hi, which does, by doubling.
-func taskBracket(visible, hard uint64) (lo, hi uint64, err error) {
-	lo, hi = visible, visible+2*toolThreadHeadroom
+// is at least visible), and hi, which does, by doubling up to the hard limit
+// or maxUserTasks, whichever is lower, so it never overflows. A fork refused
+// there is the user out of tasks, or, above maxUserTasks, something other
+// than the limit refusing it, such as a full pids cgroup.
+func taskBracket(visible, hard uint64, forks func(limit uint64) (bool, error)) (lo, hi uint64, err error) {
+	ceiling := min(hard, maxUserTasks)
+	lo, hi = visible, min(visible+2*toolThreadHeadroom, ceiling)
 	for {
-		hi = min(hi, hard)
-		ok, err := forksUnder(hi, hard)
+		ok, err := forks(hi)
 		switch {
 		case err != nil:
 			return 0, 0, err
 		case ok:
 			return lo, hi, nil
-		case hi == hard:
+		case hi == ceiling && ceiling == hard:
 			return 0, 0, fmt.Errorf("the user has reached its task limit (%d)", hard)
+		case hi == ceiling:
+			return 0, 0, fmt.Errorf("a fork is refused even under a task limit of %d, above any user's count: "+
+				"something else refuses it, such as a full pids cgroup", ceiling)
 		}
-		lo, hi = hi, 2*hi
+		lo, hi = hi, min(2*hi, ceiling)
 	}
 }
 
