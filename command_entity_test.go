@@ -20,14 +20,14 @@ func commandMessage(text string, entities ...models.MessageEntity) *models.Messa
 // in the process) and never match.
 func TestHandledCommand_OutOfRangeEntities(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	for name, entity := range map[string]models.MessageEntity{
-		"huge offset and length":  {Offset: 1 << 62, Length: 1 << 62},
-		"huge length":             {Offset: 1, Length: math.MaxInt},
-		"largest offset":          {Offset: math.MaxInt, Length: 1},
-		"negative offset":         {Offset: -1, Length: 6},
-		"negative length":         {Offset: 0, Length: -6},
-		"zero length":             {Offset: 0, Length: 0},
-		"runs past the end":       {Offset: 1, Length: 6},
-		"starts at the end":       {Offset: 6, Length: 1},
+		"huge offset and length":         {Offset: 1 << 62, Length: 1 << 62},
+		"huge length":                    {Offset: 1, Length: math.MaxInt},
+		"largest offset":                 {Offset: math.MaxInt, Length: 1},
+		"negative offset":                {Offset: -1, Length: 6},
+		"negative length":                {Offset: 0, Length: -6},
+		"zero length":                    {Offset: 0, Length: 0},
+		"runs past the end":              {Offset: 1, Length: 6},
+		"starts at the end":              {Offset: 6, Length: 1},
 		"starts inside a surrogate pair": {Offset: 1, Length: 7},
 		"ends inside a surrogate pair":   {Offset: 0, Length: 7},
 	} {
