@@ -263,6 +263,62 @@ func TestReload_AnsweredMessageStaysAnswered(t *testing.T) { //NOSONAR go:S100 -
 	assert.Len(t, tg.actions(), typing, "and no typing is shown")
 }
 
+// storeUserTextAt is storeUserText with the message's timestamp set.
+func storeUserTextAt(t *testing.T, b *Bot, chatID int64, text string, at time.Time) Message {
+	t.Helper()
+	b.getOrCreateChatMemory(chatID)
+	m := b.createMessage(chatID, 555, "tester", "user", text, true)
+	m.Timestamp = at
+	require.NoError(t, b.storeMessage(&m))
+	return b.joinConversation(m)
+}
+
+// A reply filed before a message that arrived during its turn takes a
+// timestamp just after the message it follows, so a reload (by timestamp)
+// keeps memory's order (review finding 7): the late message stays after the
+// reply, unanswered, and its flush still answers it.
+func TestReload_KeepsReplyBeforeMessageThatArrivedDuringItsTurn(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	stub := newAnthropicStub(t, candleFarmStream())
+	b, _ := historyTestBot(t, stub)
+	const chatID = int64(796)
+	asked := time.Now().Add(-time.Hour) // the turn took a while
+	first := storeUserTextAt(t, b, chatID, "first", asked)
+	turn, _, ok := b.beginTextTurn(textReq(chatID), first.Seq)
+	require.True(t, ok)
+	b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatID))
+	storeUserTextAt(t, b, chatID, "arrived during the turn", asked.Add(30*time.Minute))
+	reply, err := b.recordTurnReply(turn, chatID, "answer to first")
+	require.NoError(t, err)
+	b.finishTurn(turn)
+
+	assert.True(t, reply.Timestamp.Equal(first.Timestamp.Add(time.Microsecond)),
+		"the reply is stamped just after the message it follows, got %v", reply.Timestamp)
+	dropChatMemory(b, chatID)
+	assert.Equal(t, []string{"first", "answer to first", "arrived during the turn"}, memoryTexts(b, chatID))
+	b.respondToChat(textReq(chatID))
+	require.Len(t, stub.requestBetas(), 1, "the late message is still answered after the reload")
+	role, text := stub.lastMessage(t, 0)
+	assert.Equal(t, "user", role)
+	assert.Equal(t, "arrived during the turn", text)
+}
+
+// A reply filed at the end of memory keeps the time it was recorded.
+func TestRecordTurnReply_AppendedReplyKeepsTheCurrentTime(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	b, _ := setupBotForTest(t, 123)
+	const chatID = int64(797)
+	first := storeUserTextAt(t, b, chatID, "first", time.Now().Add(-time.Hour))
+	turn, _, ok := b.beginTextTurn(textReq(chatID), first.Seq)
+	require.True(t, ok)
+	b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatID))
+	before := time.Now()
+
+	reply, err := b.recordTurnReply(turn, chatID, "answer to first")
+	require.NoError(t, err)
+	b.finishTurn(turn)
+
+	assert.False(t, reply.Timestamp.Before(before.Add(-time.Second)), "stamped now, got %v", reply.Timestamp)
+}
+
 // The frontier message was evicted during a long turn: the reply goes to the
 // front and is trimmed straight away, without a panic.
 func TestRecordTurnReply_FrontierEvicted(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names

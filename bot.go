@@ -545,6 +545,19 @@ func (b *Bot) fileReply(chatMemory *ChatMemory, reply Message, frontier, covered
 	return answered
 }
 
+// replyPredecessor is the timestamp of the message a reply to a context that
+// ended at frontier will follow, and whether later messages will follow the
+// reply. It is false for a reply that goes at the end, or at the front.
+func (b *Bot) replyPredecessor(chatMemory *ChatMemory, frontier uint64) (time.Time, bool) {
+	b.chatMemoriesMu.RLock()
+	defer b.chatMemoriesMu.RUnlock()
+	at := replyIndex(chatMemory, frontier)
+	if at == 0 || at == len(chatMemory.Messages) {
+		return time.Time{}, false
+	}
+	return chatMemory.Messages[at-1].Timestamp, true
+}
+
 // replyIndex is where a reply to a context that ended at frontier goes: right
 // after the last message at or below it; at the end for frontier 0; at the
 // front, to be trimmed at once, when the window has moved past it.
@@ -1096,6 +1109,12 @@ func (b *Bot) recordTurnReply(turn *chatTurn, chatID int64, response string) (Me
 	// database and then file it a second time.
 	chatMemory := b.getOrCreateChatMemory(chatID)
 	assistantMessage := b.createMessage(chatID, 0, "", "assistant", response, false)
+	if after, filedBefore := b.replyPredecessor(chatMemory, frontier); filedBefore {
+		// Filed before messages that arrived during the turn: stamped just
+		// after the message it follows, so a reload, which goes by
+		// timestamp, keeps memory's order. A reply at the end keeps now.
+		assistantMessage.Timestamp = after.Add(time.Microsecond)
+	}
 	if err := b.storeMessage(&assistantMessage); err != nil {
 		return Message{}, err
 	}
