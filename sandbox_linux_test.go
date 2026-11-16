@@ -428,15 +428,19 @@ func TestMediaSandbox_ParentDeath(t *testing.T) { //NOSONAR go:S100 -- underscor
 		"the sandboxed tool %d died with its parent", child)
 }
 
-// A hard address-space limit below toolMemoryLimit is not clamped: the helper
-// refuses to run (Ruling 14 note 3), and so does the gate.
+// A hard address-space limit below the cap is not clamped: the helper
+// refuses to run (Ruling 14 note 3), and so does the gate. The helper here is
+// asked for a 3 GiB cap under a 2.5 GiB hard limit: just below the real 1.5
+// GiB cap, the Go runtime itself may fail to start on glibc (it takes about
+// 1.6 GiB of address space), which proves nothing about the helper's check.
 func TestMediaSandbox_HardLimitBelowTheCap(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	echo, err := lookupTool("echo")
 	require.NoError(t, err)
 	exe, err := os.Executable()
 	require.NoError(t, err)
-	spec := sandboxSpec{InputDir: t.TempDir(), Tool: echo, MemoryLimit: toolMemoryLimit, AllowUnsandboxed: true}
-	cmd := exec.Command("/bin/sh", "-c", fmt.Sprintf(`ulimit -v %d && exec "$0" "$@"`, toolMemoryLimit>>10-1024), // #nosec G204 -- the test binary
+	const capBytes, hardBytes = 3 << 30, 5 << 29
+	spec := sandboxSpec{InputDir: t.TempDir(), Tool: echo, MemoryLimit: capBytes, AllowUnsandboxed: true}
+	cmd := exec.Command("/bin/sh", "-c", fmt.Sprintf(`ulimit -v %d && exec "$0" "$@"`, hardBytes>>10), // #nosec G204 -- the test binary
 		exe, mediaSandboxArg, spec.String(), "--", echo, "ran")
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
 	var stderr bytes.Buffer
