@@ -33,6 +33,9 @@ func init() {
 	if sh, err := filepath.EvalSymlinks("/bin/sh"); err == nil {
 		sandboxTestRules = []sandboxRule{{path: sh, access: fsReadExec}}
 	}
+	// Every helper the tests start works on a thread that did not inherit
+	// Pdeathsig, so the parent-death test proves the re-arm (review Minor 3).
+	sandboxFreshThread = true
 	testStandIns["tcp-dial"] = tcpDialStandIn
 	testStandIns["sandbox-parent"] = sandboxParentStandIn
 	testStandIns["truncate-path"] = truncatePathStandIn

@@ -184,11 +184,32 @@ func runMediaSandbox(args []string) int {
 	// The helper allocates a few kilobytes and lives for milliseconds: no
 	// collection is worth the mappings one might need under the limit.
 	debug.SetGCPercent(-1)
-	if err := mediaSandbox(args, ppid); err != nil {
+	if err := onSandboxThread(func() error { return mediaSandbox(args, ppid) }); err != nil {
 		fmt.Fprintf(os.Stderr, "media sandbox: %v\n", err)
 		return sandboxExitCode
 	}
 	return 0
+}
+
+// sandboxFreshThread, set only by the tests (sandbox_linux_test.go), runs the
+// helper's steps and the exec on a new thread instead of this one. The main
+// thread keeps the Pdeathsig it inherited, so a helper that stays on it would
+// pass the parent-death test without its re-arm; on a new thread only the
+// re-arm keeps the signal (review Minor 3).
+var sandboxFreshThread bool
+
+// onSandboxThread runs f on the calling locked thread, or with
+// sandboxFreshThread on a new locked one.
+func onSandboxThread(f func() error) error {
+	if !sandboxFreshThread {
+		return f()
+	}
+	done := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread() // a thread of its own: the caller holds the main one
+		done <- f()
+	}()
+	return <-done
 }
 
 func mediaSandbox(args []string, ppid int) error {
