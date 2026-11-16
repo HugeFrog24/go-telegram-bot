@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -957,5 +959,118 @@ func TestWebSearchConfig(t *testing.T) {
 				t.Errorf("error %q does not contain %q", err.Error(), tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestValidateConfig_Video(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	// Each key: lower bound, upper bound, and the values just outside them.
+	keys := []struct {
+		name     string
+		set      func(*VideoConfig, int)
+		lo, hi   int
+		overHigh int
+	}{
+		{"max_duration_seconds", func(v *VideoConfig, n int) { v.MaxDurationSeconds = n }, 1, 3600, 3601},
+		{"sheet_frames", func(v *VideoConfig, n int) { v.SheetFrames = n }, 4, 20, 21},
+		{"max_lookups", func(v *VideoConfig, n int) { v.MaxLookups = n }, 1, 20, 21},
+		{"max_frames_per_lookup", func(v *VideoConfig, n int) { v.MaxFramesPerLookup = n }, 1, 20, 21},
+		{"retention_hours", func(v *VideoConfig, n int) { v.RetentionHours = n }, 1, 720, 721},
+	}
+
+	validate := func(v *VideoConfig) error {
+		cfg := thinkingTestConfig("bot-video")
+		cfg.Video = v
+		return validateConfig(&cfg, map[string]bool{}, map[string]bool{})
+	}
+
+	t.Run("absent and empty are ok", func(t *testing.T) {
+		if err := validate(nil); err != nil {
+			t.Errorf("validateConfig(video absent) = %v, want nil", err)
+		}
+		if err := validate(&VideoConfig{}); err != nil {
+			t.Errorf("validateConfig(video={}) = %v, want nil", err)
+		}
+	})
+
+	t.Run("font_file needs no validation", func(t *testing.T) {
+		if err := validate(&VideoConfig{FontFile: "/usr/share/fonts/x.ttf"}); err != nil {
+			t.Errorf("validateConfig(video.font_file) = %v, want nil", err)
+		}
+	})
+
+	for _, k := range keys {
+		t.Run(k.name, func(t *testing.T) {
+			// 0 means "use the default"; both bounds are inclusive.
+			for _, ok := range []int{0, k.lo, k.hi} {
+				var v VideoConfig
+				k.set(&v, ok)
+				if err := validate(&v); err != nil {
+					t.Errorf("validateConfig(%s=%d) = %v, want nil", k.name, ok, err)
+				}
+			}
+			bad := []int{-1, k.overHigh}
+			if k.lo > 1 {
+				bad = append(bad, k.lo-1)
+			}
+			for _, n := range bad {
+				var v VideoConfig
+				k.set(&v, n)
+				err := validate(&v)
+				if err == nil {
+					t.Fatalf("validateConfig(%s=%d) = nil, want error", k.name, n)
+				}
+				want := "'video." + k.name + "'"
+				if !contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err.Error(), want)
+				}
+			}
+		})
+	}
+
+	t.Run("loads from JSON", func(t *testing.T) {
+		var cfg BotConfig
+		if err := json.Unmarshal([]byte(`{"video": {"max_duration_seconds": 90, "font_file": "f.ttf"}}`), &cfg); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if cfg.Video == nil || cfg.Video.MaxDurationSeconds != 90 || cfg.Video.FontFile != "f.ttf" {
+			t.Errorf("Video = %+v, want max_duration_seconds 90 and font_file f.ttf", cfg.Video)
+		}
+	})
+}
+
+func TestVideoConfig_WithDefaults(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	want := VideoConfig{MaxDurationSeconds: 600, SheetFrames: 12, MaxLookups: 6, MaxFramesPerLookup: 12, RetentionHours: 24}
+	if got := (VideoConfig{}).withDefaults(); got != want {
+		t.Errorf("VideoConfig{}.withDefaults() = %+v, want %+v", got, want)
+	}
+
+	set := VideoConfig{MaxDurationSeconds: 30, SheetFrames: 8, MaxLookups: 2, MaxFramesPerLookup: 4, RetentionHours: 1, FontFile: "f.ttf"}
+	if got := set.withDefaults(); got != set {
+		t.Errorf("withDefaults() = %+v, want the set values %+v kept", got, set)
+	}
+
+	partial := VideoConfig{SheetFrames: 8}.withDefaults()
+	if partial.SheetFrames != 8 || partial.MaxLookups != 6 {
+		t.Errorf("withDefaults() = %+v, want sheet_frames kept and the rest defaulted", partial)
+	}
+}
+
+func TestLogConfigAdvisories_Video(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	var logged bytes.Buffer
+	prev := InfoLogger
+	InfoLogger = log.New(&logged, "", 0)
+	t.Cleanup(func() { InfoLogger = prev })
+
+	cfg := thinkingTestConfig("bot-video-adv")
+	logConfigAdvisories(&cfg)
+	if strings.Contains(logged.String(), "video watching on") {
+		t.Errorf("advisory logged without a video block: %q", logged.String())
+	}
+
+	cfg.Video = &VideoConfig{}
+	logConfigAdvisories(&cfg)
+	want := "[bot-video-adv] video watching on: lookups are narrated only on models that write progress notes"
+	if !strings.Contains(logged.String(), want) {
+		t.Errorf("log %q does not contain %q", logged.String(), want)
 	}
 }

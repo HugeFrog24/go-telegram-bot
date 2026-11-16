@@ -27,6 +27,73 @@ type WebSearchConfig struct {
 	MaxContentTokens    int      `json:"max_content_tokens,omitempty"`
 }
 
+// VideoConfig turns on video watching (videos, GIFs, round videos and video
+// stickers) and tunes it. Its presence enables the feature; every key is
+// optional, and zero means the default (see withDefaults).
+type VideoConfig struct {
+	MaxDurationSeconds int    `json:"max_duration_seconds,omitempty"`
+	SheetFrames        int    `json:"sheet_frames,omitempty"`
+	MaxLookups         int    `json:"max_lookups,omitempty"`
+	MaxFramesPerLookup int    `json:"max_frames_per_lookup,omitempty"`
+	RetentionHours     int    `json:"retention_hours,omitempty"`
+	FontFile           string `json:"font_file,omitempty"`
+}
+
+// The video block's defaults and inclusive bounds.
+const (
+	defaultVideoMaxDurationSeconds = 600
+	defaultVideoSheetFrames        = 12
+	defaultVideoMaxLookups         = 6
+	defaultVideoMaxFramesPerLookup = 12
+	defaultVideoRetentionHours     = 24
+
+	maxVideoMaxDurationSeconds = 3600
+	minVideoSheetFrames        = 4
+	maxVideoSheetFrames        = 20
+	maxVideoMaxLookups         = 20
+	maxVideoMaxFramesPerLookup = 20
+	maxVideoRetentionHours     = 720
+)
+
+// withDefaults returns a copy with every zero field set to its default.
+func (c VideoConfig) withDefaults() VideoConfig {
+	for _, f := range []struct {
+		field *int
+		def   int
+	}{
+		{&c.MaxDurationSeconds, defaultVideoMaxDurationSeconds},
+		{&c.SheetFrames, defaultVideoSheetFrames},
+		{&c.MaxLookups, defaultVideoMaxLookups},
+		{&c.MaxFramesPerLookup, defaultVideoMaxFramesPerLookup},
+		{&c.RetentionHours, defaultVideoRetentionHours},
+	} {
+		if *f.field == 0 {
+			*f.field = f.def
+		}
+	}
+	return c
+}
+
+// validate checks each key against its bounds; zero (the default) always passes.
+func (c VideoConfig) validate() error {
+	for _, f := range []struct {
+		key           string
+		value, lo, hi int
+	}{
+		{"max_duration_seconds", c.MaxDurationSeconds, 1, maxVideoMaxDurationSeconds},
+		{"sheet_frames", c.SheetFrames, minVideoSheetFrames, maxVideoSheetFrames},
+		{"max_lookups", c.MaxLookups, 1, maxVideoMaxLookups},
+		{"max_frames_per_lookup", c.MaxFramesPerLookup, 1, maxVideoMaxFramesPerLookup},
+		{"retention_hours", c.RetentionHours, 1, maxVideoRetentionHours},
+	} {
+		if f.value != 0 && (f.value < f.lo || f.value > f.hi) {
+			return fmt.Errorf("'video.%s' of %d is out of range: must be between %d and %d (or omitted for the default)",
+				f.key, f.value, f.lo, f.hi)
+		}
+	}
+	return nil
+}
+
 // validEfforts are the output_config.effort levels the API accepts. Models
 // older than Claude 4.6 (Haiku 4.5, Sonnet 4.5) reject the parameter entirely.
 var validEfforts = []string{"low", "medium", "high", "xhigh", "max"}
@@ -102,6 +169,7 @@ type BotConfig struct {
 	DebugScreening    bool              `json:"debug_screening"`
 	MCPServers        []MCPServer       `json:"mcp_servers,omitempty"`
 	WebSearch         *WebSearchConfig  `json:"web_search,omitempty"`
+	Video             *VideoConfig      `json:"video,omitempty"`
 	ConfigFilePath    string            `json:"-"`
 }
 
@@ -216,6 +284,11 @@ func logConfigAdvisories(config *BotConfig) {
 			config.ID)
 	}
 
+	if config.Video != nil {
+		InfoLogger.Printf("[%s] video watching on: lookups are narrated only on models that write progress notes",
+			config.ID)
+	}
+
 	if ws := config.WebSearch; ws != nil && len(ws.AllowedDomains) == 0 && len(ws.BlockedDomains) == 0 {
 		InfoLogger.Printf("[%s] web_search enabled with no allowed_domains/blocked_domains: the model may search the open web",
 			config.ID)
@@ -306,6 +379,12 @@ func validateConfig(config *BotConfig, ids, tokens map[string]bool) error {
 		}
 		if ws.MaxContentTokens < 0 {
 			return fmt.Errorf("'web_search.max_content_tokens' must be greater than 0 when set")
+		}
+	}
+
+	if config.Video != nil {
+		if err := config.Video.validate(); err != nil {
+			return err
 		}
 	}
 

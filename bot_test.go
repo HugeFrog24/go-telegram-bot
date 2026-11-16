@@ -1,9 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"log"
+	"os/exec"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"gorm.io/gorm"
 )
 
 func TestContentBlocksForMessage(t *testing.T) {
@@ -102,4 +107,60 @@ func TestStripDeadFileIDFromMemory(t *testing.T) {
 func TestStripDeadFileIDFromMemory_UnknownChatIsNoop(t *testing.T) {
 	b, _ := setupBotForTest(t, 100)
 	b.stripDeadFileIDFromMemory(99999, "file_anything")
+}
+
+// videoGateBot builds a Bot around the given video block. The database is
+// created by the caller so a test can change PATH after it and before NewBot.
+func videoGateBot(t *testing.T, db *gorm.DB, video *VideoConfig) *Bot {
+	t.Helper()
+	b, err := NewBot(db, BotConfig{
+		ID:              "video_gate_bot",
+		OwnerTelegramID: 1,
+		TelegramToken:   "test_token",
+		MemorySize:      10,
+		MessagePerHour:  5,
+		MessagePerDay:   10,
+		Model:           "claude-haiku-4-5",
+		Active:          true,
+		Video:           video,
+	}, &MockClock{currentTime: time.Now()}, &MockTelegramClient{})
+	assert.NoError(t, err)
+	return b
+}
+
+func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	var logged bytes.Buffer
+	prev := InfoLogger
+	InfoLogger = log.New(&logged, "", 0)
+	t.Cleanup(func() { InfoLogger = prev })
+
+	t.Run("no video block: off", func(t *testing.T) {
+		b := videoGateBot(t, setupTestDB(t), nil)
+		assert.False(t, b.videoOn())
+		assert.Nil(t, b.video)
+		assert.NotContains(t, logged.String(), "video:")
+	})
+
+	t.Run("video block with ffmpeg and ffprobe: on, defaults filled", func(t *testing.T) {
+		for _, tool := range []string{"ffmpeg", "ffprobe"} {
+			if _, err := exec.LookPath(tool); err != nil {
+				t.Skipf("%s not on PATH", tool)
+			}
+		}
+		b := videoGateBot(t, setupTestDB(t), &VideoConfig{SheetFrames: 8})
+		assert.True(t, b.videoOn())
+		assert.Equal(t, VideoConfig{
+			MaxDurationSeconds: 600, SheetFrames: 8, MaxLookups: 6, MaxFramesPerLookup: 12, RetentionHours: 24,
+		}, *b.video)
+	})
+
+	t.Run("video block without the tools on PATH: off, logged", func(t *testing.T) {
+		db := setupTestDB(t)
+		logged.Reset()
+		t.Setenv("PATH", "")
+		b := videoGateBot(t, db, &VideoConfig{})
+		assert.False(t, b.videoOn())
+		assert.Nil(t, b.video)
+		assert.Contains(t, logged.String(), "[video_gate_bot] video: ffmpeg/ffprobe not found on PATH; video watching is off")
+	})
 }

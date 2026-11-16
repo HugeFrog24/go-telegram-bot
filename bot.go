@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +51,32 @@ type Bot struct {
 	businessRights     map[string]businessRightsEntry
 	businessRightsMu   sync.Mutex
 	statusLines        openStatusLines
+
+	// video is the defaulted video block; nil means video watching is off
+	// (no block configured, or ffmpeg/ffprobe missing from PATH).
+	video *VideoConfig
+}
+
+// videoOn reports whether the bot watches videos.
+func (b *Bot) videoOn() bool {
+	return b.video != nil
+}
+
+// resolveVideo returns the defaulted video block when the feature can run:
+// the block is configured and both ffmpeg and ffprobe are on PATH. Otherwise
+// it returns nil, logging why when the block asked for the feature.
+func resolveVideo(config *BotConfig) *VideoConfig {
+	if config.Video == nil {
+		return nil
+	}
+	for _, tool := range []string{"ffmpeg", "ffprobe"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			InfoLogger.Printf("[%s] video: ffmpeg/ffprobe not found on PATH; video watching is off", config.ID)
+			return nil
+		}
+	}
+	video := config.Video.withDefaults()
+	return &video
 }
 
 func messageType(msg *models.Message) string {
@@ -127,6 +154,8 @@ func NewBot(db *gorm.DB, config BotConfig, clock Clock, tgClient TelegramClient)
 		statusFirstDelay:   defaultStatusFirstDelay,
 		statusEditInterval: defaultStatusEditInterval,
 		businessRights:     make(map[string]businessRightsEntry),
+
+		video: resolveVideo(&config),
 	}
 
 	if tgClient == nil {
