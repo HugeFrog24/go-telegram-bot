@@ -314,7 +314,7 @@ func (b *Bot) runTurn(turn *chatTurn, turnCtx context.Context, req turnRequest,
 
 	joined, err := call(turnCtx, out)
 	if err != nil {
-		if errors.Is(err, errTurnSilent) || errors.Is(err, errNothingToAnswer) {
+		if errors.Is(err, errTurnSilent) {
 			return
 		}
 		switch b.turnReason(turn) {

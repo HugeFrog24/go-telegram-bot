@@ -16,11 +16,13 @@ import (
 
 var ErrModelNotFound = errors.New("model not found or deprecated")
 
-// errNothingToAnswer means the conversation ends with the bot's own message,
-// so no user message is left to answer. Every current model rejects such a
-// request as an assistant prefill (400); older ones would have continued the
-// bot's reply. The turn has nothing to do and says nothing.
-var errNothingToAnswer = errors.New("nothing to answer: the conversation ends with the bot's message")
+// errHistoryNotUserLast refuses a request whose history does not end with a
+// user message. Every current model rejects one as an assistant prefill
+// (400). Turns read only messages that joined the conversation and file their
+// replies where their context ended, and a flush for an answered message
+// stops before its turn, so this is a bug: it is logged as an error, and the
+// turn fails like any other failed call.
+var errHistoryNotUserLast = errors.New("the conversation does not end with a user message")
 
 const maxFileNotFoundRetries = 3
 
@@ -56,9 +58,9 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, chatID int64, messages [
 	fileRetries, pauseContinuations := 0, 0
 	for {
 		if len(history) == 0 || history[len(history)-1].OfUser == nil {
-			InfoLogger.Printf("[%s] chat %d: nothing new to answer, the conversation ends with the bot's message; no model call",
-				b.config.ID, chatID)
-			return "", errNothingToAnswer
+			ErrorLogger.Printf("[%s] BUG: chat %d: the request's history does not end with a user message (%d messages); no model call",
+				b.config.ID, chatID, len(history))
+			return "", errHistoryNotUserLast
 		}
 		params.Messages = append(slices.Clip(history), resumed...)
 		InfoLogger.Printf("Sending %d messages to Anthropic", len(params.Messages))

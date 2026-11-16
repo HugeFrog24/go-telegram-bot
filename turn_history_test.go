@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
 	"sync"
 	"testing"
@@ -167,11 +169,18 @@ func TestRespondToChat_CollectedMessageIsAnsweredAfterTheReply(t *testing.T) { /
 	assert.Equal(t, "and the candle farm?", text)
 }
 
+// Every request must end with the user's message (I1). Coverage, aside
+// messages and filing make a history that does not a bug, so the check is an
+// assertion: an ERROR log and an error, and nothing is sent.
 func TestGetAnthropicResponse_RefusesHistoryEndingWithTheBot(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	stub := newAnthropicStub(t, candleFarmStream())
 	b, _ := historyTestBot(t, stub)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
+	var logged bytes.Buffer
+	prev := ErrorLogger
+	ErrorLogger = log.New(&logged, "", 0)
+	t.Cleanup(func() { ErrorLogger = prev })
 
 	for name, messages := range map[string][]anthropic.BetaMessageParam{
 		"ends with the bot": {
@@ -182,10 +191,28 @@ func TestGetAnthropicResponse_RefusesHistoryEndingWithTheBot(t *testing.T) { //N
 		},
 		"empty": nil,
 	} {
+		logged.Reset()
 		_, err := b.getAnthropicResponse(ctx, 42, messages, false, "alice", "", "", false, "en", 0, replySinks{})
-		assert.ErrorIs(t, err, errNothingToAnswer, name)
+		assert.ErrorIs(t, err, errHistoryNotUserLast, name)
+		assert.Contains(t, logged.String(), "does not end with a user message", name)
 	}
 	assert.Empty(t, stub.requestBetas(), "nothing is sent")
+}
+
+// A turn that meets that assertion fails like any other failed call: the
+// user gets the error reply, not silence.
+func TestRespondToChat_HistoryEndingWithTheBotGetsTheErrorReply(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	stub := newAnthropicStub(t, candleFarmStream())
+	b, tg := historyTestBot(t, stub)
+	const chatID = int64(798)
+	storeUserText(t, b, chatID, "hi")
+	b.joinConversation(Message{ChatID: chatID, Text: "a bot message no turn filed"}) // the bug the assertion catches
+
+	b.respondToChat(textReq(chatID))
+
+	assert.Empty(t, stub.requestBetas(), "nothing is sent")
+	require.Len(t, tg.sent(), 1)
+	assert.Equal(t, b.anthropicErrorResponse(errHistoryNotUserLast, 555), tg.sent()[0].Text)
 }
 
 // A turn's reply is recorded right after the newest message its context

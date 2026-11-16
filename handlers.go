@@ -69,10 +69,6 @@ func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, u
 	contextMessages := b.snapshotForTurn(turn, b.getOrCreateChatMemory(to.chatID))
 	response, err := b.getAnthropicResponse(ctx, to.chatID, contextMessages, false, username, firstName, lastName, isPremium, languageCode, messageTime, sinks)
 	freezeStatus()
-	if errors.Is(err, errNothingToAnswer) {
-		closeStatus()
-		return
-	}
 	if err != nil {
 		ErrorLogger.Printf("Error getting Anthropic response for voice: %v", err)
 		closeStatus()
@@ -634,10 +630,6 @@ func (b *Bot) runStickerTurn(ctx context.Context, to replyTarget, userMsg Messag
 func (b *Bot) handleStickerMessage(ctx context.Context, turn *chatTurn, to replyTarget, userMessage Message, message *models.Message, contextMessages []anthropic.BetaMessageParam) {
 
 	response, err := b.generateStickerResponse(ctx, to, userMessage, contextMessages)
-	if errors.Is(err, errNothingToAnswer) {
-		// The turn this one waited for read the sticker and answered it.
-		return
-	}
 	if err != nil {
 		ErrorLogger.Printf("Error generating sticker response: %v", err)
 		if message.Sticker.IsAnimated {
