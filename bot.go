@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -53,7 +52,9 @@ type Bot struct {
 	statusLines        openStatusLines
 
 	// video is the defaulted video block; nil means video watching is off
-	// (no block configured, or ffmpeg/ffprobe missing from PATH).
+	// (no block configured, or ffmpeg/ffprobe not found as absolute paths).
+	// It is the feature's only switch: later code tests b.video (or
+	// videoOn), never b.config.Video, which stays set when the tools are missing.
 	video *VideoConfig
 }
 
@@ -63,14 +64,15 @@ func (b *Bot) videoOn() bool {
 }
 
 // resolveVideo returns the defaulted video block when the feature can run:
-// the block is configured and both ffmpeg and ffprobe are on PATH. Otherwise
-// it returns nil, logging why when the block asked for the feature.
+// the block is configured and both ffmpeg and ffprobe resolve to absolute
+// paths on PATH (lookupTool). Otherwise it returns nil, logging why when the
+// block asked for the feature.
 func resolveVideo(config *BotConfig) *VideoConfig {
 	if config.Video == nil {
 		return nil
 	}
 	for _, tool := range []string{"ffmpeg", "ffprobe"} {
-		if _, err := exec.LookPath(tool); err != nil {
+		if _, err := lookupTool(tool); err != nil {
 			InfoLogger.Printf("[%s] video: ffmpeg/ffprobe not found on PATH; video watching is off", config.ID)
 			return nil
 		}
