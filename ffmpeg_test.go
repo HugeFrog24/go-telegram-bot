@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -684,10 +683,32 @@ func processGone(pid string) bool {
 	return strings.HasPrefix(rest, "Z") || strings.HasPrefix(rest, "X")
 }
 
+// firstLine is the stdout of a test's tool: not an *os.File, so os/exec
+// copies the output through a pipe of its own, and Wait waits for every
+// holder of that pipe (up to WaitDelay), as it does for runTool's buffers.
+// The first line the tool writes goes to line.
+type firstLine struct {
+	buf  []byte
+	sent bool
+	line chan string
+}
+
+func (w *firstLine) Write(p []byte) (int, error) {
+	if !w.sent {
+		w.buf = append(w.buf, p...)
+		if i := bytes.IndexByte(w.buf, '\n'); i >= 0 {
+			w.line <- string(w.buf[:i])
+			w.sent = true
+		}
+	}
+	return len(p), nil
+}
+
 // A timeout kills everything the tool started, not only the tool: a
 // stand-in tool that leaves a sleeping child must not orphan it. The
 // stand-in reports the child's PID on stdout, since the sandbox lets it
-// write no file.
+// write no file. The child holds the same stdout, so if only the tool were
+// killed, Wait would wait for the child through toolWaitDelay.
 func TestRunTool_KillsProcessGroup(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	fakeTool(t, "spawner", `sleep 300 &
 echo $!
@@ -698,15 +719,16 @@ wait`)
 	defer cancel()
 	cmd, err := newToolCmd(ctx, bin, t.TempDir(), "", nil)
 	require.NoError(t, err)
-	r, w, err := os.Pipe()
-	require.NoError(t, err)
-	defer func() { _ = r.Close() }()
-	cmd.Stdout = w
+	lines := make(chan string, 1)
+	cmd.Stdout = &firstLine{line: lines}
+	start := time.Now()
 	require.NoError(t, cmd.Start())
-	_ = w.Close()
-	line, err := bufio.NewReader(r).ReadString('\n')
-	require.NoError(t, err, "the stand-in reports its child")
-	child := strings.TrimSpace(line)
+	var child string
+	select {
+	case child = <-lines:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stand-in did not report its child")
+	}
 	t.Cleanup(func() {
 		if pid, err := strconv.Atoi(child); err == nil && !processGone(child) {
 			if p, err := os.FindProcess(pid); err == nil {
@@ -715,10 +737,10 @@ wait`)
 		}
 	})
 
-	start := time.Now()
 	require.Error(t, cmd.Wait(), "the timeout killed the tool")
+	elapsed := time.Since(start)
 	assert.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
-	assert.Less(t, time.Since(start), toolWaitDelay, "the kill took the whole group at once")
+	assert.Less(t, elapsed, toolWaitDelay, "the kill took the whole group at once: nothing held stdout open after it")
 	assert.Eventually(t, func() bool { return processGone(child) }, 3*time.Second, 20*time.Millisecond,
 		"the sleeping grandchild %s died with the tool's process group", child)
 }
