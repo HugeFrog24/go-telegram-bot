@@ -85,7 +85,7 @@ var kindFormats = map[string][]string{
 
 // probeOutput asks ffprobe for just the fields probeMedia checks.
 var probeOutput = []string{
-	"-show_entries", "format=format_name,duration:stream=codec_type,codec_name,width,height,duration:" +
+	"-show_entries", "format=format_name,duration,start_time:stream=codec_type,codec_name,width,height,duration,start_time:" +
 		"stream_disposition=attached_pic:stream_tags=alpha_mode,DURATION:stream_side_data=rotation",
 	"-of", "json",
 }
@@ -103,12 +103,17 @@ var (
 
 // mediaProbe is what probeMedia learned about a file.
 type mediaProbe struct {
-	Format        string  // ffprobe format_name; render calls pin -f (and -format_whitelist) to its demuxer
-	Codec         string  // codec_name of the chosen stream (first video stream with attached_pic=0)
-	Duration      float64 // seconds; 0 when unknown
-	Width, Height int     // display size: swapped when the stream is rotated a quarter turn
-	HasAlpha      bool    // VP8/VP9 in WebM with alpha (video stickers)
+	Format         string  // ffprobe format_name; render calls pin -f (and -format_whitelist) to its demuxer
+	Codec          string  // codec_name of the chosen stream (first video stream with attached_pic=0)
+	Duration       float64 // seconds of the chosen stream; 0 when unknown
+	Width, Height  int     // display size: swapped when the stream is rotated a quarter turn
+	HasAlpha       bool    // VP8/VP9 in WebM with alpha (video stickers)
+	StartTime      float64 // the chosen stream's first timestamp; every sheet time counts from it
+	ContainerStart float64 // the file's start time, which ffmpeg's -ss counts from
 }
+
+// maxStartSeconds bounds a start time either way; real files are within seconds of 0.
+const maxStartSeconds = 24 * 60 * 60
 
 // containerFor finds the accepted container for an ffprobe format_name.
 func containerFor(formatName string) (demuxer, ext string, ok bool) {
@@ -163,6 +168,7 @@ type probeStream struct {
 	Width       int    `json:"width"`
 	Height      int    `json:"height"`
 	Duration    string `json:"duration"`
+	StartTime   string `json:"start_time"`
 	Disposition struct {
 		AttachedPic int `json:"attached_pic"`
 	} `json:"disposition"`
@@ -185,12 +191,14 @@ func parseProbe(out []byte, formats []string) (mediaProbe, error) {
 		Format  struct {
 			FormatName string `json:"format_name"`
 			Duration   string `json:"duration"`
+			StartTime  string `json:"start_time"`
 		} `json:"format"`
 	}
 	if err := json.Unmarshal(out, &doc); err != nil {
 		return mediaProbe{}, fmt.Errorf("%w: cannot parse ffprobe output: %w", errUnsupportedMedia, err)
 	}
-	if demuxer, _, ok := containerFor(doc.Format.FormatName); !ok || !slices.Contains(formats, demuxer) {
+	demuxer, _, ok := containerFor(doc.Format.FormatName)
+	if !ok || !slices.Contains(formats, demuxer) {
 		return mediaProbe{}, fmt.Errorf("%w: format %q", errUnsupportedMedia, doc.Format.FormatName)
 	}
 	if len(doc.Streams) >= toolMaxStreams {
@@ -209,40 +217,74 @@ func parseProbe(out []byte, formats []string) (mediaProbe, error) {
 	if !usableSize(s.Width, s.Height) {
 		return mediaProbe{}, fmt.Errorf("%w: %dx%d is not a usable size", errUnsupportedMedia, s.Width, s.Height)
 	}
-	duration, err := probeDuration(s, doc.Format.Duration)
-	if err != nil {
+	p := mediaProbe{
+		Format:   doc.Format.FormatName,
+		Codec:    s.CodecName,
+		Width:    s.Width,
+		Height:   s.Height,
+		HasAlpha: s.Tags.AlphaMode == "1" && alphaDecoders[s.CodecName] != "" && demuxer == "matroska",
+	}
+	if err := p.readTimes(s, doc.Format.Duration, doc.Format.StartTime, demuxer == "matroska"); err != nil {
 		return mediaProbe{}, err
 	}
-	w, h := s.Width, s.Height
 	for _, sd := range s.SideData {
 		if math.Mod(math.Abs(math.Round(sd.Rotation)), 180) == 90 {
-			w, h = h, w // autorotate turns the frames before any filter sees them
+			p.Width, p.Height = p.Height, p.Width // autorotate turns the frames before any filter sees them
 			break
 		}
 	}
-	return mediaProbe{
-		Format:   doc.Format.FormatName,
-		Codec:    s.CodecName,
-		Duration: duration,
-		Width:    w,
-		Height:   h,
-		HasAlpha: s.Tags.AlphaMode == "1" && alphaDecoders[s.CodecName] != "" && strings.HasPrefix(doc.Format.FormatName, "matroska"),
-	}, nil
+	return p, nil
+}
+
+// readTimes sets the start times and the duration from the chosen stream and
+// the container's fields. A start time that is "N/A" or missing is 0.
+func (p *mediaProbe) readTimes(s probeStream, formatDuration, formatStart string, matroska bool) error {
+	var err error
+	if p.StartTime, err = startTime(s.StartTime); err != nil {
+		return err
+	}
+	if p.ContainerStart, err = startTime(formatStart); err != nil {
+		return err
+	}
+	p.Duration, err = probeDuration(s, formatDuration, p.StartTime, matroska)
+	return err
+}
+
+// startTime parses an ffprobe start_time, which must be finite and within
+// maxStartSeconds of 0. "N/A" or missing is 0.
+func startTime(v string) (float64, error) {
+	if v == "" || v == "N/A" {
+		return 0, nil
+	}
+	t, err := strconv.ParseFloat(v, 64)
+	if err != nil || !finiteIn(t, -maxStartSeconds, maxStartSeconds) {
+		return 0, fmt.Errorf("%w: start time %q", errUnsupportedMedia, v)
+	}
+	return t, nil
 }
 
 // probeDuration takes the chosen stream's duration, then its Matroska
 // DURATION tag (Matroska streams have no duration field), then the
-// container's, which also covers longer audio. 0 means unknown. A
-// non-finite or negative duration field is refused; a tag that is not a
-// well-formed H:MM:SS time is ignored.
-func probeDuration(s probeStream, format string) (float64, error) {
+// container's, which also covers longer audio. Matroska's tag and file
+// duration say where the stream ends on the file's clock, so its length is
+// that minus the stream's start. 0 means unknown. A non-finite or negative
+// duration field is refused; a tag that is not a well-formed H:MM:SS time is
+// ignored.
+func probeDuration(s probeStream, formatDuration string, start float64, matroska bool) (float64, error) {
 	if d, err := numericDuration(s.Duration); err != nil || d > 0 {
 		return d, err
 	}
-	if d, ok := tagDuration(s.Tags.Duration); ok {
-		return d, nil
+	length := func(end float64) float64 {
+		if !matroska || end == 0 {
+			return end
+		}
+		return max(0, end-start)
 	}
-	return numericDuration(format)
+	if d, ok := tagDuration(s.Tags.Duration); ok && length(d) > 0 {
+		return length(d), nil
+	}
+	d, err := numericDuration(formatDuration)
+	return length(d), err
 }
 
 // numericDuration parses one of ffprobe's duration fields; "N/A" or missing is 0.
@@ -333,6 +375,14 @@ func formatSeconds(s float64) string {
 	return strconv.FormatFloat(s, 'f', 6, 64)
 }
 
+// signedSeconds formats a checked time as a term to add: "+1.500000" or "-1.500000".
+func signedSeconds(s float64) string {
+	if s < 0 {
+		return "-" + formatSeconds(-s)
+	}
+	return "+" + formatSeconds(s)
+}
+
 // Bounds on a sheet request. Numbers outside them never reach ffmpeg (item 11).
 const (
 	maxSheetFrames    = max(maxVideoSheetFrames, maxVideoMaxFramesPerLookup)
@@ -341,14 +391,16 @@ const (
 	maxSheetRate      = 1000.0                     // frames per second of source time a sheet may sample
 	singleFrameWindow = 1.0                        // W for one frame: seconds decoded after Start
 	lookback          = 10.0                       // L: seconds decoded before Start (Ruling 10)
+	endMargin         = 0.001                      // a single frame is taken at least this far before the end
 )
 
 var (
 	// errInvalidSheet means renderSheet got numbers out of range, or a probe
 	// that probeMedia would not have produced. Nothing ran.
 	errInvalidSheet = errors.New("invalid sheet request")
-	// errNoFrame means ffmpeg ran cleanly but no frame came out of the decode
-	// window: nothing was on screen within the lookback before Start. It is
+	// errNoFrame means ffmpeg exited cleanly but produced no image. Usually
+	// nothing was on screen within the lookback before Start; on ffmpeg 6.x a
+	// refused decoder or a frame over -max_pixels can end the same way. It is
 	// also errUnsupportedMedia.
 	errNoFrame = errors.New("no frame near that time")
 )
@@ -365,23 +417,28 @@ type sheetSpec struct {
 type sheetPlan struct {
 	demuxer, decoder string    // -f and -format_whitelist; input -c:v for alpha ("" otherwise)
 	start            float64   // S: tile times count from here
-	seek, window     float64   // input -ss max(0, S−L) and -t W+L: the decode window (Ruling 10)
+	seek, window     float64   // max(0, S−L) and W+L: the decode window (Ruling 10), relative like S
+	origin           float64   // the video's first timestamp: relative times are measured from it
+	inputSeek        float64   // input -ss: the window's start on the clock -ss uses (the file's start time)
 	rate             float64   // frames per second sampled; 0 for an unknown duration
 	frames           int       // tiles in the image
 	cols, rows       int       // grid
 	tileW, tileH     int       // even, so tiles line up on chroma rows
-	times            []float64 // source time of each tile
+	times            []float64 // time of each tile, relative to the video's start
 }
 
 // renderSheet renders frames of path as one JPEG and returns it with each
-// tile's source time. Frames > 1 gives a gridFor(Frames) sheet of the frames
-// on screen at t_i = Start + i·(End−Start)/Frames; Frames == 1 gives the frame
-// on screen at Start. Decoding starts `lookback` seconds before Start, so a
+// tile's time. Every time it takes or returns counts from the video's first
+// frame (probe.StartTime), whatever the file's own clock says. Frames > 1
+// gives a gridFor(Frames) sheet of the frames on screen at
+// t_i = Start + i·(End−Start)/Frames; Frames == 1 gives the frame on screen at
+// Start, and a Start at or past the end gives the last frame, with its time
+// just before the end. Decoding starts `lookback` seconds before Start, so a
 // frame that began up to that long before a tile's time is found; one that
 // began earlier is not (errNoFrame where ffmpeg can tell, else a render
 // failure). When probe.Duration is 0 (unknown) every frame is the first one,
 // at t=0. The image meets the sizing rule for spec.MaxEdge and each tile has
-// its source time burned in.
+// its time burned in.
 //
 // It runs one ffmpeg process, capped at sheetTimeout. It never extends ctx's
 // deadline, so the caller passes the per-call one in ctx: a first sheet
@@ -409,10 +466,10 @@ func renderSheet(ctx context.Context, path string, probe mediaProbe, spec sheetS
 }
 
 // renderOutcome sorts out a render run. A clean exit that wrote nothing means
-// no frame reached the encoder: errNoFrame. ffmpeg 7 and later exit with −22
-// in that case instead, the same status as a refused decoder or an unusable
-// font, so such a run cannot be told apart by its status and stays a plain
-// decode failure.
+// no frame reached the encoder: errNoFrame (on 6.x that can also be a
+// refusal). ffmpeg 7 and later exit with −22 when no frame comes, the same
+// status as a refused decoder or an unusable font, so such a run cannot be
+// told apart by its status and stays a plain decode failure.
 func renderOutcome(out []byte, err error) ([]byte, error) {
 	switch {
 	case err != nil:
@@ -434,10 +491,14 @@ func planSheet(probe mediaProbe, spec sheetSpec) (sheetPlan, error) {
 		p.decoder = alphaDecoders[probe.Codec]
 	}
 	if probe.Duration > 0 {
-		if err := p.sample(min(spec.Start, probe.Duration), min(spec.End, probe.Duration)); err != nil {
+		if err := p.sample(spec.Start, spec.End, probe.Duration); err != nil {
 			return sheetPlan{}, err
 		}
 	}
+	// With -copyts, -ss counts from the file's start time while frames carry
+	// the file's clock; the plan's times count from the video's first frame.
+	p.origin = probe.StartTime
+	p.inputSeek = max(0, probe.StartTime+p.seek-probe.ContainerStart)
 	p.cols, p.rows = gridFor(spec.Frames)
 	gridW, gridH := fitImageSize(p.cols*probe.Width, p.rows*probe.Height, spec.MaxEdge)
 	p.tileW, p.tileH = max(2, gridW/p.cols&^1), max(2, gridH/p.rows&^1)
@@ -445,12 +506,19 @@ func planSheet(probe mediaProbe, spec sheetSpec) (sheetPlan, error) {
 }
 
 // sample sets the tile times, the sampling rate and the decode window for a
-// file of known duration, with start and end already clamped to it. The
-// window W is End−Start plus one step, or singleFrameWindow for one frame;
-// decoding starts lookback seconds early (Ruling 10).
-func (p *sheetPlan) sample(start, end float64) error {
+// file of known duration. Start and End are clamped to it; a single frame is
+// taken at least endMargin before the end, since the last frame stays on
+// screen until then and nothing is on screen at the end itself. The window W
+// is End−Start plus one step, or singleFrameWindow for one frame; decoding
+// starts lookback seconds early (Ruling 10).
+func (p *sheetPlan) sample(start, end, duration float64) error {
+	start, end = min(start, duration), min(end, duration)
 	width := singleFrameWindow
-	p.rate, p.times[0] = 1/singleFrameWindow, start
+	p.rate = 1 / singleFrameWindow
+	if p.frames == 1 {
+		start = min(start, max(0, duration-endMargin))
+	}
+	p.times[0] = start
 	if p.frames > 1 {
 		span := end - start
 		if span <= 0 || float64(p.frames)/span > maxSheetRate {
@@ -482,6 +550,8 @@ func checkSheet(probe mediaProbe, spec sheetSpec) error {
 		bad = fmt.Sprintf("size %dx%d", probe.Width, probe.Height)
 	case !finiteIn(probe.Duration, 0, maxSheetSeconds):
 		bad = fmt.Sprintf("duration %v", probe.Duration)
+	case !finiteIn(probe.StartTime, -maxStartSeconds, maxStartSeconds) || !finiteIn(probe.ContainerStart, -maxStartSeconds, maxStartSeconds):
+		bad = fmt.Sprintf("start times %v and %v", probe.StartTime, probe.ContainerStart)
 	case !finiteIn(spec.Start, 0, maxSheetSeconds) || !finiteIn(spec.End, 0, maxSheetSeconds):
 		bad = fmt.Sprintf("range %v to %v", spec.Start, spec.End)
 	case spec.Frames < 1 || spec.Frames > maxSheetFrames:
@@ -515,7 +585,7 @@ func renderArgs(input string, p sheetPlan, font string, timeLimit int) []string 
 		codecs:    renderCodecs,
 		decoder:   p.decoder,
 		timeLimit: timeLimit,
-		seek:      p.seek,
+		seek:      p.inputSeek,
 		window:    p.window,
 		input:     input,
 		output: []string{"-map", "0:V:0", "-an", "-sn", "-dn", "-vf", sheetFilter(p, font),
@@ -537,17 +607,17 @@ const timestampText = `text='%{pts\:hms}'`
 
 // sheetFilter builds the -vf graph from constants, the plan's checked numbers
 // and the escaped font path; nothing in it comes from the file, the user or
-// the model (item 11). With -copyts the frames keep their source times.
+// the model (item 11). With -copyts the frames keep the file's clock.
 func sheetFilter(p sheetPlan, font string) string {
 	var f []string
 	switch {
 	case p.rate > 0:
 		// Shift Start to 0 (frames from the lookback get negative times), take
 		// one frame every 1/rate s with round=up, which keeps the frame on
-		// screen at each tile's time, then shift back in a fine time base so
-		// drawtext prints the source time. One frame works the same way.
-		start := formatSeconds(p.start)
-		f = append(f, "setpts=PTS-"+start+"/TB")
+		// screen at each tile's time, then shift to Start in a fine time base
+		// so drawtext prints the time from the video's start. One frame works
+		// the same way.
+		f = append(f, "setpts=PTS"+signedSeconds(-(p.origin+p.start))+"/TB")
 		if p.seek > 0 {
 			// Mid-file, the window must hold the frame on screen at Start. If it
 			// does not (that frame began over the lookback earlier), drop
@@ -557,7 +627,7 @@ func sheetFilter(p sheetPlan, font string) string {
 			f = append(f, nothingBeforeStart)
 		}
 		f = append(f, "fps=fps="+strconv.FormatFloat(p.rate, 'f', -1, 64)+":start_time=0:round=up",
-			"settb=AVTB", "setpts=PTS+"+start+"/TB")
+			"settb=AVTB", "setpts=PTS"+signedSeconds(p.start)+"/TB")
 	case p.frames > 1:
 		// Unknown duration: the first frame, repeated, every copy at t=0.
 		f = append(f, "trim=end_frame=1", "loop=loop="+strconv.Itoa(p.frames-1)+":size=1", "setpts=0")

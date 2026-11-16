@@ -318,8 +318,12 @@ func TestParseProbe(t *testing.T) {
 			codec, w, h, duration, extra)
 	}
 	h264 := video("h264", 720, 1280, "37.000000", "")
+	docStarts := func(format, duration, start string, streams ...string) []byte {
+		return []byte(`{"streams":[` + strings.Join(streams, ",") + `],"format":{"format_name":"` + format +
+			`","duration":"` + duration + `","start_time":"` + start + `"}}`)
+	}
 	doc := func(format, duration string, streams ...string) []byte {
-		return []byte(`{"streams":[` + strings.Join(streams, ",") + `],"format":{"format_name":"` + format + `","duration":"` + duration + `"}}`)
+		return docStarts(format, duration, "N/A", streams...)
 	}
 	cover := `{"codec_type":"video","codec_name":"mjpeg","width":3000,"height":3000,"disposition":{"attached_pic":1}}`
 	audio := `{"codec_type":"audio","codec_name":"aac","disposition":{"attached_pic":0}}`
@@ -361,6 +365,20 @@ func TestParseProbe(t *testing.T) {
 				mediaProbe{Format: "matroska,webm", Codec: "vp9", Duration: 12, Width: 512, Height: 512}},
 			{"NaN tag: container's duration", doc("matroska,webm", "12", video("vp9", 512, 512, "N/A", `,"tags":{"DURATION":"00:00:NaN"}`)),
 				mediaProbe{Format: "matroska,webm", Codec: "vp9", Duration: 12, Width: 512, Height: 512}},
+			// Start times: the stream's and the file's (audio may start first).
+			{"start times", docStarts(mov, "30.02", "19.976780", video("h264", 720, 1280, "30", `,"start_time":"20.000000"`)),
+				mediaProbe{Format: mov, Codec: "h264", Duration: 30, Width: 720, Height: 1280, StartTime: 20, ContainerStart: 19.97678}},
+			{"start time N/A: 0", docStarts(mov, "30", "N/A", video("h264", 720, 1280, "30", `,"start_time":"N/A"`)),
+				mediaProbe{Format: mov, Codec: "h264", Duration: 30, Width: 720, Height: 1280}},
+			{"negative start time (B-frame delay)", docStarts(mov, "30", "-0.040000", video("h264", 720, 1280, "30", `,"start_time":"-0.040000"`)),
+				mediaProbe{Format: mov, Codec: "h264", Duration: 30, Width: 720, Height: 1280, StartTime: -0.04, ContainerStart: -0.04}},
+			// Matroska's DURATION tag and file duration are end times on the file's clock.
+			{"matroska tag is an end time", docStarts("matroska,webm", "50", "20", video("vp9", 512, 512, "N/A", `,"start_time":"20.000000","tags":{"DURATION":"00:00:50.000000000"}`)),
+				mediaProbe{Format: "matroska,webm", Codec: "vp9", Duration: 30, Width: 512, Height: 512, StartTime: 20, ContainerStart: 20}},
+			{"matroska file duration is an end time", docStarts("matroska,webm", "35", "5", video("vp9", 512, 512, "N/A", `,"start_time":"5.000000"`)),
+				mediaProbe{Format: "matroska,webm", Codec: "vp9", Duration: 30, Width: 512, Height: 512, StartTime: 5, ContainerStart: 5}},
+			{"mp4 file duration is a length", docStarts(mov, "30", "20", video("h264", 720, 1280, "N/A", `,"start_time":"20.000000"`)),
+				mediaProbe{Format: mov, Codec: "h264", Duration: 30, Width: 720, Height: 1280, StartTime: 20, ContainerStart: 20}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				got, err := parseProbe(tc.out, []string{"mov", "matroska"})
@@ -393,6 +411,9 @@ func TestParseProbe(t *testing.T) {
 			{"NaN duration", "duration", doc(mov, "1", video("h264", 720, 1280, "NaN", ""))},
 			{"infinite duration", "duration", doc(mov, "+Inf", video("h264", 720, 1280, "N/A", ""))},
 			{"negative duration", "duration", doc(mov, "1", video("h264", 720, 1280, "-3", ""))},
+			{"NaN start time", "start time", doc(mov, "1", video("h264", 720, 1280, "1", `,"start_time":"NaN"`))},
+			{"infinite file start time", "start time", docStarts(mov, "1", "-Inf", h264)},
+			{"start time out of range", "start time", doc(mov, "1", video("h264", 720, 1280, "1", `,"start_time":"90000.000000"`))},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				_, err := parseProbe(tc.out, []string{"mov", "matroska"})
@@ -411,7 +432,7 @@ func TestToolArgs_Probe(t *testing.T) { //NOSONAR go:S100 -- underscore separati
 		"-protocol_whitelist", "file", "-format_whitelist", "mov,matroska",
 		"-codec_whitelist", probeCodecs, "-max_pixels", "16777216", "-max_streams", "32", "-threads", "2",
 		"-i", "file:" + in,
-		"-show_entries", "format=format_name,duration:stream=codec_type,codec_name,width,height,duration:stream_disposition=attached_pic:stream_tags=alpha_mode,DURATION:stream_side_data=rotation",
+		"-show_entries", "format=format_name,duration,start_time:stream=codec_type,codec_name,width,height,duration,start_time:stream_disposition=attached_pic:stream_tags=alpha_mode,DURATION:stream_side_data=rotation",
 		"-of", "json",
 	}, got)
 	assert.NotContains(t, got, "-nostdin", "ffprobe rejects -nostdin; its stdin stays nil")
@@ -812,10 +833,11 @@ var segmentColours = []struct {
 	{"blue", "0x0000FF", [3]int{0, 0, 255}},
 }
 
-// segmentsFixture is an H.264 clip of one solid-colour segment per
+// segmentsFixture is an H.264 MP4 of one solid-colour segment per
 // segmentColours entry, each segment seconds long, at rate frames per second
-// ("25", or "1/35" for one frame per segment).
-func segmentsFixture(t *testing.T, segment int, rate string) string {
+// ("25", or "1/35" for one frame per segment). more adds inputs and options
+// before the video codec, e.g. an audio track.
+func segmentsFixture(t *testing.T, segment int, rate string, more ...string) string {
 	t.Helper()
 	var graph []string
 	var inputs string
@@ -824,8 +846,72 @@ func segmentsFixture(t *testing.T, segment int, rate string) string {
 		inputs += fmt.Sprintf("[s%d]", i)
 	}
 	graph = append(graph, fmt.Sprintf("%sconcat=n=%d:v=1:a=0[out0]", inputs, len(segmentColours)))
-	return ffmpegFixture(t, "-f", "lavfi", "-i", strings.Join(graph, ";"),
-		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-f", "mp4")
+	args := append([]string{"-f", "lavfi", "-i", strings.Join(graph, ";")}, more...)
+	return ffmpegFixture(t, append(args, "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-f", "mp4")...)
+}
+
+// offsetFixture remuxes src into muxer with every timestamp moved offset seconds later.
+func offsetFixture(t *testing.T, src, muxer, offset string) string {
+	t.Helper()
+	return ffmpegFixture(t, "-i", src, "-c", "copy", "-output_ts_offset", offset, "-f", muxer)
+}
+
+// Files whose timestamps do not start at 0 (an edit list, a cut, audio
+// priming): every time renderSheet takes or returns counts from the video's
+// first frame, so tiles show the frame at that relative time.
+func TestRenderSheet_StartTimeOffset(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	plain := segmentsFixture(t, 10, "25")
+	withAudio := segmentsFixture(t, 10, "25", "-f", "lavfi", "-i", "sine=duration=30", "-c:a", "aac")
+	for _, tc := range []struct{ name, path string }{
+		{"no offset", plain},
+		{"mkv +20 s", offsetFixture(t, plain, "matroska", "20")},
+		{"mkv +5 s", offsetFixture(t, plain, "matroska", "5")},
+		{"mp4 +20 s", offsetFixture(t, plain, "mp4", "20")},
+		{"mp4 +5 s", offsetFixture(t, plain, "mp4", "5")},
+		{"mp4 +20 s, audio starts first", offsetFixture(t, withAudio, "mp4", "20")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe, err := probeMedia(context.Background(), tc.path, "video")
+			require.NoError(t, err)
+			assert.InDelta(t, 30, probe.Duration, 0.1, "the video's length, not where it ends")
+			for _, spec := range []sheetSpec{
+				{Start: 0, End: probe.Duration, Frames: 6}, // the first sheet: 0, 5, … 25 s
+				{Start: 25, End: 29, Frames: 4},            // a lookup well into the file (seek > 0)
+				{Start: 15, Frames: 1},                     // a single frame
+				{Start: 9.99, End: 21.99, Frames: 4},       // a lookup across both colour changes
+			} {
+				spec.MaxEdge = maxImageEdge
+				data, frameTimes, err := renderSheet(context.Background(), tc.path, probe, spec)
+				if assert.NoError(t, err, "%+v", spec) {
+					assert.InDelta(t, spec.Start, frameTimes[0], 1e-9, "times are relative to the video's start")
+					assertTilesShow(t, data, frameTimes, 10)
+				}
+			}
+		})
+	}
+}
+
+// A request at or past the end shows the last frame, and says when it is.
+func TestRenderSheet_EndOfClip(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	path := segmentsFixture(t, 10, "25")
+	probe, err := probeMedia(context.Background(), path, "video")
+	require.NoError(t, err)
+	for _, spec := range []sheetSpec{
+		{Start: probe.Duration, Frames: 1},                          // "the last frame"
+		{Start: probe.Duration + 60, Frames: 1},                     // past the end: clamped
+		{Start: probe.Duration - 4, End: probe.Duration, Frames: 4}, // a lookup ending at the end
+	} {
+		spec.MaxEdge = maxImageEdge
+		data, frameTimes, err := renderSheet(context.Background(), path, probe, spec)
+		if !assert.NoError(t, err, "%+v", spec) {
+			continue
+		}
+		assert.Less(t, frameTimes[len(frameTimes)-1], probe.Duration, "the time actually shown")
+		assert.Greater(t, frameTimes[len(frameTimes)-1], probe.Duration-1.01)
+		assertTilesShow(t, data, frameTimes, 10)
+	}
 }
 
 // tileColour names the colour nearest to the middle of tile k: a segment
@@ -849,8 +935,11 @@ func assertTilesShow(t *testing.T, data []byte, frameTimes []float64, segment fl
 	img := decodeSheet(t, data, maxImageEdge)
 	cols, rows := gridFor(len(frameTimes))
 	for k, ft := range frameTimes {
-		want := segmentColours[int(ft/segment)].name
-		assert.Equal(t, want, tileColour(img, cols, rows, k), "tile %d at %.3f s", k, ft)
+		seg := int(ft / segment)
+		if !assert.True(t, ft >= 0 && seg < len(segmentColours), "tile %d at %.3f s is outside the clip", k, ft) {
+			continue
+		}
+		assert.Equal(t, segmentColours[seg].name, tileColour(img, cols, rows, k), "tile %d at %.3f s", k, ft)
 	}
 }
 
@@ -1000,6 +1089,8 @@ func TestRenderSheet_RefusesBadInput(t *testing.T) { //NOSONAR go:S100 -- unders
 		{"infinite duration", func(p *mediaProbe) { p.Duration = inf }, nil},
 		{"negative duration", func(p *mediaProbe) { p.Duration = -1 }, nil},
 		{"duration out of range", func(p *mediaProbe) { p.Duration = maxSheetSeconds + 1 }, nil},
+		{"NaN start time", func(p *mediaProbe) { p.StartTime = nan }, nil},
+		{"file start time out of range", func(p *mediaProbe) { p.ContainerStart = -maxStartSeconds - 1 }, nil},
 		{"concat format", func(p *mediaProbe) { p.Format = "concat" }, nil},
 		{"lavfi format", func(p *mediaProbe) { p.Format = "lavfi" }, nil},
 		{"mpeg4 codec", func(p *mediaProbe) { p.Codec = "mpeg4" }, nil},
@@ -1057,6 +1148,27 @@ func TestPlanSheet(t *testing.T) {
 		assert.Equal(t, singleFrameWindow+lookback, p.window)
 		assert.InDelta(t, 1/singleFrameWindow, p.rate, 1e-9, "the fps chain picks the frame on screen at Start")
 		assert.Equal(t, []float64{12.5}, p.times)
+	})
+
+	t.Run("single frame at or past the end: just before it", func(t *testing.T) {
+		for _, start := range []float64{37, 40} {
+			p, err := planSheet(probe, sheetSpec{Start: start, Frames: 1, MaxEdge: maxImageEdge})
+			require.NoError(t, err)
+			assert.Equal(t, []float64{37 - endMargin}, p.times, "the time actually shown")
+			assert.Equal(t, 37-endMargin, p.start)
+		}
+	})
+
+	t.Run("start times: -ss counts from the file's start, frames from the video's", func(t *testing.T) {
+		offset := probe
+		offset.StartTime, offset.ContainerStart = 20, 19.5
+		p, err := planSheet(offset, sheetSpec{Start: 16, End: 28, Frames: 12, MaxEdge: maxImageEdge})
+		require.NoError(t, err)
+		assert.Equal(t, 6.0, p.seek, "relative to the video's start")
+		assert.InDelta(t, 6.5, p.inputSeek, 1e-9, "the video's second 6 is the file's 26, which -ss writes as 26-19.5")
+		filter := sheetFilter(p, "")
+		assert.True(t, strings.HasPrefix(filter, "setpts=PTS-36.000000/TB,"), filter)
+		assert.Contains(t, filter, "setpts=PTS+16.000000/TB", "labels show the time from the video's start")
 	})
 
 	t.Run("range clamped to the duration", func(t *testing.T) {
