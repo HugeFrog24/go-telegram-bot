@@ -563,6 +563,49 @@ var addressSpaceHardLimit = func() (uint64, error) {
 	return rl.Max, err
 }
 
+// botDirs are the bot's own directories, which no sandbox rule may reach: the
+// working directory and its config/ and data/ (the database and, by default,
+// the stored videos). A variable so a test can place them under /usr.
+var botDirs = func() ([]string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	return []string{wd, filepath.Join(wd, "config"), filepath.Join(wd, "data")}, nil
+}
+
+// sandboxSparesBot says why the sandbox would let a tool read the bot's own
+// files, or returns nil: a bot directory beneath a directory the system rules
+// grant to every tool (/usr, /lib, /lib64) would be open to all of them, the
+// tokens and the chat database included (review Minor 5). Links are followed
+// on both sides, so /lib on a merged-/usr system counts as /usr/lib.
+func sandboxSparesBot() error {
+	dirs, err := botDirs()
+	if err != nil {
+		return fmt.Errorf("cannot find the bot's directories: %w", err)
+	}
+	for _, r := range sandboxSystemRules {
+		if r.access&unix.LANDLOCK_ACCESS_FS_READ_DIR == 0 {
+			continue // a rule on one file
+		}
+		granted := realPath(r.path)
+		for _, d := range dirs {
+			if within(granted, realPath(d)) {
+				return fmt.Errorf("the bot's directory %s is beneath %s, which the ffmpeg sandbox lets every tool read", d, r.path)
+			}
+		}
+	}
+	return nil
+}
+
+// realPath is p with its links resolved where it exists, or p cleaned.
+func realPath(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return filepath.Clean(p)
+}
+
 // toolLimitsUsable says why the tools' limits cannot be set, or returns nil:
 // a hard address-space limit below toolMemoryLimit turns video off rather
 // than being clamped (Ruling 14 note 3).

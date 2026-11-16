@@ -465,6 +465,53 @@ func TestMediaSandbox_HardLimitBelowTheCap(t *testing.T) { //NOSONAR go:S100 -- 
 	})
 }
 
+// No sandbox rule may reach the bot's own files: a working directory,
+// config/ or data/ beneath a directory every tool may read (/usr, /lib,
+// /lib64) turns video off (review Minor 5).
+func TestSandboxSparesBot(t *testing.T) {
+	prev := botDirs
+	t.Cleanup(func() { botDirs = prev })
+	use := func(dirs ...string) { botDirs = func() ([]string, error) { return dirs, nil } }
+
+	wd := t.TempDir()
+	use(wd, filepath.Join(wd, "config"), filepath.Join(wd, "data"))
+	assert.NoError(t, sandboxSparesBot(), "a bot in a temp dir is outside every grant")
+	own, err := prev()
+	require.NoError(t, err)
+	use(own...)
+	assert.NoError(t, sandboxSparesBot(), "nor is this test's own working directory")
+
+	for _, dirs := range [][]string{
+		{"/usr/src/app", "/usr/src/app/config", "/usr/src/app/data"},
+		{"/home/bot", "/home/bot/config", "/usr/local/share/bot-data"},
+		{"/usr"},
+	} {
+		use(dirs...)
+		assert.ErrorContains(t, sandboxSparesBot(), "beneath /usr", "%v", dirs)
+	}
+	use("/lib") // a link into /usr/lib on merged-/usr systems, a directory of its own elsewhere
+	assert.Error(t, sandboxSparesBot())
+
+	// A data directory that links into /usr counts where it points.
+	link := filepath.Join(t.TempDir(), "data")
+	require.NoError(t, os.Symlink("/usr/share", link))
+	use(t.TempDir(), link)
+	assert.ErrorContains(t, sandboxSparesBot(), "beneath /usr")
+
+	t.Run("gate", func(t *testing.T) {
+		requireFFmpeg(t)
+		var logged bytes.Buffer
+		prevLog := InfoLogger
+		InfoLogger = log.New(&logged, "", 0)
+		t.Cleanup(func() { InfoLogger = prevLog })
+		use("/usr/src/app", "/usr/src/app/config", "/usr/src/app/data")
+		b := videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
+		assert.False(t, b.videoOn())
+		assert.Contains(t, logged.String(), "[video_gate_bot] video: the bot's directory /usr/src/app is beneath /usr, "+
+			"which the ffmpeg sandbox lets every tool read; video watching is off")
+	})
+}
+
 // The spec is strict: anything malformed is refused before any exec.
 func TestParseSandboxArgs(t *testing.T) {
 	dir := t.TempDir()

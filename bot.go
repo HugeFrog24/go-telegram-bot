@@ -73,10 +73,11 @@ var (
 
 // resolveVideo returns the defaulted video block when the feature can run:
 // the block is configured, both ffmpeg and ffprobe resolve to absolute paths
-// on PATH (lookupTool), the tools' limits can be set, the Landlock sandbox
-// is there (or video.allow_unsandboxed accepts its absence, with a loud
-// warning), and the self-test passes through the production runner.
-// Otherwise it returns nil, logging why when the block asked for the feature.
+// on PATH (lookupTool), the tools' limits can be set, no sandbox rule reaches
+// the bot's own directories, the Landlock sandbox is there (or
+// video.allow_unsandboxed accepts its absence, with a loud warning), and the
+// self-test passes through the production runner. Otherwise it returns nil,
+// logging why when the block asked for the feature.
 func resolveVideo(config *BotConfig) *VideoConfig {
 	if config.Video == nil {
 		return nil
@@ -115,7 +116,10 @@ func videoRunnable() error {
 			return errors.New("ffmpeg/ffprobe not found on PATH")
 		}
 	}
-	return toolLimitsUsable()
+	if err := toolLimitsUsable(); err != nil {
+		return err
+	}
+	return sandboxSparesBot()
 }
 
 // logSandbox logs the sandbox the self-test reported: when it counts as one,

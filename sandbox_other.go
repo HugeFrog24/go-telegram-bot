@@ -27,6 +27,10 @@ func sandboxAvailable() (int, error) {
 // toolLimitsUsable has nothing to check: there are no per-tool limits here.
 func toolLimitsUsable() error { return nil }
 
+// sandboxSparesBot has nothing to check: there is no sandbox here to grant
+// anything.
+func sandboxSparesBot() error { return nil }
+
 // sandboxSelfCheck has no helper to run: its report is empty.
 func sandboxSelfCheck(context.Context, string, string) (sandboxReport, error) {
 	return sandboxReport{}, nil
