@@ -64,17 +64,25 @@ func sandboxUsable(abi int, err error) error {
 }
 
 // sandboxGapList is what the sandbox's two layers may leave open: what each
-// Landlock ABI cannot deny, and whether the seccomp filter does instead
-// (Ruling 16 item 1). Stat metadata neither layer hides.
+// Landlock ABI cannot deny, and whether the seccomp allowlist denies it
+// instead (Ruling 18 items 1 and 4). Neither layer hides a file's metadata
+// from a read by path (stat, access, readlink, statfs), which the tools use.
 var sandboxGapList = []struct {
-	abi     int // the Landlock ABI that denies it; 0 for none
-	seccomp bool
+	abi     int  // the Landlock ABI that denies it; 0 for none
+	seccomp bool // whether the seccomp filter denies it
 	what    string
 }{
+	{1, false, "files (reading, writing and running any the user may)"},
+	{3, false, "file truncation"},
 	{4, true, "TCP"},
 	{6, true, "abstract unix sockets and signals"},
 	{9, true, "pathname unix sockets"},
 	{10, true, "UDP"},
+	{0, true, "other processes' resource limits, priority and CPU affinity"},
+	{0, true, "file metadata changes (mode, owner, times, extended attributes)"},
+	{0, true, "SysV IPC, inotify and fanotify"},
+	{0, true, "clearing the parent-death signal"},
+	{0, true, "every other system call (new processes, namespaces, io_uring, bpf)"},
 	{0, false, "file metadata (stat: whether a path exists, sizes, times)"},
 }
 
