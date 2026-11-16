@@ -223,3 +223,23 @@ The last one bypasses `-max_pixels`, because the libvpx wrapper checks the frame
     - A lower pixel cap. 4K phone video is common.
     - A native-decoder pre-pass before libvpx. Items 2 and 3 cover it.
     - A Windows Job Object. Windows is dev-only.
+
+## Sandbox for the tools (Ruling 13)
+
+The user chose, on 2026-11-16, to sandbox ffmpeg and ffprobe. This settles Ruling 12 item 9 and is built as **Task 2b** of the plan. That task's design section is binding. In short:
+
+- **A re-exec helper runs every tool.** It is the bot's own binary, called as `__media_sandbox <spec> -- <tool> <args…>`. On one locked OS thread it applies, in order:
+  1. rlimits: address space = `toolMemoryLimit`, core 0, fsize 0, nofile 64;
+  2. `oom_score_adj` 1000;
+  3. `no_new_privs`;
+  4. Landlock at the best available ABI:
+     - read/execute only beneath the system library and binary directories and `/etc`;
+     - read-only on the input directory and the font;
+     - no writes anywhere;
+     - TCP bind/connect denied on ABI ≥ 4;
+     - abstract unix sockets and signals scoped on ABI ≥ 6;
+  5. finally an exec of the tool.
+- **This replaces the `/bin/sh` `ulimit` wrapper from Ruling 12 item 2.**
+- **Fail closed by default.** If Landlock is unavailable (any non-Linux OS, or an unsupported or seccomp-blocked kernel), video watching is off. `video.allow_unsandboxed: true` opts out, with a loud boot warning; Windows development uses it.
+- **A gate self-test** checks that a read inside the input directory works, while a read outside it and any file creation both fail. It logs the result and the ABI.
+- **Still not covered:** UDP and other non-TCP sockets on ABI < 6 or so. Ptrace of the bot is blocked by Landlock's domain rules, plus `PR_SET_DUMPABLE` from Task 8.

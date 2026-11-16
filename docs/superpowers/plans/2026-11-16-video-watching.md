@@ -295,6 +295,62 @@ func TestRenderSheet_Timeout(t *testing.T)              //NOSONAR ... // already
 
 ---
 
+### Task 2b: Landlock sandbox for ffmpeg and ffprobe (user decision, 2026-11-16)
+
+The user asked for this after the blind review of Task 2. A memory-corruption bug in a reachable ffmpeg component would otherwise run as the bot's own user. That user can read every bot's config (tokens, API keys), the SQLite chat history, and other chats' media.
+
+**Files:**
+- Create `sandbox_linux.go`, `sandbox_other.go` and `sandbox_linux_test.go`.
+- Modify `main.go` (the helper entry point, first thing in `main`), `ffmpeg.go`/`ffmpeg_linux.go`/`ffmpeg_other.go` (runs go through the helper), `config.go` (`VideoConfig.AllowUnsandboxed`), and `bot.go` (the gate and its self-test).
+- `go.mod` may promote `golang.org/x/sys` to a direct dependency. Add no other new dependency.
+
+**Design (binding; see Ruling 13 in the decisions doc):**
+- **A re-exec helper.**
+  - Every tool run becomes `<os.Executable()> __media_sandbox <spec> -- <abs tool path> <args…>`.
+  - The spec carries only:
+    - the input directory;
+    - the font file, if any;
+    - the tool path;
+    - the memory limit.
+  - It is built by the bot, never from user, file or model data.
+  - At the top of `main`, before config loading, logging or anything else, the binary checks `os.Args[1] == "__media_sandbox"`, applies the sandbox, and execs the tool. It never returns to normal startup.
+- **Order inside the helper, on one OS thread** (`runtime.LockOSThread`):
+  1. `setrlimit`: `RLIMIT_AS` = `toolMemoryLimit`, `RLIMIT_CORE` 0, `RLIMIT_FSIZE` 0 and `RLIMIT_NOFILE` 64. These replace the `/bin/sh` `ulimit` wrapper from Ruling 12; that wrapper is removed.
+  2. Write `/proc/self/oom_score_adj` = 1000.
+  3. Run `prctl(PR_SET_NO_NEW_PRIVS, 1)`.
+  4. Create a Landlock ruleset for the best ABI the kernel offers. Query the version and mask the access rights per ABI.
+  5. Add the filesystem rules:
+     - read and execute beneath `/usr`, `/lib`, `/lib64` (where present) and `/etc`, and on the tool binary;
+     - read-only beneath the input directory and on the font file;
+     - read on `/dev/null` and `/dev/urandom`;
+     - nothing else: **no write access anywhere**, and no `/proc` or `/sys` beyond what the tool provably needs.
+
+     Stdout and stderr are inherited pipes, so Landlock doesn't affect them.
+  6. **Network:** on ABI ≥ 4, deny TCP bind and connect. On ABI ≥ 6, also scope abstract unix sockets and signals.
+  7. Restrict the thread (`landlock_restrict_self`), then `syscall.Exec` the tool from the same locked thread.
+- **When the sandbox is unavailable:** a non-Linux OS, or a Landlock syscall that returns ENOSYS, EOPNOTSUPP or EPERM (for example a Docker seccomp profile that blocks it).
+  - By default **video watching is off**, and the reason is logged.
+  - `video.allow_unsandboxed: true` opts out: tools run without Landlock, with a loud warning at boot. The rlimits and `oom_score_adj` still apply on Linux.
+  - Windows development uses this opt-out.
+- **Gate self-test:** when the gate would turn video on, it runs the helper once in a self-test mode. The helper applies the sandbox to itself and checks three things: it can read a file inside a temp input directory, it cannot read a file outside it, and it cannot create a file. It then logs `[<id>] video: ffmpeg sandbox on (Landlock ABI <n>)`, or the reason it is unavailable.
+
+- [ ] **Step 1: Write the failing tests** (`sandbox_linux_test.go`, Linux only; they run in Docker):
+  - With a harmless sandboxed `cat`: reading a file inside the input directory works, while reading a file elsewhere in the data root and reading a fake `config/` file under the repository's working directory both fail. Creating a file in `/tmp` and in the input directory also fails.
+  - A sandboxed ffmpeg render of a lavfi clip still works, font included, and gives the same JPEG as an unsandboxed run.
+  - On ABI ≥ 4, a sandboxed TCP connect to a local listener fails; skip with the ABI noted otherwise.
+  - `/proc/self/limits` from inside the helper shows the address-space, core, fsize and nofile limits.
+  - The self-test reports on or off correctly.
+  - The gate: Landlock unavailable plus `allow_unsandboxed` false means video is off. Simulate this with a test hook.
+  - Spec parsing rejects anything malformed. A helper invoked with a bad spec exits non-zero without exec'ing.
+  - On other OSes: the gate is off unless `allow_unsandboxed`, and tools then run directly.
+- [ ] **Step 2: Run them in Docker** (Alpine 3.24 with ffmpeg 8.1.3, and Ubuntu 24.04), using the default seccomp profile. Expected: compile failure.
+- [ ] **Step 3: Implement.** Use `golang.org/x/sys/unix` syscalls and constants. Check the exact names in the module cache.
+- [ ] **Step 4: Run** the full suite on Windows, plus both Docker runs with the **default** Docker seccomp profile. Report whether the default profile allows Landlock, and the ABI the Docker kernel offers.
+- [ ] **Step 5: Run the duplication check.**
+- [ ] **Step 6: Commit.** Stage only the files above, with `feat: Landlock sandbox for ffmpeg and ffprobe`.
+
+---
+
 ### Task 3: Video records, storage, expiry and `/clear_hard`
 
 **Files:** Create `video_store.go`, `video_store_test.go`. Modify `models.go`, `database.go`, `bot.go` (`videoRoot`, `videoRefMu`, sweeper in `Start`), `anthropic_files.go` (`deleteRowFiles`), the test helper `setupTestDB` (AutoMigrate `Video`).
