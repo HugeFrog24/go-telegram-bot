@@ -596,10 +596,113 @@ func TestNewToolCmd(t *testing.T) {
 		want = append(want, "SYSTEMROOT="+os.Getenv("SYSTEMROOT"))
 	}
 	assert.Equal(t, want, cmd.Env, "only PATH (and SYSTEMROOT on Windows) reaches the child")
-	if runtime.GOOS == "linux" {
-		require.NotNil(t, cmd.SysProcAttr)
-		assert.EqualValues(t, 9, reflect.ValueOf(cmd.SysProcAttr).Elem().FieldByName("Pdeathsig").Int(), "SIGKILL when the bot dies")
+	assert.Equal(t, 1536<<20, toolMemoryLimit)
+	if runtime.GOOS != "linux" {
+		assert.False(t, toolMemoryCapped)
+		assert.Equal(t, []string{"/abs/ffmpeg", "-version"}, cmd.Args, "the tool runs directly: no memory cap off Linux")
+		return
 	}
+
+	// Linux: the memory-cap wrapper (Ruling 12 item 2), which execs the tool in place.
+	assert.True(t, toolMemoryCapped)
+	assert.Equal(t, "/bin/sh", cmd.Path)
+	assert.Equal(t, []string{"/bin/sh", "-c", `ulimit -v 1572864 && echo 1000 > /proc/self/oom_score_adj && exec "$0" "$@"`,
+		"/abs/ffmpeg", "-version"}, cmd.Args)
+	require.NotNil(t, cmd.SysProcAttr)
+	attr := reflect.ValueOf(cmd.SysProcAttr).Elem()
+	assert.EqualValues(t, 9, attr.FieldByName("Pdeathsig").Int(), "SIGKILL when the bot dies")
+	assert.True(t, attr.FieldByName("Setpgid").Bool(), "its own process group (Ruling 12 item 5)")
+	assert.NotNil(t, cmd.Cancel, "a timeout kills the whole group")
+}
+
+// fakeTool writes a harmless shell script named name into a new directory
+// and puts that directory first on PATH, so runTool runs it as a tool.
+func fakeTool(t *testing.T, name, body string) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("stand-in tools are shell scripts; the memory cap and process groups are Linux's")
+	}
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body+"\n"), 0o700)) // #nosec G306 -- executable test script
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// The cap reaches the process that runs the tool: a stand-in tool reports its
+// own limits, OOM score and process group from /proc. Its process group being
+// its own PID shows it is the very process runTool started (exec, no fork).
+func TestRunTool_LinuxMemoryCap(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	fakeTool(t, "limits-tool", `read -r stat < /proc/self/stat
+echo "pid $$"
+echo "stat $stat"
+read -r adj < /proc/self/oom_score_adj
+echo "oom $adj"
+while IFS= read -r line; do echo "limit $line"; done < /proc/self/limits`)
+	out, err := runTool(context.Background(), "limits-tool", t.TempDir(), nil)
+	require.NoError(t, err)
+	report := map[string]string{}
+	var limits []string
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		key, value, _ := strings.Cut(line, " ")
+		if key == "limit" {
+			limits = append(limits, value)
+			continue
+		}
+		report[key] = value
+	}
+	t.Logf("%q", report)
+
+	limit := strconv.Itoa(toolMemoryLimit)
+	i := slices.IndexFunc(limits, func(l string) bool { return strings.HasPrefix(l, "Max address space") })
+	require.GreaterOrEqual(t, i, 0, "%q", limits)
+	assert.Equal(t, []string{limit, limit, "bytes"}, strings.Fields(strings.TrimPrefix(limits[i], "Max address space")),
+		"soft and hard address-space limits are toolMemoryLimit")
+	assert.Equal(t, "1000", report["oom"], "the OOM killer's first choice")
+
+	_, rest, ok := strings.Cut(report["stat"], ") ") // pid (comm) state ppid pgrp ...
+	require.True(t, ok, report["stat"])
+	fields := strings.Fields(rest)
+	require.GreaterOrEqual(t, len(fields), 3)
+	assert.Equal(t, report["pid"], fields[2], "the tool leads its own process group")
+}
+
+// processGone reports whether pid has exited (or is a zombie, dead but not
+// yet reaped by whoever inherited it).
+func processGone(pid string) bool {
+	stat, err := os.ReadFile(filepath.Join("/proc", pid, "stat"))
+	if err != nil {
+		return true
+	}
+	_, rest, _ := strings.Cut(string(stat), ") ")
+	return strings.HasPrefix(rest, "Z") || strings.HasPrefix(rest, "X")
+}
+
+// A timeout kills everything the tool started, not only the tool: a
+// stand-in tool that leaves a sleeping child must not orphan it.
+func TestRunTool_KillsProcessGroup(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	fakeTool(t, "spawner", `sleep 300 &
+echo $! > child.pid
+wait`)
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := runTool(ctx, "spawner", dir, nil)
+	elapsed := time.Since(start)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	data, err := os.ReadFile(filepath.Join(dir, "child.pid"))
+	require.NoError(t, err, "the stand-in started its child")
+	child := strings.TrimSpace(string(data))
+	t.Cleanup(func() {
+		if pid, err := strconv.Atoi(child); err == nil && !processGone(child) {
+			if p, err := os.FindProcess(pid); err == nil {
+				_ = p.Kill()
+			}
+		}
+	})
+	assert.Eventually(t, func() bool { return processGone(child) }, 3*time.Second, 20*time.Millisecond,
+		"the sleeping grandchild %s died with the tool's process group", child)
+	assert.Less(t, elapsed, toolWaitDelay, "no orphan held the output pipes open after the kill")
 }
 
 func TestLookupTool(t *testing.T) {
@@ -1215,6 +1318,47 @@ func TestProbeMedia_AlphaOnlyForStickers(t *testing.T) { //NOSONAR go:S100 -- un
 	}
 }
 
+// Normal files still probe and render, as a first sheet and as one frame.
+// On Linux every run is under toolMemoryLimit (Ruling 12 item 2), so this is
+// the check that the cap leaves room for ordinary 4K phone video.
+func TestRenderSheet_NormalFilesFitTheMemoryCap(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	t.Logf("memory cap in place: %v (%d MiB)", toolMemoryCapped, toolMemoryLimit>>20)
+	clip := func(size, rate string) []string {
+		return []string{"-f", "lavfi", "-i", "testsrc2=size=" + size + ":rate=" + rate + ":duration=1", "-f", "lavfi", "-i", "sine=duration=1"}
+	}
+	for _, tc := range []struct {
+		name, kind string
+		args       []string
+	}{
+		{"4K H.264", "video", append(clip("3840x2160", "30"), "-c:v", "libx264", "-preset", "faster", "-refs", "4", "-bf", "3",
+			"-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", "-f", "mp4")},
+		{"4K HEVC 10-bit", "video", append(clip("3840x2160", "30"), "-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error",
+			"-pix_fmt", "yuv420p10le", "-tag:v", "hvc1", "-c:a", "aac", "-shortest", "-f", "mp4")},
+		{"1080p VP9", "video", append(clip("1920x1080", "30"), "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-row-mt", "1",
+			"-c:a", "libopus", "-shortest", "-f", "webm")},
+		{"alpha sticker", "sticker", alphaWebmArgs(512, 3)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := optionalFixture(t, tc.args...)
+			probe, err := probeMedia(context.Background(), path, tc.kind)
+			require.NoError(t, err)
+			edge, frames := maxImageEdge, 12
+			if tc.kind == "sticker" {
+				edge, frames = stickerSheetEdge, stickerSheetFrames
+			}
+			for _, spec := range []sheetSpec{
+				{Start: 0, End: probe.Duration, Frames: frames, MaxEdge: edge},
+				{Start: probe.Duration / 2, Frames: 1, MaxEdge: edge},
+			} {
+				data, _, err := renderSheet(context.Background(), path, probe, spec)
+				require.NoError(t, err, "%+v", spec)
+				decodeSheet(t, data, edge)
+			}
+		})
+	}
+}
+
 func TestRenderSheet_Timeout(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	requireFFmpeg(t)
 	path := ffmpegFixture(t, gifArgs...)
@@ -1392,7 +1536,7 @@ func TestToolArgs_Render(t *testing.T) { //NOSONAR go:S100 -- underscore separat
 			"scale=238:422," +
 			`drawtext=fontfile=C\\:\\\\Windows\\\\Fonts\\\\arial.ttf:text='%{pts\:hms}':fontsize=19:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=4:x=4:y=4,` +
 			"tile=4x3",
-		"-frames:v", "1", "-q:v", "3", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1",
+		"-frames:v", "1", "-threads", "1", "-q:v", "3", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1",
 	}, got)
 	assertNoForbiddenArgs(t, got)
 

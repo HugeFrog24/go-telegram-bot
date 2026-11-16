@@ -64,9 +64,10 @@ func (b *Bot) videoOn() bool {
 }
 
 // resolveVideo returns the defaulted video block when the feature can run:
-// the block is configured and both ffmpeg and ffprobe resolve to absolute
-// paths on PATH (lookupTool). Otherwise it returns nil, logging why when the
-// block asked for the feature.
+// the block is configured, both ffmpeg and ffprobe resolve to absolute paths
+// on PATH (lookupTool), and the runner can apply its limits (on Linux, the
+// memory-cap shell). Otherwise it returns nil, logging why when the block
+// asked for the feature.
 func resolveVideo(config *BotConfig) *VideoConfig {
 	if config.Video == nil {
 		return nil
@@ -76,6 +77,10 @@ func resolveVideo(config *BotConfig) *VideoConfig {
 			InfoLogger.Printf("[%s] video: ffmpeg/ffprobe not found on PATH; video watching is off", config.ID)
 			return nil
 		}
+	}
+	if err := toolRunnerReady(); err != nil {
+		InfoLogger.Printf("[%s] video: %v; video watching is off", config.ID, err)
+		return nil
 	}
 	video := config.Video.withDefaults()
 	return &video

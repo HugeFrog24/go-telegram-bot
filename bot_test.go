@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -152,6 +153,27 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		assert.Equal(t, VideoConfig{
 			MaxDurationSeconds: 600, SheetFrames: 8, MaxLookups: 6, MaxFramesPerLookup: 12, RetentionHours: 24,
 		}, *b.video)
+	})
+
+	// On Linux every tool runs through /bin/sh, which applies the memory cap:
+	// without it the feature fails closed. Other OSes have no cap and need no shell.
+	t.Run("video block without the memory-cap shell: off on Linux, logged", func(t *testing.T) {
+		requireFFmpeg(t)
+		db := setupTestDB(t)
+		logged.Reset()
+		prev := toolShell
+		toolShell = filepath.Join(t.TempDir(), "sh")
+		t.Cleanup(func() { toolShell = prev })
+		b := videoGateBot(t, db, &VideoConfig{})
+		if !toolMemoryCapped {
+			assert.True(t, b.videoOn(), "no shell is needed off Linux")
+			return
+		}
+		assert.False(t, b.videoOn())
+		assert.Nil(t, b.video)
+		assert.Contains(t, logged.String(), "[video_gate_bot] video: "+toolShell)
+		assert.Contains(t, logged.String(), "memory cap")
+		assert.Contains(t, logged.String(), "video watching is off")
 	})
 
 	t.Run("video block without the tools on PATH: off, logged", func(t *testing.T) {

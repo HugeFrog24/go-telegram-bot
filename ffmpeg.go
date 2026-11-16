@@ -34,14 +34,16 @@ const (
 // section of docs/superpowers/research/2026-11-16-untrusted-video-parsing-decisions.md
 // ("item N" below refers to it).
 const (
-	toolMaxAlloc    = 134217728 // -max_alloc on both tools: the largest single allocation (Ruling 12 item 1)
-	toolMaxPixels   = 16777216  // -max_pixels on both tools (item 5)
-	probeMaxSide    = 8192      // the probe refuses a wider or taller stream (item 5)
-	probeMaxArea    = 16777216  // ... or one with more pixels (item 5)
-	toolMaxStreams  = 32        // -max_streams on both tools (item 6)
-	toolThreads     = 2         // -threads as an input option (item 6)
-	toolOutputLimit = 8 << 20   // stdout bytes a run may write; one more kills it (item 7)
-	toolStderrTail  = 64 << 10  // stderr bytes kept for the log (item 7)
+	toolMaxAlloc    = 134217728  // -max_alloc on both tools: the largest single allocation (Ruling 12 item 1)
+	toolMemoryLimit = 1536 << 20 // address space of each child, on Linux only (Ruling 12 item 2; ffmpeg_linux.go)
+	toolMaxPixels   = 16777216   // -max_pixels on both tools (item 5)
+	probeMaxSide    = 8192       // the probe refuses a wider or taller stream (item 5)
+	probeMaxArea    = 16777216   // ... or one with more pixels (item 5)
+	toolMaxStreams  = 32         // -max_streams on both tools (item 6)
+	toolThreads     = 2          // -threads as an input option (item 6)
+	encoderThreads  = 1          // -threads as an output option: the mjpeg encoder (see renderArgs)
+	toolOutputLimit = 8 << 20    // stdout bytes a run may write; one more kills it (item 7)
+	toolStderrTail  = 64 << 10   // stderr bytes kept for the log (item 7)
 	toolWaitDelay   = 2 * time.Second
 )
 
@@ -611,6 +613,10 @@ func finiteIn(v, lo, hi float64) bool {
 
 // renderArgs is the ffmpeg argument vector for a planned sheet. The demuxer is
 // pinned with -f and is the only whitelisted format; one JPEG goes to stdout.
+// The encoder gets encoderThreads: by default it starts a thread per CPU (up
+// to 16), and with glibc each thread reserves a malloc arena and a stack, so
+// on a 32-CPU host they alone took ~0.5 GiB of the address space that
+// toolMemoryLimit caps.
 func renderArgs(input string, p sheetPlan, font string, timeLimit int) []string {
 	return toolArgs(toolRun{
 		tool:      "ffmpeg",
@@ -623,7 +629,7 @@ func renderArgs(input string, p sheetPlan, font string, timeLimit int) []string 
 		window:    p.window,
 		input:     input,
 		output: []string{"-map", "0:V:0", "-an", "-sn", "-dn", "-vf", sheetFilter(p, font),
-			"-frames:v", "1", "-q:v", "3", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1"},
+			"-frames:v", "1", "-threads", strconv.Itoa(encoderThreads), "-q:v", "3", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1"},
 	})
 }
 
@@ -768,6 +774,24 @@ func lookupTool(name string) (string, error) {
 	return p, nil
 }
 
+// toolShell is the shell every tool runs through on Linux, to apply the
+// memory cap (ffmpeg_linux.go). It is a variable only so a test can make it
+// missing.
+var toolShell = "/bin/sh"
+
+// toolRunnerReady says why runTool cannot run tools at all, or returns nil.
+// On Linux a missing or unusable toolShell turns video watching off (fail
+// closed, Ruling 12 item 2); elsewhere there is nothing to check.
+func toolRunnerReady() error {
+	if !toolMemoryCapped {
+		return nil
+	}
+	if _, err := exec.LookPath(toolShell); err != nil {
+		return fmt.Errorf("%s, which applies the ffmpeg memory cap, cannot be run: %w", toolShell, err)
+	}
+	return nil
+}
+
 // toolSlots bounds concurrent ffprobe/ffmpeg processes across the whole bot
 // (item 8). Each run takes a slot for itself alone: never across two runs.
 var toolSlots = make(chan struct{}, toolConcurrency(runtime.NumCPU()))
@@ -843,9 +867,11 @@ func runTool(ctx context.Context, name, dir string, args []string) ([]byte, erro
 
 // newToolCmd builds the child process: its stdin stays nil (the null device),
 // its environment holds only PATH (and SYSTEMROOT on Windows), and it runs in
-// dir, the directory that holds only the input file (item 9).
+// dir, the directory that holds only the input file (item 9). On Linux it
+// runs under the memory cap and leads its own process group (ffmpeg_linux.go).
 func newToolCmd(ctx context.Context, bin, dir string, args []string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, bin, args...) // #nosec G204 -- fixed binary, generated arguments
+	path, argv := toolCommand(bin, args)
+	cmd := exec.CommandContext(ctx, path, argv...) // #nosec G204 -- fixed binary, generated arguments
 	cmd.Dir = dir
 	cmd.Env = toolEnv()
 	cmd.WaitDelay = toolWaitDelay
