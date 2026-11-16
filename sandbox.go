@@ -66,7 +66,14 @@ func sandboxUsable(abi int, err error) error {
 // sandboxGapList is what the sandbox's two layers may leave open: what each
 // Landlock ABI cannot deny, and whether the seccomp allowlist denies it
 // instead (Ruling 18 items 1 and 4). Neither layer hides a file's metadata
-// from a read by path (stat, access, readlink, statfs), which the tools use.
+// from a read by path (stat, access, readlink, statfs), which the tools use,
+// nor keeps the parent-death signal (Ruling 19 item 1): the filter refuses
+// prctl(PR_SET_PDEATHSIG), but the signal is per task and a new thread has
+// none, so a thread the tool starts can exec it again without one, and
+// de_thread keeps its PID. That orphan keeps Landlock, the filter, the
+// rlimits, its PID and its group; it outlives only a bot that dies, and only
+// outside a supervisor: Docker's PID namespace and systemd's default
+// KillMode=control-group kill it.
 var sandboxGapList = []struct {
 	abi     int  // the Landlock ABI that denies it; 0 for none
 	seccomp bool // whether the seccomp filter denies it
@@ -81,13 +88,15 @@ var sandboxGapList = []struct {
 	{0, true, "other processes' resource limits, priority and CPU affinity"},
 	{0, true, "file metadata changes (mode, owner, times, extended attributes)"},
 	{0, true, "SysV IPC, inotify and fanotify"},
-	{0, true, "clearing the parent-death signal"},
 	{0, true, "every other system call (new processes, namespaces, io_uring, bpf)"},
 	{0, false, "file metadata (stat: whether a path exists, sizes, times)"},
+	{0, false, "the parent-death signal, which a thread the tool starts drops by exec: while the bot lives a timeout still kills the tool's group, " +
+		"but a tool that outlives a dead bot, still sandboxed, ends only with Docker's PID namespace or a systemd unit's control-group kill"},
 }
 
 // sandboxGaps lists what neither Landlock at abi nor, when seccomp is true,
-// the seccomp filter covers, each with the ABI that would; "" for nothing.
+// the seccomp filter covers, each with the ABI that would, separated by
+// semicolons; "" for nothing.
 func sandboxGaps(abi int, seccomp bool) string {
 	var gaps []string
 	for _, g := range sandboxGapList {
@@ -99,7 +108,7 @@ func sandboxGaps(abi int, seccomp bool) string {
 			gaps = append(gaps, g.what)
 		}
 	}
-	return strings.Join(gaps, ", ")
+	return strings.Join(gaps, "; ")
 }
 
 // sandboxReport is what the helper's check run reports to the gate.

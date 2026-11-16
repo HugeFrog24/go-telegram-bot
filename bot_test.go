@@ -390,26 +390,30 @@ func TestSandboxUsable(t *testing.T) {
 
 // What neither layer covers (Ruling 18 item 4): each ABI's gaps without the
 // seccomp filter, with what only the filter could deny; with it, from ABI
-// 3, only what no layer hides, file metadata; and without Landlock, files.
+// 3, only what no layer covers: file metadata, and the parent-death signal,
+// which a tool can drop by exec from a new thread whatever the filter
+// allows (Ruling 19 item 1); and without Landlock, files.
 func TestSandboxGaps(t *testing.T) {
-	const meta = "file metadata (stat: whether a path exists, sizes, times)"
-	const filterOnly = "other processes' resource limits, priority and CPU affinity, " +
-		"file metadata changes (mode, owner, times, extended attributes), SysV IPC, inotify and fanotify, " +
-		"clearing the parent-death signal, every other system call (new processes, namespaces, io_uring, bpf), "
-	assert.Equal(t, "TCP (ABI 4), abstract unix sockets and signals (ABI 6), pathname unix sockets (ABI 9), UDP (ABI 10), "+
-		filterOnly+meta, sandboxGaps(3, false))
-	assert.Equal(t, "abstract unix sockets and signals (ABI 6), pathname unix sockets (ABI 9), UDP (ABI 10), "+filterOnly+meta,
+	const always = "file metadata (stat: whether a path exists, sizes, times); " +
+		"the parent-death signal, which a thread the tool starts drops by exec: while the bot lives a timeout still kills the tool's group, " +
+		"but a tool that outlives a dead bot, still sandboxed, ends only with Docker's PID namespace or a systemd unit's control-group kill"
+	const filterOnly = "other processes' resource limits, priority and CPU affinity; " +
+		"file metadata changes (mode, owner, times, extended attributes); SysV IPC, inotify and fanotify; " +
+		"every other system call (new processes, namespaces, io_uring, bpf); "
+	assert.Equal(t, "TCP (ABI 4); abstract unix sockets and signals (ABI 6); pathname unix sockets (ABI 9); UDP (ABI 10); "+
+		filterOnly+always, sandboxGaps(3, false))
+	assert.Equal(t, "abstract unix sockets and signals (ABI 6); pathname unix sockets (ABI 9); UDP (ABI 10); "+filterOnly+always,
 		sandboxGaps(4, false))
-	assert.Equal(t, "pathname unix sockets (ABI 9), UDP (ABI 10), "+filterOnly+meta, sandboxGaps(7, false))
-	assert.Equal(t, "UDP (ABI 10), "+filterOnly+meta, sandboxGaps(9, false))
-	assert.Equal(t, filterOnly+meta, sandboxGaps(10, false))
+	assert.Equal(t, "pathname unix sockets (ABI 9); UDP (ABI 10); "+filterOnly+always, sandboxGaps(7, false))
+	assert.Equal(t, "UDP (ABI 10); "+filterOnly+always, sandboxGaps(9, false))
+	assert.Equal(t, filterOnly+always, sandboxGaps(10, false))
 	for _, abi := range []int{3, 4, 7, 10} {
-		assert.Equal(t, meta, sandboxGaps(abi, true), "ABI %d with the filter", abi)
+		assert.Equal(t, always, sandboxGaps(abi, true), "ABI %d with the filter", abi)
 	}
-	assert.Equal(t, "file truncation (ABI 3), "+meta, sandboxGaps(2, true))
-	assert.Equal(t, "files (reading, writing and running any the user may) (ABI 1), file truncation (ABI 3), "+meta,
+	assert.Equal(t, "file truncation (ABI 3); "+always, sandboxGaps(2, true))
+	assert.Equal(t, "files (reading, writing and running any the user may) (ABI 1); file truncation (ABI 3); "+always,
 		sandboxGaps(0, true), "the filter alone, under video.allow_unsandboxed")
 	for _, gaps := range []string{sandboxGaps(3, true), sandboxGaps(0, true)} {
-		assert.NotContains(t, gaps, "signals")
+		assert.NotContains(t, gaps, "signals;")
 	}
 }

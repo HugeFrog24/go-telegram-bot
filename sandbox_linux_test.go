@@ -1726,8 +1726,11 @@ func TestNewBot_VideoGateSandboxOn(t *testing.T) { //NOSONAR go:S100 -- undersco
 	b := videoGateBot(t, setupTestDB(t), &VideoConfig{})
 	assert.True(t, b.videoOn())
 	assert.Contains(t, logged.String(), fmt.Sprintf("[video_gate_bot] video: ffmpeg sandbox on (Landlock ABI %d, seccomp filter)", abi))
-	assert.Contains(t, logged.String(), "[video_gate_bot] video: the sandbox does not cover file metadata (stat: whether a path exists, sizes, times)\n",
+	assert.Contains(t, logged.String(), "[video_gate_bot] video: the sandbox does not cover "+sandboxGaps(abi, true)+"\n",
 		"with the filter only what neither layer covers is named, once")
+	assert.Contains(t, logged.String(), "file metadata (stat: whether a path exists, sizes, times); the parent-death signal, which a thread the tool starts drops by exec",
+		"the thread-exec residual (Ruling 19 item 1)")
+	assert.Contains(t, logged.String(), "ends only with Docker's PID namespace or a systemd unit's control-group kill\n", "and its backstop")
 	assert.Equal(t, 1, strings.Count(logged.String(), "does not cover"))
 	assert.NotContains(t, logged.String(), "oom_score_adj")
 }

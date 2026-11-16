@@ -90,7 +90,9 @@ var seccompFcntlCommands = []uint32{unix.F_DUPFD, unix.F_DUPFD_CLOEXEC, unix.F_G
 // seccompPrctlOptions are the prctl(2) options the tools are seen to use:
 // naming a thread (ffmpeg's workers), reading the capability bounding set
 // (libcap, on Ubuntu) and naming a mapping (the Go runtime). Every other
-// option, PR_SET_PDEATHSIG among them, is refused.
+// option, PR_SET_PDEATHSIG among them, is refused. That does not keep the
+// parent-death signal: a thread the tool starts has none, and can exec the
+// tool again without it (Ruling 19 item 1; see setToolProcAttr).
 var seccompPrctlOptions = []uint32{unix.PR_SET_NAME, unix.PR_GET_NAME, unix.PR_CAPBSET_READ, unix.PR_SET_VMA}
 
 // seccompFutexOps are the futex(2) operations allowed once seccompFutexFlags

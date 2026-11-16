@@ -35,7 +35,9 @@ import (
 // and main hands that to runMediaSandbox before anything else. The helper
 // limits itself, restricts itself with Landlock and then execs the tool in
 // place: the same PID and process group, so Pdeathsig and the group kill reach
-// the tool as they reached the helper.
+// the tool as they reached the helper. The tool can drop Pdeathsig by exec
+// from a thread of its own, but not the group kill (Ruling 19 item 1; see
+// setToolProcAttr).
 
 // sandboxExe is how the bot runs itself again: the binary it is running from,
 // even if the file on disk has been replaced since.

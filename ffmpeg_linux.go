@@ -37,14 +37,20 @@ func toolCommand(bin, dir, font string, cpu int, args []string) (string, []strin
 }
 
 // setToolProcAttr has the kernel SIGKILL an ffmpeg/ffprobe child when the bot
-// dies, so no orphaned decoder keeps running (security decisions, Task 2
-// item 10). The signal follows the OS thread that started the child; the Go
-// runtime only retires a thread after a goroutine exits while locked to it,
-// which this code never does. The helper takes the signal again on the thread
-// it execs from (Ruling 14 note 2). It reaches only the direct child, the
-// tool itself: a process the tool forked would outlive a dead bot. That gap
-// is accepted (Ruling 14 note 7): ffmpeg and ffprobe do not fork, and a
-// timeout kills the whole group.
+// dies (security decisions, Task 2 item 10). The signal follows the OS thread
+// that started the child; the Go runtime only retires a thread after a
+// goroutine exits while locked to it, which this code never does. The helper
+// takes the signal again on the thread it execs from (Ruling 14 note 2). It
+// reaches only the direct child, the tool itself, and the seccomp filter
+// lets the tool start threads but no process. A compromised tool can still
+// drop the signal (Ruling 19 item 1, accepted): the signal is per task and a
+// new thread has none, so a thread that execs the tool again runs on
+// without it, and de_thread keeps the PID. That orphan keeps Landlock, the
+// filter, the rlimits, its PID and its group, so while the bot lives a
+// timeout's group kill still ends it; it outlives only a bot that dies, and
+// then only outside a supervisor: Docker's PID namespace and systemd's
+// default KillMode=control-group kill it. The gaps line says so
+// (sandboxGapList).
 //
 // The child also leads its own process group, and a timeout or the output
 // bound kills that whole group: a wrapper script on PATH cannot leave a
