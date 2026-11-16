@@ -168,3 +168,15 @@ This replaces the "Task 2: decode window" item of Ruling 9. The Task 2 review fo
 - **Tests:**
   - A fixture made of time segments in distinct solid colours, plus a sparse variant with a frame every 35 s. For a sheet, a lookup and a single frame, tile k must show the colour of the segment that contains `frameTimes[k]`.
   - A still-image clip lookup at Start = 7 s must succeed.
+
+## Isolation tests (Ruling 11)
+
+Video lookups are scoped to bot and chat. The chat ID comes from the Telegram update, never from the model. The model supplies only a ref string, and file paths come from the stored record. The plan already tests cross-chat lookups. These tests are added, and they are binding:
+
+- **Task 3:**
+  - `TestFindVideo_OtherBotSameChat`: two bot IDs with the **same** chat ID. That is the common case, because one user messaging two bots privately has the same chat ID with both. Check three things:
+    - `findVideo` returns `errVideoNotFound` across bots;
+    - ref numbering is scoped to bot + chat, so each bot's first video is `v1`;
+    - files land under different `<botID>` directories.
+  - **Hostile refs:** `"../v1"`, `"v1/../../x"`, `"v1' OR 1=1 --"`, `""`, `"V1"`, `" v1"` and a 10 KB string each return `errVideoNotFound`. The ref is never used to build a path; check it as a string against `^v[1-9][0-9]{0,8}$` before any lookup.
+- **Task 7:** an end-to-end loop test. The scripted model calls `view_frames` with a ref that exists only in another chat, and then one that exists only for another bot in the same chat. Each call returns `is_error` "… not found in this chat". The next request's body carries no image block, no frame times and no label from the other chat or bot.
