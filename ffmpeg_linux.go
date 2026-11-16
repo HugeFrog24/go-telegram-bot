@@ -32,7 +32,10 @@ func toolCommand(bin, dir, font string, args []string) (string, []string, error)
 // item 10). The signal follows the OS thread that started the child; the Go
 // runtime only retires a thread after a goroutine exits while locked to it,
 // which this code never does. The helper takes the signal again on the thread
-// it execs from (Ruling 14 note 2).
+// it execs from (Ruling 14 note 2). It reaches only the direct child, the
+// tool itself: a process the tool forked would outlive a dead bot. That gap
+// is accepted (Ruling 14 note 7): ffmpeg and ffprobe do not fork, and a
+// timeout kills the whole group.
 //
 // The child also leads its own process group, and a timeout or the output
 // bound kills that whole group: a wrapper script on PATH cannot leave a
