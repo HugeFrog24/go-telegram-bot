@@ -54,6 +54,13 @@ type Message struct {
 	// after a turn read memory has a higher one than all the turn read. It
 	// lives in memory only; a reload gives new ones in load order.
 	Seq uint64 `gorm:"-"`
+	// Aside keeps a stored message out of the conversation: a handled
+	// command and its reply, a rate-limited message and its notice, a voice
+	// note refused or not transcribed and its notice, media the bot does not
+	// read, and any other notice sent outside a model turn. The row stays
+	// for stats and the record, but never enters chat memory or the model's
+	// context, answers nothing, and a reload skips it.
+	Aside bool `gorm:"default:false"`
 }
 
 type ChatMemory struct {

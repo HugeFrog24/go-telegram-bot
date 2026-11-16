@@ -29,7 +29,7 @@ func (b *Bot) generateSpeech(ctx context.Context, text string) (io.Reader, error
 		return nil, fmt.Errorf("elevenlabs TTS marshal error: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		elevenLabsTTSURL+b.config.ElevenLabsVoiceID, bytes.NewReader(body))
+		b.ttsURL+b.config.ElevenLabsVoiceID, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("elevenlabs TTS request error: %w", err)
 	}
@@ -71,7 +71,7 @@ func (b *Bot) transcribeVoice(ctx context.Context, fileID string) (string, error
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		elevenLabsSTTURL, &buf)
+		b.sttURL, &buf)
 	if err != nil {
 		return "", fmt.Errorf("create STT request error: %w", err)
 	}

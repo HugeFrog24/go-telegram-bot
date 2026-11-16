@@ -15,16 +15,12 @@ import (
 
 func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, userMsg Message, to replyTarget, userID int64, username, firstName, lastName string, isPremium bool, languageCode string, messageTime int) {
 	if b.config.ElevenLabsAPIKey == "" {
-		if err := b.sendResponse(ctx, to, "I don't understand voice messages."); err != nil {
-			ErrorLogger.Printf("Error sending voice-unsupported message: %v", err)
-		}
+		b.refuseVoice(ctx, &userMsg, to, "I don't understand voice messages.")
 		return
 	}
 
 	if !b.hasScope(userID, ScopeTTSUse) {
-		if err := b.sendResponse(ctx, to, "You don't have permission to use voice features."); err != nil {
-			ErrorLogger.Printf("Error sending permission denied message: %v", err)
-		}
+		b.refuseVoice(ctx, &userMsg, to, "You don't have permission to use voice features.")
 		return
 	}
 
@@ -39,27 +35,22 @@ func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, u
 	defer stopTyping()
 
 	transcript, err := b.transcribeVoice(ctx, message.Voice.FileID)
+	if err == nil && strings.TrimSpace(transcript) == "" {
+		err = errors.New("empty transcript")
+	}
 	if err != nil {
 		ErrorLogger.Printf("Error transcribing voice message from user %d: %v", userID, err)
-		if err := b.sendResponse(ctx, to, "Sorry, I couldn't understand your voice message."); err != nil {
-			ErrorLogger.Printf("Error sending transcription error message: %v", err)
-		}
+		b.refuseVoice(ctx, &userMsg, to, "Sorry, I couldn't understand your voice message.")
 		return
 	}
 
-	if err := b.db.Model(&userMsg).Update("text", transcript).Error; err != nil {
+	// The note joins the conversation only now, as its transcript: until then
+	// no other turn could read its placeholder, cover it, or answer it.
+	userMsg.Text = transcript
+	if err := b.db.Model(&Message{}).Where("id = ?", userMsg.ID).Update("text", transcript).Error; err != nil {
 		ErrorLogger.Printf("Error updating voice transcript in DB: %v", err)
 	}
-	b.chatMemoriesMu.Lock()
-	if mem, exists := b.chatMemories[to.chatID]; exists {
-		for i := len(mem.Messages) - 1; i >= 0; i-- {
-			if mem.Messages[i].ID == userMsg.ID {
-				mem.Messages[i].Text = transcript
-				break
-			}
-		}
-	}
-	b.chatMemoriesMu.Unlock()
+	b.joinConversation(userMsg)
 
 	// Notes show while the model works. Once it is done, notes end: one still
 	// waiting is dropped, so none first appears during speech synthesis. The
@@ -119,6 +110,15 @@ func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, u
 	}
 }
 
+// refuseVoice sets a voice note that will not be transcribed aside, with the
+// notice that tells the user why.
+func (b *Bot) refuseVoice(ctx context.Context, userMsg *Message, to replyTarget, notice string) {
+	b.setAside(userMsg)
+	if err := b.sendResponse(ctx, to, notice); err != nil {
+		ErrorLogger.Printf("Error sending voice notice: %v", err)
+	}
+}
+
 func (b *Bot) uploadPhotoFromItem(ctx context.Context, item *models.Message, chatID int64) (string, error) {
 	photo := largestPhotoSize(item.Photo)
 	data, err := b.downloadTelegramFile(ctx, photo.FileID)
@@ -175,7 +175,7 @@ func (b *Bot) handlePhotoMessage(
 			}
 			return "", errTurnSilent
 		}
-		b.addMessageToChatMemory(chatMemory, userMessage)
+		b.joinConversation(userMessage)
 
 		contextMessages := b.snapshotForTurn(turn, chatMemory)
 		return b.getAnthropicResponse(
@@ -236,7 +236,7 @@ func (b *Bot) uploadPhotoItems(ctx context.Context, items []*models.Message, to 
 // respondToChat runs one assistant turn against the chat's current memory and
 // streams the reply back. Both the immediate path and the debounced flush go
 // through here, so a coalesced turn is byte-for-byte the same request as a
-// single-message one: the messages were already written to memory at intake, and
+// single-message one: the messages joined memory before they were buffered, and
 // the model simply sees more of them.
 //
 // If a turn is already running for the chat, beginTextTurn decides whether this
@@ -386,89 +386,13 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		return
 	}
 
-	if message.Entities != nil {
-		for _, entity := range message.Entities {
-			if entity.Type == "bot_command" {
-				command := strings.TrimSpace(message.Text[entity.Offset : entity.Offset+entity.Length])
-				switch command {
-				case "/stats":
-					parts := strings.Fields(message.Text)
-
-					if len(parts) == 1 {
-						b.sendStats(ctx, to, userID, 0)
-						return
-					}
-
-					if len(parts) >= 2 && parts[1] == "user" {
-						targetUserID := userID
-
-						if len(parts) >= 3 {
-							var parseErr error
-							targetUserID, parseErr = strconv.ParseInt(parts[2], 10, 64)
-							if parseErr != nil {
-								InfoLogger.Printf("User %d provided invalid user ID format: %s", userID, parts[2])
-								if err := b.sendResponse(ctx, to, "Invalid user ID format. Usage: /stats user [user_id]"); err != nil {
-									ErrorLogger.Printf("Error sending response: %v", err)
-								}
-								return
-							}
-						}
-
-						b.sendStats(ctx, to, userID, targetUserID)
-						return
-					}
-
-					if err := b.sendResponse(ctx, to, "Invalid command format. Usage: /stats or /stats user [user_id]"); err != nil {
-						ErrorLogger.Printf("Error sending response: %v", err)
-					}
-					return
-				case "/whoami":
-					b.sendWhoAmI(ctx, to, userID, username)
-					return
-				case "/clear", "/clear_hard":
-					targetUserID, targetChatID, errReply := parseClearArgs(command, strings.Fields(message.Text))
-					if errReply != "" {
-						InfoLogger.Printf("User %d sent invalid arguments to %s: %s", userID, command, errReply)
-						if err := b.sendResponse(ctx, to, errReply); err != nil {
-							ErrorLogger.Printf("Error sending response: %v", err)
-						}
-						return
-					}
-					b.clearChatHistory(ctx, to, userID, targetUserID, targetChatID, command == "/clear_hard")
-					return
-				case "/set_model":
-					if !b.hasScope(userID, ScopeModelSet) {
-						if err := b.sendResponse(ctx, to, "Permission denied. Only admins and owners can change the model."); err != nil {
-							ErrorLogger.Printf("Error sending response: %v", err)
-						}
-						return
-					}
-					parts := strings.Fields(message.Text)
-					if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-						if err := b.sendResponse(ctx, to, "Usage: /set_model <model-id>"); err != nil {
-							ErrorLogger.Printf("Error sending response: %v", err)
-						}
-						return
-					}
-					newModel := strings.TrimSpace(parts[1])
-					if err := b.config.PersistModel(newModel); err != nil {
-						ErrorLogger.Printf("Failed to persist model change: %v", err)
-						if err := b.sendResponse(ctx, to, fmt.Sprintf("Model updated in memory to `%s`, but failed to save to config file: %v", newModel, err)); err != nil {
-							ErrorLogger.Printf("Error sending response: %v", err)
-						}
-						return
-					}
-					InfoLogger.Printf("Model changed to %s by user %d", newModel, userID)
-					if err := b.sendResponse(ctx, to, fmt.Sprintf("✅ Model updated to `%s` and saved to config.", newModel)); err != nil {
-						ErrorLogger.Printf("Error sending response: %v", err)
-					}
-					return
-				}
-			}
-		}
+	if command := handledCommand(message); command != "" {
+		b.runCommand(ctx, to, command, message.Text, userID, username)
+		return
 	}
 
 	if !b.checkRateLimits(userID) {
+		b.setAside(&userMsg)
 		b.sendRateLimitExceededMessage(ctx, to)
 		return
 	}
@@ -486,10 +410,14 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	}
 
 	if text == "" {
+		// Stored aside at intake (unreadMedia).
 		InfoLogger.Printf("Received a non-text message from user %d in chat %d", userID, chatID)
 		return
 	}
 
+	// The text passed the command and rate-limit checks: it joins the
+	// conversation.
+	b.joinConversation(userMsg)
 	req := turnRequest{
 		ctx: ctx, chatID: chatID, userID: userID, isEmojiOnly: isOnlyEmojis(text),
 		username: username, firstName: firstName, lastName: lastName,
@@ -585,6 +513,97 @@ func (b *Bot) handleStopGeneration(chatID int64, draftID int) {
 	InfoLogger.Printf("[%s] stop for chat %d ignored: draft %d is not the running turn", b.config.ID, chatID, draftID)
 }
 
+// handledCommands are the commands the bot answers itself. Any other /command
+// is ordinary text for the model.
+var handledCommands = map[string]bool{
+	"/stats": true, "/whoami": true, "/clear": true, "/clear_hard": true, "/set_model": true,
+}
+
+// handledCommand is the first command in message the bot handles itself, or
+// "" when there is none.
+func handledCommand(message *models.Message) string {
+	for _, entity := range message.Entities {
+		end := entity.Offset + entity.Length
+		if entity.Type != "bot_command" || entity.Offset < 0 || entity.Length < 0 || end > len(message.Text) {
+			continue
+		}
+		if command := strings.TrimSpace(message.Text[entity.Offset:end]); handledCommands[command] {
+			return command
+		}
+	}
+	return ""
+}
+
+// unreadMedia reports whether message is media the bot does not read yet,
+// which never joins the conversation. Photos never reach intake as one.
+func unreadMedia(message *models.Message) bool {
+	return message.Text == "" && message.Sticker == nil && message.Voice == nil
+}
+
+// runCommand answers a handled command. The command and every reply here are
+// aside: they never join the conversation.
+func (b *Bot) runCommand(ctx context.Context, to replyTarget, command, text string, userID int64, username string) {
+	reply := func(notice string) {
+		if err := b.sendResponse(ctx, to, notice); err != nil {
+			ErrorLogger.Printf("Error sending response: %v", err)
+		}
+	}
+	switch command {
+	case "/stats":
+		parts := strings.Fields(text)
+		switch {
+		case len(parts) <= 1:
+			b.sendStats(ctx, to, userID, 0)
+		case parts[1] == "user":
+			targetUserID := userID
+			if len(parts) >= 3 {
+				var parseErr error
+				if targetUserID, parseErr = strconv.ParseInt(parts[2], 10, 64); parseErr != nil {
+					InfoLogger.Printf("User %d provided invalid user ID format: %s", userID, parts[2])
+					reply("Invalid user ID format. Usage: /stats user [user_id]")
+					return
+				}
+			}
+			b.sendStats(ctx, to, userID, targetUserID)
+		default:
+			reply("Invalid command format. Usage: /stats or /stats user [user_id]")
+		}
+	case "/whoami":
+		b.sendWhoAmI(ctx, to, userID, username)
+	case "/clear", "/clear_hard":
+		targetUserID, targetChatID, errReply := parseClearArgs(command, strings.Fields(text))
+		if errReply != "" {
+			InfoLogger.Printf("User %d sent invalid arguments to %s: %s", userID, command, errReply)
+			reply(errReply)
+			return
+		}
+		b.clearChatHistory(ctx, to, userID, targetUserID, targetChatID, command == "/clear_hard")
+	case "/set_model":
+		b.setModel(text, userID, reply)
+	}
+}
+
+// setModel handles /set_model, answering through reply.
+func (b *Bot) setModel(text string, userID int64, reply func(string)) {
+	if !b.hasScope(userID, ScopeModelSet) {
+		reply("Permission denied. Only admins and owners can change the model.")
+		return
+	}
+	parts := strings.Fields(text)
+	if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+		reply("Usage: /set_model <model-id>")
+		return
+	}
+	newModel := strings.TrimSpace(parts[1])
+	if err := b.config.PersistModel(newModel); err != nil {
+		ErrorLogger.Printf("Failed to persist model change: %v", err)
+		reply(fmt.Sprintf("Model updated in memory to `%s`, but failed to save to config file: %v", newModel, err))
+		return
+	}
+	InfoLogger.Printf("Model changed to %s by user %d", newModel, userID)
+	reply(fmt.Sprintf("✅ Model updated to `%s` and saved to config.", newModel))
+}
+
 func (b *Bot) sendRateLimitExceededMessage(ctx context.Context, to replyTarget) {
 	if err := b.sendResponse(ctx, to, "Rate limit exceeded. Please try again later."); err != nil {
 		ErrorLogger.Printf("Error sending rate limit exceeded message: %v", err)
@@ -592,10 +611,12 @@ func (b *Bot) sendRateLimitExceededMessage(ctx context.Context, to replyTarget) 
 }
 
 // runStickerTurn answers a sticker as its own committed turn, after any turn
-// already running on the chat.
+// already running on the chat. The sticker joins the conversation inside
+// that turn, so no other turn can read or cover it.
 func (b *Bot) runStickerTurn(ctx context.Context, to replyTarget, userMsg Message, message *models.Message) {
 	turn, turnCtx := b.beginTurn(ctx, to.chatID)
 	defer b.endTurn(turn)
+	b.joinConversation(userMsg)
 	contextMessages := b.snapshotForTurn(turn, b.getOrCreateChatMemory(to.chatID))
 	b.handleStickerMessage(turnCtx, turn, to, userMsg, message, contextMessages)
 }

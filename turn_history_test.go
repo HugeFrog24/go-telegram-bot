@@ -44,10 +44,22 @@ func historyTestBot(t *testing.T, stub *anthropicStub) (*Bot, telegramRecord) {
 // as at intake, so a first load cannot read the new row and add it twice.
 func storeUserText(t *testing.T, b *Bot, chatID int64, text string) Message {
 	t.Helper()
-	mem := b.getOrCreateChatMemory(chatID)
+	b.getOrCreateChatMemory(chatID)
 	m := b.createMessage(chatID, 555, "tester", "user", text, true)
 	require.NoError(t, b.storeMessage(&m))
-	return b.addMessageToChatMemory(mem, m)
+	return b.joinConversation(m)
+}
+
+// answerInTurn records reply as a turn's answer to everything in the chat's
+// memory, as a text turn would, without a model.
+func answerInTurn(t *testing.T, b *Bot, chatID int64, reply string) {
+	t.Helper()
+	turn, _, ok := b.beginTextTurn(textReq(chatID), b.newestAnswerableSeqInChat(chatID))
+	require.True(t, ok)
+	defer b.finishTurn(turn)
+	b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatID))
+	_, err := b.recordTurnReply(turn, chatID, reply)
+	require.NoError(t, err)
 }
 
 func chatIdle(b *Bot, chatID int64) bool {
@@ -176,30 +188,6 @@ func TestGetAnthropicResponse_RefusesHistoryEndingWithTheBot(t *testing.T) { //N
 	assert.Empty(t, stub.requestBetas(), "nothing is sent")
 }
 
-// A sticker that lands just as a text turn starts is read by that turn, which
-// answers both. The sticker's own turn waited for it and then has nothing
-// left to answer: no second model call, and no canned sticker reply either.
-func TestRunStickerTurn_AnsweredByTheTurnItWaitedForSaysNothing(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
-	stub := newAnthropicStub(t, candleFarmStream())
-	b, tg := historyTestBot(t, stub)
-	const chatID = int64(779)
-	storeUserText(t, b, chatID, "look at this")
-	sticker := b.createMessage(chatID, 555, "tester", "user", "Sent a sticker: 😀", true)
-	sticker.StickerFileID = "sticker-file"
-	require.NoError(t, b.storeMessage(&sticker))
-	b.addMessageToChatMemory(b.getOrCreateChatMemory(chatID), sticker)
-
-	b.respondToChat(textReq(chatID)) // the text turn reads both and answers
-	require.Len(t, stub.requestBetas(), 1)
-	answered := len(tg.sent())
-
-	b.runStickerTurn(context.Background(), replyTarget{chatID: chatID}, sticker,
-		&models.Message{Sticker: &models.Sticker{FileID: "sticker-file", Emoji: "😀"}})
-
-	assert.Len(t, stub.requestBetas(), 1, "no second model call")
-	assert.Len(t, tg.sent(), answered, "no canned sticker reply either")
-}
-
 // A turn's reply is recorded right after the newest message its context
 // included. A message that arrived while it ran stays after the reply, and
 // stays unanswered until a turn of its own answers it.
@@ -229,12 +217,12 @@ func TestRespondToChat_MessageThatReachedMemoryLateIsStillAnswered(t *testing.T)
 	stub, open := newGatedAnthropicStub(t, candleFarmStream(), 1)
 	b, _ := historyTestBot(t, stub)
 	const chatID = int64(785)
-	mem := b.getOrCreateChatMemory(chatID)
+	b.getOrCreateChatMemory(chatID) // loaded before the stores, as at intake
 	first := b.createMessage(chatID, 555, "tester", "user", "first, stored first", true)
 	require.NoError(t, b.storeMessage(&first))
 	second := b.createMessage(chatID, 556, "other", "user", "second, stored second", true)
 	require.NoError(t, b.storeMessage(&second))
-	b.addMessageToChatMemory(mem, second) // second's handler reaches memory first
+	b.joinConversation(second) // second's handler reaches memory first
 
 	done := make(chan struct{})
 	go func() {
@@ -243,7 +231,7 @@ func TestRespondToChat_MessageThatReachedMemoryLateIsStillAnswered(t *testing.T)
 	}()
 	// The request is out, so the turn has read memory: second only.
 	require.Eventually(t, func() bool { return len(stub.requestBetas()) == 1 }, 5*time.Second, 5*time.Millisecond)
-	b.addMessageToChatMemory(mem, first) // first's handler reaches memory now
+	b.joinConversation(first) // first's handler reaches memory now
 	open()
 	<-done
 

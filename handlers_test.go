@@ -613,6 +613,9 @@ func setupBotForTest(t *testing.T, ownerID int64) (*Bot, *MockTelegramClient) {
 	b, err := NewBot(db, config, mockClock, mockTgClient)
 	assert.NoError(t, err)
 	if b != nil {
+		// No test reaches ElevenLabs: one that needs speech installs a
+		// stand-in (voiceStubs); any other call fails here, locally.
+		b.sttURL, b.ttsURL = "http://127.0.0.1:1/stt", "http://127.0.0.1:1/tts/"
 		t.Cleanup(func() { stopPendingTimers(b) })
 	}
 	return b, mockTgClient

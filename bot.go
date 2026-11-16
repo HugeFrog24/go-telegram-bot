@@ -41,6 +41,9 @@ type Bot struct {
 	// (Message.Seq). Guarded by chatMemoriesMu.
 	memorySeq uint64
 
+	// ElevenLabs endpoints: fields so tests can point them at a stand-in.
+	sttURL, ttsURL string
+
 	// Drafts: the send throttle, the keepalive and how the sender sleeps
 	// (fields so tests can shorten the timings and count the sender's timers).
 	draftInterval  time.Duration
@@ -291,6 +294,9 @@ func NewBot(db *gorm.DB, config BotConfig, clock Clock, tgClient TelegramClient)
 		statusEditInterval: defaultStatusEditInterval,
 		businessRights:     make(map[string]businessRightsEntry),
 
+		sttURL: elevenLabsSTTURL,
+		ttsURL: elevenLabsTTSURL,
+
 		video: resolveVideo(&config),
 	}
 
@@ -419,12 +425,13 @@ func (b *Bot) getOrCreateChatMemory(chatID int64) *ChatMemory {
 	return chatMemory
 }
 
-// loadChatHistory reads the chat's newest messages from the database, oldest
-// first, for a memory being created: at startup, or after /clear dropped it.
-// Messages with the same timestamp keep the order they were stored in.
+// loadChatHistory reads the chat's newest conversation messages from the
+// database, oldest first, for a memory being created: at startup, or after
+// /clear dropped it. Aside rows are skipped. Messages with the same timestamp
+// keep the order they were stored in.
 func (b *Bot) loadChatHistory(chatID int64) []Message {
 	var messages []Message
-	err := b.db.Where("chat_id = ? AND bot_id = ?", chatID, b.botID).
+	err := b.db.Where("chat_id = ? AND bot_id = ? AND (aside = ? OR aside IS NULL)", chatID, b.botID, false).
 		Order("timestamp desc, id desc").
 		Limit(b.memorySize * 2).
 		Find(&messages).Error
@@ -482,11 +489,21 @@ func (b *Bot) stripDeadFileIDFromMemory(chatID int64, deadFileID string) {
 	}
 }
 
-// addMessageToChatMemory appends message to the chat's memory and returns the
-// copy memory holds, which carries its sequence.
-func (b *Bot) addMessageToChatMemory(chatMemory *ChatMemory, message Message) Message {
+// joinConversation appends a stored user message to its chat's memory, once
+// it joins the conversation, and returns the copy memory holds, which carries
+// its sequence. Until then no turn can read it, cover it, or mark it
+// answered. A memory reloaded since the message was stored may hold it
+// already; that copy then takes the message's current text.
+func (b *Bot) joinConversation(message Message) Message {
+	chatMemory := b.getOrCreateChatMemory(message.ChatID)
 	b.chatMemoriesMu.Lock()
 	defer b.chatMemoriesMu.Unlock()
+	for i := range chatMemory.Messages {
+		if held := &chatMemory.Messages[i]; message.ID != 0 && held.ID == message.ID {
+			held.Text = message.Text
+			return *held
+		}
+	}
 	return b.insertLocked(chatMemory, message, len(chatMemory.Messages))
 }
 
@@ -773,34 +790,39 @@ func initTelegramBot(token string, b *Bot) (TelegramClient, error) {
 	return tgBot, nil
 }
 
+// sendResponse sends a notice that is not part of the conversation: a
+// command's reply, a refusal, a failure the user is told about, anything sent
+// outside a model turn. It is stored aside, so it never enters memory or the
+// model's context, answers nothing, and cannot leave a pending message
+// looking answered.
 func (b *Bot) sendResponse(ctx context.Context, to replyTarget, text string) error {
-	return b.sendTurnReply(ctx, nil, to, text)
+	notice := b.createMessage(to.chatID, 0, "", "assistant", text, false)
+	notice.Aside = true
+	if err := b.storeMessage(&notice); err != nil {
+		ErrorLogger.Printf("Error storing notice: %v", err)
+		return err
+	}
+	return b.sendOneSegment(ctx, to, text)
 }
 
-// sendTurnReply records text as the bot's message, then sends it. With a
-// turn, the record goes where that turn's context ended (recordTurnReply);
-// without one, at the end of memory, as for a command's reply.
+// sendTurnReply records text as turn's reply, filed where the turn's context
+// ended (recordTurnReply), then sends it.
 func (b *Bot) sendTurnReply(ctx context.Context, turn *chatTurn, to replyTarget, text string) error {
-	_, err := b.recordTurnReply(turn, to.chatID, text)
-	if err != nil {
+	if _, err := b.recordTurnReply(turn, to.chatID, text); err != nil {
 		ErrorLogger.Printf("Error storing assistant message: %v", err)
 		return err
 	}
+	return b.sendOneSegment(ctx, to, text)
+}
 
-	params := &bot.SendMessageParams{
-		ChatID:               to.chatID,
-		MessageThreadID:      to.threadID,
-		BusinessConnectionID: to.businessConnectionID,
-		Text:                 text,
+// setAside takes a stored user message out of the conversation when it is
+// refused after intake. It never joined, so it is in no memory; only the row
+// changes.
+func (b *Bot) setAside(msg *Message) {
+	msg.Aside = true
+	if err := b.db.Model(&Message{}).Where("id = ?", msg.ID).Update("aside", true).Error; err != nil {
+		ErrorLogger.Printf("[%s] setting message %d aside: %v", b.config.ID, msg.ID, err)
 	}
-
-	_, err = b.tgBot.SendMessage(ctx, params)
-	if err != nil {
-		ErrorLogger.Printf("[%s] Error sending message to chat %d with BusinessConnectionID %s: %v",
-			b.config.ID, to.chatID, to.businessConnectionID, err)
-		return err
-	}
-	return nil
 }
 
 func (b *Bot) sendOneSegment(ctx context.Context, to replyTarget, text string) error {
@@ -1039,20 +1061,18 @@ func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
 			userMessage.StickerPNGFile = message.Sticker.Thumbnail.FileID
 		}
 	}
+	// A handled command and media the bot does not read never join the
+	// conversation.
+	userMessage.Aside = handledCommand(message) != "" || unreadMedia(message)
 
-	chatMemory := b.getOrCreateChatMemory(message.Chat.ID)
-
+	// Intake only stores: a message joins memory once it is accepted into
+	// the conversation (joinConversation). Memory is loaded first, or its
+	// first load would read this row before the message joined.
+	b.getOrCreateChatMemory(message.Chat.ID)
 	if err := b.storeMessage(&userMessage); err != nil {
 		return Message{}, err
 	}
-
-	b.addMessageToChatMemory(chatMemory, userMessage)
-
 	return userMessage, nil
-}
-
-func (b *Bot) screenOutgoingMessage(chatID int64, response string) (Message, error) {
-	return b.recordTurnReply(nil, chatID, response)
 }
 
 // recordTurnReply stores the bot's message for a turn. It goes into chat
@@ -1062,8 +1082,7 @@ func (b *Bot) screenOutgoingMessage(chatID int64, response string) (Message, err
 // with it, as the API requires, instead of with this reply. Only the user
 // messages the turn covered are marked answered.
 //
-// A nil turn appends and covers every answerable message in memory, as for a
-// command's reply.
+// Notices outside a model turn never come here: they are aside (sendResponse).
 func (b *Bot) recordTurnReply(turn *chatTurn, chatID int64, response string) (Message, error) {
 	frontier, covered := b.contextEnd(turn)
 	if b.config.DebugScreening {
@@ -1085,9 +1104,6 @@ func (b *Bot) recordTurnReply(turn *chatTurn, chatID int64, response string) (Me
 	assistantMessage := b.createMessage(chatID, 0, "", "assistant", response, false)
 	if err := b.storeMessage(&assistantMessage); err != nil {
 		return Message{}, err
-	}
-	if turn == nil {
-		covered = b.newestAnswerableSeqInChat(chatID)
 	}
 	b.markAnswered(chatID, b.fileReply(chatMemory, assistantMessage, frontier, covered))
 	return assistantMessage, nil

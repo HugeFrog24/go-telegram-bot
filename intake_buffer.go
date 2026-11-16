@@ -6,9 +6,9 @@ import (
 )
 
 // pendingIntake holds a chat's coalescing window. The buffered message bodies
-// are deliberately absent: screenIncomingMessage has already persisted each
-// message to the database and to chat memory by the time it is buffered, so the
-// flushed turn picks them all up from memory. What is kept here is the request
+// are deliberately absent: each message is stored and has joined chat memory
+// by the time it is buffered, so the flushed turn picks them all up from
+// memory. What is kept here is the request
 // the turn needs, always refreshed to the most recent message in the batch.
 type pendingIntake struct {
 	turnRequest

@@ -15,11 +15,11 @@ import (
 // the way screenIncomingMessage does, without going through handleUpdate.
 func storeUserMessage(t *testing.T, b *Bot, chatID int64, telegramID int, text string) Message {
 	t.Helper()
-	mem := b.getOrCreateChatMemory(chatID)
+	b.getOrCreateChatMemory(chatID)
 	msg := b.createMessage(chatID, chatID, "owner", "user", text, true)
 	msg.TelegramMessageID = telegramID
 	require.NoError(t, b.storeMessage(&msg))
-	return b.addMessageToChatMemory(mem, msg)
+	return b.joinConversation(msg)
 }
 
 func editUpdate(chatID int64, telegramID int, text string) *models.Update {
@@ -98,8 +98,7 @@ func TestHandleUpdate_EditOfAnsweredMessageOnlyCorrectsRecord(t *testing.T) { //
 	b.config.DebounceMs = int(bufferOnly / time.Millisecond)
 	const chatID int64 = 123
 	storeUserMessage(t, b, chatID, 80, "first question")
-	_, err := b.screenOutgoingMessage(chatID, "first answer")
-	require.NoError(t, err)
+	answerInTurn(t, b, chatID, "first answer")
 
 	// A newer, unrelated message is waiting in its window.
 	b.handleUpdate(context.Background(), nil, &models.Update{Message: &models.Message{
