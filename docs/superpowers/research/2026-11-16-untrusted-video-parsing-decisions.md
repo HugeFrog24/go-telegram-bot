@@ -180,3 +180,46 @@ Video lookups are scoped to bot and chat. The chat ID comes from the Telegram up
     - files land under different `<botID>` directories.
   - **Hostile refs:** `"../v1"`, `"v1/../../x"`, `"v1' OR 1=1 --"`, `""`, `"V1"`, `" v1"` and a 10 KB string each return `errVideoNotFound`. The ref is never used to build a path; check it as a string against `^v[1-9][0-9]{0,8}$` before any lookup.
 - **Task 7:** an end-to-end loop test. The scripted model calls `view_frames` with a ref that exists only in another chat, and then one that exists only for another bot in the same chat. Each call returns `is_error` "… not found in this chat". The next request's body carries no image block, no frame times and no label from the other chat or bot.
+
+## Blind review of the ffmpeg layer (Ruling 12)
+
+The blind review of Task 2 measured memory blowups on the production stack (Alpine 3.24, ffmpeg 8.1.3). Small hostile files push one run to 1–6 GB:
+
+| Hostile file | Size | Peak memory |
+|---|---|---|
+| zlib-compressed moov | 1 MB | 1.1 GB |
+| huge sample index | 10 KB | 4.9 GB |
+| 4:4:4 10-bit 4K | 2.7 MB | 1.6 GB |
+| libvpx with a late oversized keyframe | 160 KB | 6.0 GB |
+
+The last one bypasses `-max_pixels`, because the libvpx wrapper checks the frame size only after decoding. With four slots that is enough to OOM the host. These items are binding for Task 2. Where they differ from earlier items, they win.
+
+1. **`-max_alloc 134217728` on both tools.** This is moved from "Later". The reviewer tested it: the cmov and stsz files are refused at about 45 MB, and 4K files still work.
+2. **A per-child memory cap on Linux.**
+   - Every tool runs through `/bin/sh -c 'ulimit -v <KiB> && echo 1000 > /proc/self/oom_score_adj && exec "$0" "$@"' <abs tool path> <args…>`.
+   - The constant `toolMemoryLimit` is 1536 MiB. Verify on Alpine 8.1.3 that normal 4K H.264, 4K HEVC 10-bit, 1080p VP9 and the alpha sticker fixtures still render. Raise the constant, and say so, if one fails.
+   - `exec` keeps the PID, so `Pdeathsig` and the kill still reach ffmpeg.
+   - If `/bin/sh` is missing, video watching is off (fail closed) and the reason is logged.
+   - On other OSes the cap does not exist. Document that.
+3. **libvpx (the alpha path) only for stickers.**
+   - `HasAlpha` is set only when the kind is `sticker`. Every other kind decodes VP8/VP9 with the native decoders, which honour `-max_pixels`.
+   - A sticker must probe at ≤ 512 × 512 and ≤ 10 s, or it is refused. Mid-stream size changes are bounded by item 2.
+   - Drop `libaom-av1` from the render list, so AV1 decodes only through `libdav1d`, which receives `-max_pixels`. If `libdav1d` is missing, AV1 is unsupported.
+4. **Try `-fflags +noparse+nofillin`** on both tools, so codec parsers stop running on refused streams. Keep it only if the full suite passes on Windows 9.0.2, Alpine 8.1.3 and Ubuntu 6.1.1, including the colour/frame-time tests. Otherwise drop it and say so.
+5. **Kill the whole process group on Linux.** Set `Setpgid`, and make `cmd.Cancel` kill the process group, so a wrapper script on PATH can't leave its child running. The Windows dev shim can still orphan ffmpeg; document that limit.
+6. **Version log.**
+   - When the gate turns video on, run `ffmpeg -hide_banner -version` once, through the same runner with a 5 s timeout, and log the first line.
+   - Warn when the major version is below 8, or when it can't be read.
+   - It is never fatal.
+7. **Carried to Tasks 5 and 7:**
+   - Each chat holds at most one video job, probe or render, at a time. A second one waits for the first.
+   - Callers pass frame counts and durations already bounded by the bot's `video` config. `checkSheet`'s global bounds are only a backstop.
+8. **Compose `mem_limit`.** The README (Task 8) recommends at least `slots × toolMemoryLimit + 512 MiB`. Whether to set it stays the operator's decision (Ruling 7).
+9. **Not adopted yet: a sandbox for the tools.**
+   - The reviewer rates the blast radius as Important. A future memory-corruption bug would run as the bot's user and could read every bot's config. No reachable code-execution CVE is known for 8.1.3 or 9.0.2.
+   - A Landlock re-exec helper is the candidate fix: read-only access to the input directory, font and libraries; no writes; no TCP on ABI v4 or later. It is pending the user's decision.
+10. **Declined:**
+    - A pix_fmt allowlist. The memory cap bounds it, and a list would refuse legitimate 10-bit and screen-capture content.
+    - A lower pixel cap. 4K phone video is common.
+    - A native-decoder pre-pass before libvpx. Items 2 and 3 cover it.
+    - A Windows Job Object. Windows is dev-only.
