@@ -560,13 +560,6 @@ func replyIndex(chatMemory *ChatMemory, frontier uint64) int {
 	return 0
 }
 
-// prepareContextMessages converts chat memory into API messages.
-func (b *Bot) prepareContextMessages(chatMemory *ChatMemory) []anthropic.BetaMessageParam {
-	b.chatMemoriesMu.RLock()
-	defer b.chatMemoriesMu.RUnlock()
-	return b.buildContextMessages(chatMemory)
-}
-
 // snapshotForTurn builds the model context for turn and records on it what
 // that context covers, all read under one lock so they cannot disagree: the
 // newest answerable user message, which lets a later flush tell whether the
@@ -613,7 +606,8 @@ func (b *Bot) newestAnswerableSeqInChat(chatID int64) uint64 {
 	return newestAnswerableSeq(chatMemory)
 }
 
-// buildContextMessages is prepareContextMessages without the lock.
+// buildContextMessages converts chat memory into API messages. The caller
+// holds chatMemoriesMu.
 func (b *Bot) buildContextMessages(chatMemory *ChatMemory) []anthropic.BetaMessageParam {
 	InfoLogger.Printf("Chat memory contains %d messages", len(chatMemory.Messages))
 	if b.config.DebugScreening {

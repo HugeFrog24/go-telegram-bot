@@ -52,7 +52,7 @@ func TestMarkTrailingCacheBreakpoint(t *testing.T) {
 	})
 }
 
-func TestPrepareContextMessages_CacheHistoryToggle(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+func TestBuildContextMessages_CacheHistoryToggle(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	b, _ := setupBotForTest(t, 123)
 	memory := &ChatMemory{
 		Messages: []Message{
@@ -63,7 +63,7 @@ func TestPrepareContextMessages_CacheHistoryToggle(t *testing.T) { //NOSONAR go:
 	}
 
 	t.Run("enabled by default", func(t *testing.T) {
-		msgs := b.prepareContextMessages(memory)
+		msgs := b.buildContextMessages(memory)
 		require.Len(t, msgs, 2)
 		require.NotNil(t, msgs[0].OfUser, "user memory becomes a user turn")
 		require.NotNil(t, msgs[1].OfAssistant, "bot memory becomes an assistant turn")
@@ -75,7 +75,7 @@ func TestPrepareContextMessages_CacheHistoryToggle(t *testing.T) { //NOSONAR go:
 		b.config.CacheHistory = &off
 		defer func() { b.config.CacheHistory = nil }()
 
-		msgs := b.prepareContextMessages(memory)
+		msgs := b.buildContextMessages(memory)
 		require.Len(t, msgs, 2)
 		assert.True(t, param.IsOmitted(msgs[1].OfAssistant.Content[0].OfText.CacheControl))
 	})

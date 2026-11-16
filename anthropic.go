@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,10 @@ var errNothingToAnswer = errors.New("nothing to answer: the conversation ends wi
 
 const maxFileNotFoundRetries = 3
 
+// imageGoneText stands in for an image whose file the Files API no longer
+// has, so the message keeps content (replaceDeadImage).
+const imageGoneText = "[image no longer available]"
+
 const maxPauseTurnContinuations = 5
 
 const defaultMaxTokens = 1000
@@ -34,14 +39,15 @@ var mcpUnsupportedCount atomic.Uint64
 type mcpCall struct{ server, name, input string }
 
 func (b *Bot) getAnthropicResponse(ctx context.Context, chatID int64, messages []anthropic.BetaMessageParam, isEmojiOnly bool, username string, firstName string, lastName string, isPremium bool, languageCode string, messageTime int, sinks replySinks) (string, error) {
-	if len(messages) == 0 || messages[len(messages)-1].OfUser == nil {
-		InfoLogger.Printf("[%s] chat %d: nothing new to answer, the conversation ends with the bot's message; no model call",
-			b.config.ID, chatID)
-		return "", errNothingToAnswer
-	}
-	InfoLogger.Printf("Sending %d messages to Anthropic", len(messages))
-
 	params := b.buildMessageParams(messages, isEmojiOnly, username, firstName, lastName, isPremium, languageCode, messageTime)
+
+	// history is the conversation as the turn read it. Every request sends it,
+	// with any self-heal edits made in place, followed by the paused turns the
+	// API asked to have sent back as they were (pause_turn). It is never
+	// rebuilt from live memory, so a message that lands during the turn is
+	// never read by it.
+	history := params.Messages
+	var resumed []anthropic.BetaMessageParam
 
 	// One assembler serves the whole turn, so across pause_turn continuations
 	// and self-heal retries the user watches one reply grow.
@@ -49,27 +55,19 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, chatID int64, messages [
 	var lastMsg anthropic.BetaMessage
 	fileRetries, pauseContinuations := 0, 0
 	for {
+		if len(history) == 0 || history[len(history)-1].OfUser == nil {
+			InfoLogger.Printf("[%s] chat %d: nothing new to answer, the conversation ends with the bot's message; no model call",
+				b.config.ID, chatID)
+			return "", errNothingToAnswer
+		}
+		params.Messages = append(slices.Clip(history), resumed...)
+		InfoLogger.Printf("Sending %d messages to Anthropic", len(params.Messages))
 		msg, streamErr := b.streamMessages(ctx, params, a)
 		if streamErr != nil {
-			var apiErr *anthropic.Error
-			if !errors.As(streamErr, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
-				return "", fmt.Errorf("error creating Anthropic message: %w", streamErr)
-			}
-			missingFileID := extractMissingFileID(streamErr)
-			if missingFileID == "" {
-				return "", fmt.Errorf("%w: %s", ErrModelNotFound, b.config.Model)
-			}
 			fileRetries++
-			if fileRetries > maxFileNotFoundRetries {
-				return "", fmt.Errorf("max self-heal retries (%d) exceeded: too many file_ids gone from anthropic", maxFileNotFoundRetries)
+			if err := b.selfHeal(ctx, chatID, history, streamErr, fileRetries); err != nil {
+				return "", err
 			}
-			ErrorLogger.Printf("[%s] self-heal: stripping dead file_id %s from chat %d (attempt %d/%d)",
-				b.config.ID, missingFileID, chatID, fileRetries, maxFileNotFoundRetries)
-			b.stripDeadFileIDFromMemory(chatID, missingFileID)
-			if _, cleanupErr := b.markFilesPendingCleanup(ctx, chatID, []string{missingFileID}); cleanupErr != nil {
-				ErrorLogger.Printf("[%s] mark files pending cleanup: %v", b.config.ID, cleanupErr)
-			}
-			params.Messages = b.prepareContextMessages(b.getOrCreateChatMemory(chatID))
 			continue
 		}
 
@@ -84,7 +82,7 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, chatID int64, messages [
 				a.flushHeld() // the turn ends here, so the text it was holding is part of the partial answer
 				break
 			}
-			params.Messages = append(params.Messages, msg.ToParam())
+			resumed = append(resumed, msg.ToParam())
 			continue
 		}
 		break
@@ -95,6 +93,58 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, chatID int64, messages [
 			lastMsg.Usage.OutputTokensDetails.ThinkingTokens, params.MaxTokens)
 	}
 	return a.reply(), nil
+}
+
+// selfHeal handles a failed request. A 404 that names a file the Files API
+// no longer has is healed in the request itself: that file's image blocks in
+// history become a note (replaceDeadImage), and the file is stripped from
+// memory and marked for cleanup, for later turns. nil asks for a retry of the
+// same history. Any other failure, or one a retry cannot heal, is returned.
+func (b *Bot) selfHeal(ctx context.Context, chatID int64, history []anthropic.BetaMessageParam, streamErr error, attempt int) error {
+	var apiErr *anthropic.Error
+	if !errors.As(streamErr, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("error creating Anthropic message: %w", streamErr)
+	}
+	missingFileID := extractMissingFileID(streamErr)
+	if missingFileID == "" {
+		return fmt.Errorf("%w: %s", ErrModelNotFound, b.config.Model)
+	}
+	if attempt > maxFileNotFoundRetries {
+		return fmt.Errorf("max self-heal retries (%d) exceeded: too many file_ids gone from anthropic", maxFileNotFoundRetries)
+	}
+	if !replaceDeadImage(history, missingFileID) {
+		return fmt.Errorf("file_id %s is gone from anthropic but not in the request: %w", missingFileID, streamErr)
+	}
+	ErrorLogger.Printf("[%s] self-heal: replaced dead file_id %s in chat %d's request (attempt %d/%d)",
+		b.config.ID, missingFileID, chatID, attempt, maxFileNotFoundRetries)
+	b.stripDeadFileIDFromMemory(chatID, missingFileID)
+	if _, cleanupErr := b.markFilesPendingCleanup(ctx, chatID, []string{missingFileID}); cleanupErr != nil {
+		ErrorLogger.Printf("[%s] mark files pending cleanup: %v", b.config.ID, cleanupErr)
+	}
+	return nil
+}
+
+// replaceDeadImage swaps every image block in messages that refers to fileID
+// for a short note, so its message keeps content, and reports whether it
+// found one. A cache breakpoint on the image moves to the note.
+func replaceDeadImage(messages []anthropic.BetaMessageParam, fileID string) bool {
+	replaced := false
+	for _, m := range messages {
+		if m.OfUser == nil {
+			continue
+		}
+		for i, block := range m.OfUser.Content {
+			image := block.OfImage
+			if image == nil || image.Source.OfFile == nil || image.Source.OfFile.FileID != fileID {
+				continue
+			}
+			note := anthropic.NewBetaTextBlock(imageGoneText)
+			note.OfText.CacheControl = image.CacheControl
+			m.OfUser.Content[i] = note
+			replaced = true
+		}
+	}
+	return replaced
 }
 
 // buildMessageParams assembles one Messages request for a turn: model, system
