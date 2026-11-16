@@ -211,3 +211,22 @@ func TestClear_DuringSpeechSynthesisSendsNothing(t *testing.T) { //NOSONAR go:S1
 	assert.Equal(t, []string{clearedNotice}, sentTexts(sent), "nothing after the confirmation")
 	assert.Empty(t, memoryTexts(b, ownerChat))
 }
+
+// Text a cancelled turn's stream still delivers is not sent: the segment
+// sink sends nothing once the turn's context is done.
+func TestAnswerOutput_CancelledTurnSendsNoSegment(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	b, tg := setupBotForTest(t, 123)
+	sent := recordSends(tg)
+	const chatID = int64(-1004) // a group: segments, no draft
+	turn, turnCtx, ok := b.beginTextTurn(textReq(chatID), 1)
+	require.True(t, ok)
+	defer b.finishTurn(turn)
+	out := b.newAnswerOutput(turnCtx, turn, replyTarget{chatID: chatID}, false)
+	defer out.close()
+	require.NoError(t, out.onSegment("before the clear"))
+
+	b.cancelForClear(chatID)
+
+	assert.NoError(t, out.onSegment("after the clear"))
+	assert.Equal(t, []string{"before the clear"}, sentTexts(sent))
+}
