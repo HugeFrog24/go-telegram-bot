@@ -82,6 +82,22 @@ Everything is gated on the bot's config, so bots without `video` behave exactly 
   - Capture exit codes without piping.
 - **Commits:** directly on `main`. Stage by name and never stage `go-telegram-bot.exe`. Every message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
+## Blind security review after every task (user requirement)
+
+The user asked for this on 2026-11-16 and accepted up to twice the implementation time.
+- **When:** after each task's normal review, and any fix loop it triggers, comes back clean.
+- **Who:** a fresh security reviewer with no session context.
+- **What it sees:**
+  - the task's diff, and the repository's source to trace paths;
+  - a short factual threat description: untrusted media, ffmpeg via `os/exec`, attacker-influenced LLM tool arguments.
+- **What it must not see:** the plan, the design, the research, implementer reports or earlier reviews.
+- **What it does:**
+  - searches for current CVEs itself;
+  - confirms suspicions only with harmless self-made samples.
+- **Its findings:** Critical and Important ones go through the normal fix loop, and each fix round is re-checked by another blind security reviewer. A finding that matches an existing ruling is adjudicated against it in the ledger.
+- **Models:** Opus 5.5 for Tasks 2, 3, 5, 6, 7 and 8; Sonnet 5.5 for Tasks 1 and 4.
+- **Task 0 (research)** gets a blind cross-check: a fresh agent first writes its own CVE and attack-technique list for the same scope without reading the research, then compares it with the research and reports the gaps.
+
 ## Review Focus
 
 1. **Editing a video's caption** replaces only the caption. The sheet labels and the not-watched note survive, because they live outside `Message.Text`. Test: Task 4, `TestHandleEditedMessage_VideoCaptionKeepsLabels`.
