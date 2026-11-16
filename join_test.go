@@ -67,7 +67,7 @@ func TestReload_DuringTranscriptionDoesNotLoadThePlaceholder(t *testing.T) { //N
 	require.Len(t, stub.requestBetas(), 1)
 	assert.False(t, requestHas(t, stub, 0, "[Voice message]"), "the placeholder is not read")
 
-	b.handleVoiceMessage(context.Background(), voice, userMsg, nil, replyTarget{chatID: chatID},
+	b.handleVoiceMessage(context.Background(), voice, userMsg, replyTarget{chatID: chatID},
 		123, "owner", "", "", false, "en", 0)
 
 	require.Len(t, stub.requestBetas(), 2, "the transcript reaches the model")

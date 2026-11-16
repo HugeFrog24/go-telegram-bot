@@ -274,34 +274,57 @@ func (b *Bot) clearedTurn(turn *chatTurn) bool {
 // it would produce a second, unprompted reply. Stop does not discard the
 // flush: the message predates the tap and still deserves an answer.
 func (b *Bot) finishTurn(turn *chatTurn) *turnRequest {
+	rerun, _, _ := b.closeTurn(turn, false)
+	return rerun
+}
+
+// endTurn finishes the turn and hands the chat to the flush collected behind
+// it, which runs on its own goroutine, so a chain of collected turns does not
+// nest on the stack of whichever update handler happened to run the first one.
+func (b *Bot) endTurn(turn *chatTurn) {
+	if rerun, next, nextCtx := b.closeTurn(turn, true); next != nil {
+		go b.runTextTurn(next, nextCtx, *rerun)
+	}
+}
+
+// closeTurn is finishTurn. With handOver, a rerun that still has something
+// to answer is registered as the chat's next turn in the same step that
+// unregisters this one, so a media turn waiting in beginTurn cannot take the
+// chat in between: the collected text keeps its place ahead of it. The new
+// turn is returned for the caller to run.
+func (b *Bot) closeTurn(turn *chatTurn, handOver bool) (*turnRequest, *chatTurn, context.Context) {
+	var chatMemory *ChatMemory
+	if handOver {
+		chatMemory = b.getOrCreateChatMemory(turn.chatID)
+	}
 	b.turnsMu.Lock()
 	if b.turns[turn.chatID] == turn {
 		delete(b.turns, turn.chatID)
 	}
 	rerun, want, reason, covered := turn.rerun, turn.rerunWant, turn.reason, turn.coveredSeq
+	due := rerun != nil && (reason == cancelRestart || want > covered)
+	var next *chatTurn
+	var nextCtx context.Context
+	if due && handOver && want > chatMemory.answeredThrough.Load() && b.turns[turn.chatID] == nil {
+		next, nextCtx = b.registerTurnLocked(rerun.ctx, turn.chatID, want, false)
+	}
 	b.turnsMu.Unlock()
 
 	turn.cancel()
 	close(turn.done)
 
-	if rerun == nil {
-		return nil
-	}
-	if reason != cancelRestart && want <= covered {
+	switch {
+	case rerun == nil:
+		return nil, nil, nil
+	case !due:
 		InfoLogger.Printf("[%s] turn %d for chat %d covered collected message %d; no rerun",
 			b.config.ID, turn.seq, turn.chatID, want)
-		return nil
+		return nil, nil, nil
+	case handOver && next == nil:
+		InfoLogger.Printf("[%s] turn: chat %d collected message %d already answered; no rerun",
+			b.config.ID, turn.chatID, want)
 	}
-	return rerun
-}
-
-// endTurn finishes the turn and runs whatever was collected behind it on its
-// own goroutine, so a chain of collected turns does not nest on the stack of
-// whichever update handler happened to run the first one.
-func (b *Bot) endTurn(turn *chatTurn) {
-	if next := b.finishTurn(turn); next != nil {
-		go b.respondToChat(*next)
-	}
+	return rerun, next, nextCtx
 }
 
 // runTurn drives a registered turn to completion: keeps the typing indicator

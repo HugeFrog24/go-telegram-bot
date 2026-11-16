@@ -236,7 +236,7 @@ func TestHandleVoiceMessage_InvisibleUntilTranscribed(t *testing.T) { //NOSONAR 
 	assert.Equal(t, "one more thing", text)
 	assert.False(t, requestHas(t, stub, 0, "[Voice message]"), "the untranscribed voice note is not read")
 
-	b.handleVoiceMessage(context.Background(), voice, userMsg, nil, replyTarget{chatID: chatID},
+	b.handleVoiceMessage(context.Background(), voice, userMsg, replyTarget{chatID: chatID},
 		123, "owner", "", "", false, "en", 0)
 
 	require.Len(t, stub.requestBetas(), 2, "the voice turn asks the model")
@@ -264,7 +264,7 @@ func TestHandleVoiceMessage_TranscriptionFailureLeavesCollectedTextAnswered(t *t
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		b.handleVoiceMessage(context.Background(), voice, userMsg, nil, replyTarget{chatID: chatID},
+		b.handleVoiceMessage(context.Background(), voice, userMsg, replyTarget{chatID: chatID},
 			123, "owner", "", "", false, "en", 0)
 	}()
 	require.Eventually(t, func() bool { return !chatIdle(b, chatID) }, 5*time.Second, 5*time.Millisecond,

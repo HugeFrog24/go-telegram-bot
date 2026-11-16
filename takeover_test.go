@@ -13,9 +13,10 @@ import (
 	"gorm.io/gorm"
 )
 
-// A media message takes over the text batch waiting in its quiet window: its
-// own turn will read and answer that text. When the media path ends without
-// a model turn, the batch must still be answered, as its own text turn.
+// A media message never takes over the text batch waiting in its quiet
+// window: the batch runs first, as its own text turn (startWaitingText). It is
+// answered whatever becomes of the media path, which may end without a model
+// turn of its own.
 
 const ownerChat = int64(123) // the owner's private chat
 
@@ -40,11 +41,17 @@ func takeoverBot(t *testing.T) (*Bot, *MockTelegramClient, *anthropicStub, func(
 func requireBatchAnswered(t *testing.T, b *Bot, stub *anthropicStub) {
 	t.Helper()
 	waitIdle(t, b, ownerChat)
+	assert.False(t, b.hasPendingIntake(ownerChat))
 	require.Len(t, stub.requestBetas(), 1, "the waiting text is answered")
 	role, text := stub.lastMessage(t, 0)
 	assert.Equal(t, "user", role)
 	assert.Equal(t, "where is the candle farm?", text)
-	assert.False(t, b.hasPendingIntake(ownerChat))
+}
+
+// requireNotice checks the media path told the user why it gave up.
+func requireNotice(t *testing.T, sent func() []bot.SendMessageParams, notice string) {
+	t.Helper()
+	assert.Contains(t, sentTexts(sent), notice)
 }
 
 func photoUpdate(msgID int) *models.Update {
@@ -60,8 +67,7 @@ func TestHandleUpdate_BufferedTextSurvivesRefusedVoice(t *testing.T) { //NOSONAR
 	b.handleUpdate(context.Background(), nil, &models.Update{Message: voiceMessage(ownerChat, 951)})
 
 	requireBatchAnswered(t, b, stub)
-	require.NotEmpty(t, sent())
-	assert.Equal(t, "I don't understand voice messages.", sent()[0].Text)
+	requireNotice(t, sent, "I don't understand voice messages.")
 }
 
 func TestHandleUpdate_BufferedTextSurvivesFailedTranscription(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
@@ -71,8 +77,7 @@ func TestHandleUpdate_BufferedTextSurvivesFailedTranscription(t *testing.T) { //
 	b.handleUpdate(context.Background(), nil, &models.Update{Message: voiceMessage(ownerChat, 952)})
 
 	requireBatchAnswered(t, b, stub)
-	require.NotEmpty(t, sent())
-	assert.Equal(t, "Sorry, I couldn't understand your voice message.", sent()[0].Text)
+	requireNotice(t, sent, "Sorry, I couldn't understand your voice message.")
 }
 
 func TestHandleUpdate_BufferedTextSurvivesFailedPhotoUpload(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
@@ -84,8 +89,7 @@ func TestHandleUpdate_BufferedTextSurvivesFailedPhotoUpload(t *testing.T) { //NO
 	b.handleUpdate(context.Background(), nil, photoUpdate(953))
 
 	requireBatchAnswered(t, b, stub)
-	require.NotEmpty(t, sent())
-	assert.Equal(t, "Sorry, I couldn't process one of your images.", sent()[0].Text)
+	requireNotice(t, sent, "Sorry, I couldn't process one of your images.")
 }
 
 func TestHandleUpdate_BufferedTextSurvivesFailedPhotoStore(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
@@ -100,11 +104,12 @@ func TestHandleUpdate_BufferedTextSurvivesFailedPhotoStore(t *testing.T) { //NOS
 	b.handleUpdate(context.Background(), nil, photoUpdate(954))
 
 	requireBatchAnswered(t, b, stub)
-	require.NotEmpty(t, sent())
-	assert.Equal(t, "Sorry, I had trouble saving your message.", sent()[0].Text)
+	requireNotice(t, sent, "Sorry, I had trouble saving your message.")
 }
 
-func TestHandleUpdate_BufferedTextSurvivesRateLimitedPhoto(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+// A rate-limited photo is refused before it touches the waiting batch, which
+// keeps its quiet window and is answered when it closes.
+func TestHandleUpdate_RateLimitedPhotoLeavesTheWaitingTextAlone(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	stub := newAnthropicStub(t, candleFarmStream())
 	b, tg := setupBotForTest(t, ownerChat)
 	useAnthropicStub(b, stub)
@@ -115,9 +120,11 @@ func TestHandleUpdate_BufferedTextSurvivesRateLimitedPhoto(t *testing.T) { //NOS
 
 	b.handleUpdate(context.Background(), nil, photoUpdate(956))
 
+	assert.True(t, b.hasPendingIntake(ownerChat), "the batch still waits in its window")
+	assert.Empty(t, stub.requestBetas())
+	flushPending(t, b, ownerChat)
 	requireBatchAnswered(t, b, stub)
-	require.NotEmpty(t, sent())
-	assert.Equal(t, "Rate limit exceeded. Please try again later.", sent()[0].Text)
+	requireNotice(t, sent, "Rate limit exceeded. Please try again later.")
 }
 
 func TestFlushAlbum_RateLimitedAlbumLeavesBufferedTextAnswered(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names

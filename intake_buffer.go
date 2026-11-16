@@ -120,10 +120,9 @@ func (b *Bot) cancelIntake(chatID int64) int {
 	return 0
 }
 
-// takeIntake drops a chat's pending buffer like cancelIntake, for a media
-// message whose own turn will read and answer the batch, and hands back the
-// request the flush would have run, or nil. The media path passes it to
-// answerPending if it ends without a model turn.
+// takeIntake drops a chat's pending buffer like cancelIntake, and hands back
+// the request its flush would have run, or nil, for a media message that
+// runs the batch at once, ahead of its own turn (startWaitingText).
 func (b *Bot) takeIntake(chatID int64) *turnRequest {
 	pending := b.removeIntake(chatID)
 	if pending == nil {
@@ -147,17 +146,6 @@ func (b *Bot) removeIntake(chatID int64) *pendingIntake {
 	}
 	delete(b.intakeBuffers, chatID)
 	return pending
-}
-
-// answerPending runs, as a text turn of its own, the batch a media path took
-// over (takeIntake) and then ended without a model turn to answer it: a voice
-// note refused or not transcribed, a photo rate-limited, not uploaded or not
-// stored. Called inside the media path's turn, it is collected behind that
-// turn and runs once it ends.
-func (b *Bot) answerPending(pending *turnRequest) {
-	if pending != nil {
-		b.respondToChat(*pending)
-	}
 }
 
 // hasPendingIntake reports whether a chat currently holds a buffered batch.
