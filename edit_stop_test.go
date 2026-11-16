@@ -15,11 +15,11 @@ import (
 // the way screenIncomingMessage does, without going through handleUpdate.
 func storeUserMessage(t *testing.T, b *Bot, chatID int64, telegramID int, text string) Message {
 	t.Helper()
+	mem := b.getOrCreateChatMemory(chatID)
 	msg := b.createMessage(chatID, chatID, "owner", "user", text, true)
 	msg.TelegramMessageID = telegramID
 	require.NoError(t, b.storeMessage(&msg))
-	b.addMessageToChatMemory(b.getOrCreateChatMemory(chatID), msg)
-	return msg
+	return b.addMessageToChatMemory(mem, msg)
 }
 
 func editUpdate(chatID int64, telegramID int, text string) *models.Update {
@@ -123,7 +123,7 @@ func TestHandleUpdate_EditRestartsUncommittedTurn(t *testing.T) { //NOSONAR go:S
 	b, _ := setupBotForTest(t, 123)
 	const chatID int64 = 123
 	msg := storeUserMessage(t, b, chatID, 82, "how do I use libtik")
-	turn, ctx, ok := b.beginTextTurn(textReq(chatID), msg.ID)
+	turn, ctx, ok := b.beginTextTurn(textReq(chatID), msg.Seq)
 	require.True(t, ok)
 
 	b.handleUpdate(context.Background(), nil, editUpdate(chatID, 82, "how do I use libtibik"))

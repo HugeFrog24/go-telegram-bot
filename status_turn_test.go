@@ -135,7 +135,7 @@ func setupNotesTurn(t *testing.T, notes, drafts bool) (*Bot, *turnTelegram) {
 	return b, rec
 }
 
-func startNotesTurn(t *testing.T, b *Bot, req turnRequest, wantID uint) (*chatTurn, context.Context) {
+func startNotesTurn(t *testing.T, b *Bot, req turnRequest, wantID uint64) (*chatTurn, context.Context) {
 	t.Helper()
 	turn, turnCtx, ok := b.beginTextTurn(req, wantID)
 	require.True(t, ok)

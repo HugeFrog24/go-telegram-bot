@@ -194,13 +194,29 @@ func serveAnthropicStub(t *testing.T, stub *anthropicStub) *anthropicStub {
 	return stub
 }
 
+// body is request i's body. It fails the test when the stub never saw
+// request i.
+func (s *anthropicStub) body(t *testing.T, i int) []byte {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if i < 0 || i >= len(s.bodies) {
+		t.Fatalf("request %d was never made: the stub saw %d", i, len(s.bodies))
+	}
+	return s.bodies[i]
+}
+
 // lastMessage is the role and text of the final entry in request i's
 // messages, the turn the model is asked to answer.
 func (s *anthropicStub) lastMessage(t *testing.T, i int) (role, text string) {
 	t.Helper()
-	s.mu.Lock()
-	body := s.bodies[i]
-	s.mu.Unlock()
+	return lastRoleText(t, s.body(t, i))
+}
+
+// lastRoleText is the role and text of the final entry in a request body's
+// messages.
+func lastRoleText(t *testing.T, body []byte) (role, text string) {
+	t.Helper()
 	var req struct {
 		Messages []struct {
 			Role    string `json:"role"`
@@ -211,7 +227,7 @@ func (s *anthropicStub) lastMessage(t *testing.T, i int) (role, text string) {
 		} `json:"messages"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil || len(req.Messages) == 0 {
-		t.Fatalf("request %d has no messages: %v", i, err)
+		t.Fatalf("the request has no messages: %v", err)
 	}
 	last := req.Messages[len(req.Messages)-1]
 	var sb strings.Builder

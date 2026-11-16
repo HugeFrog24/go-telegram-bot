@@ -37,6 +37,10 @@ type Bot struct {
 	turnsMu         sync.Mutex
 	turnSeq         uint64
 
+	// memorySeq is the last sequence given to a message in chat memory
+	// (Message.Seq). Guarded by chatMemoriesMu.
+	memorySeq uint64
+
 	// Drafts: the send throttle, the keepalive and how the sender sleeps
 	// (fields so tests can shorten the timings and count the sender's timers).
 	draftInterval  time.Duration
@@ -396,46 +400,65 @@ func (b *Bot) getOrCreateChatMemory(chatID int64) *ChatMemory {
 	b.chatMemoriesMu.RLock()
 	chatMemory, exists := b.chatMemories[chatID]
 	b.chatMemoriesMu.RUnlock()
-
-	if !exists {
-		b.chatMemoriesMu.Lock()
-		defer b.chatMemoriesMu.Unlock()
-
-		chatMemory, exists = b.chatMemories[chatID]
-		if !exists {
-			var count int64
-			b.db.Model(&Message{}).Where("chat_id = ? AND bot_id = ?", chatID, b.botID).Count(&count)
-			isNewChat := count == 0
-
-			var messages []Message
-			if !isNewChat {
-				err := b.db.Where("chat_id = ? AND bot_id = ?", chatID, b.botID).
-					Order("timestamp desc").
-					Limit(b.memorySize * 2).
-					Find(&messages).Error
-
-				if err != nil {
-					ErrorLogger.Printf("Error fetching messages from database: %v", err)
-					messages = []Message{}
-				} else {
-					for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
-						messages[i], messages[j] = messages[j], messages[i]
-					}
-				}
-			} else {
-				messages = []Message{}
-			}
-
-			chatMemory = &ChatMemory{
-				Messages: messages,
-				Size:     b.memorySize * 2,
-			}
-
-			b.chatMemories[chatID] = chatMemory
-		}
+	if exists {
+		return chatMemory
 	}
 
+	b.chatMemoriesMu.Lock()
+	defer b.chatMemoriesMu.Unlock()
+	if chatMemory, exists = b.chatMemories[chatID]; exists {
+		return chatMemory
+	}
+	history := b.loadChatHistory(chatID)
+	chatMemory = &ChatMemory{Messages: make([]Message, 0, len(history)), Size: b.memorySize * 2}
+	for _, message := range history {
+		b.insertLocked(chatMemory, message, len(chatMemory.Messages))
+	}
+	chatMemory.answeredThrough.Store(reloadedAnsweredThrough(chatMemory.Messages))
+	b.chatMemories[chatID] = chatMemory
 	return chatMemory
+}
+
+// loadChatHistory reads the chat's newest messages from the database, oldest
+// first, for a memory being created: at startup, or after /clear dropped it.
+// Messages with the same timestamp keep the order they were stored in.
+func (b *Bot) loadChatHistory(chatID int64) []Message {
+	var messages []Message
+	err := b.db.Where("chat_id = ? AND bot_id = ?", chatID, b.botID).
+		Order("timestamp desc, id desc").
+		Limit(b.memorySize * 2).
+		Find(&messages).Error
+	if err != nil {
+		ErrorLogger.Printf("Error fetching messages from database: %v", err)
+		return nil
+	}
+	slices.Reverse(messages)
+	return messages
+}
+
+// reloadedAnsweredThrough is answeredThrough for a memory just loaded from the
+// database: the last answerable user message before the last bot message. A
+// model reply follows the messages its turn read, so those before the last
+// reply are answered and those after it are not.
+func reloadedAnsweredThrough(messages []Message) uint64 {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].IsUser {
+			continue
+		}
+		for j := i - 1; j >= 0; j-- {
+			if answerable(messages[j]) {
+				return messages[j].Seq
+			}
+		}
+		return 0
+	}
+	return 0
+}
+
+// answerable reports whether msg is a user message the model can be asked to
+// answer: one with content to send.
+func answerable(msg Message) bool {
+	return msg.IsUser && len(contentBlocksForMessage(msg)) > 0
 }
 
 func (b *Bot) stripDeadFileIDFromMemory(chatID int64, deadFileID string) {
@@ -459,32 +482,65 @@ func (b *Bot) stripDeadFileIDFromMemory(chatID int64, deadFileID string) {
 	}
 }
 
-func (b *Bot) addMessageToChatMemory(chatMemory *ChatMemory, message Message) {
-	b.insertIntoChatMemory(chatMemory, message, 0)
+// addMessageToChatMemory appends message to the chat's memory and returns the
+// copy memory holds, which carries its sequence.
+func (b *Bot) addMessageToChatMemory(chatMemory *ChatMemory, message Message) Message {
+	b.chatMemoriesMu.Lock()
+	defer b.chatMemoriesMu.Unlock()
+	return b.insertLocked(chatMemory, message, len(chatMemory.Messages))
 }
 
-// insertIntoChatMemory puts message right after the last message whose id is
-// at or below frontierID, or at the end when frontierID is 0, then trims the
-// window from the front.
-func (b *Bot) insertIntoChatMemory(chatMemory *ChatMemory, message Message, frontierID uint) {
+// insertLocked puts message into memory at index at with the next sequence
+// number, then trims the window from the front, and returns the copy memory
+// holds. Sequences only grow, across chats and reloads, so one taken before a
+// message was inserted is always below that message's. The caller holds
+// chatMemoriesMu for writing.
+func (b *Bot) insertLocked(chatMemory *ChatMemory, message Message, at int) Message {
+	b.memorySeq++
+	message.Seq = b.memorySeq
+	chatMemory.Messages = slices.Insert(chatMemory.Messages, at, message)
+	if excess := len(chatMemory.Messages) - chatMemory.Size; excess > 0 {
+		chatMemory.Messages = chatMemory.Messages[excess:]
+	}
+	return message
+}
+
+// fileReply puts a turn's reply into memory right after the last message at
+// or below frontier, or at the end when frontier is 0, and raises the chat's
+// answeredThrough to covered. Messages that arrived while the turn ran have
+// higher sequences, so they stay after the reply. It returns the database ids
+// of the user messages the reply newly answers.
+func (b *Bot) fileReply(chatMemory *ChatMemory, reply Message, frontier, covered uint64) []uint {
 	b.chatMemoriesMu.Lock()
 	defer b.chatMemoriesMu.Unlock()
 
-	at := len(chatMemory.Messages)
-	if frontierID > 0 {
-		at = 0
-		for i := len(chatMemory.Messages) - 1; i >= 0; i-- {
-			if chatMemory.Messages[i].ID <= frontierID {
-				at = i + 1
-				break
-			}
+	before := chatMemory.answeredThrough.Load()
+	var answered []uint
+	for _, m := range chatMemory.Messages {
+		if m.IsUser && m.ID != 0 && m.Seq > before && m.Seq <= covered {
+			answered = append(answered, m.ID)
 		}
 	}
-	chatMemory.Messages = slices.Insert(chatMemory.Messages, at, message)
-
-	if len(chatMemory.Messages) > chatMemory.Size {
-		chatMemory.Messages = chatMemory.Messages[len(chatMemory.Messages)-chatMemory.Size:]
+	b.insertLocked(chatMemory, reply, replyIndex(chatMemory, frontier))
+	if covered > before {
+		chatMemory.answeredThrough.Store(covered)
 	}
+	return answered
+}
+
+// replyIndex is where a reply to a context that ended at frontier goes: right
+// after the last message at or below it; at the end for frontier 0; at the
+// front, to be trimmed at once, when the window has moved past it.
+func replyIndex(chatMemory *ChatMemory, frontier uint64) int {
+	if frontier == 0 {
+		return len(chatMemory.Messages)
+	}
+	for i := len(chatMemory.Messages) - 1; i >= 0; i-- {
+		if chatMemory.Messages[i].Seq <= frontier {
+			return i + 1
+		}
+	}
+	return 0
 }
 
 // prepareContextMessages converts chat memory into API messages.
@@ -494,44 +550,50 @@ func (b *Bot) prepareContextMessages(chatMemory *ChatMemory) []anthropic.BetaMes
 	return b.buildContextMessages(chatMemory)
 }
 
-// snapshotForTurn builds the model context for turn and records on it the
-// newest user message that context includes, both read under one lock so they
-// cannot disagree. The recorded id is what lets a later flush tell whether the
-// running turn already answers it.
+// snapshotForTurn builds the model context for turn and records on it what
+// that context covers, all read under one lock so they cannot disagree: the
+// newest answerable user message, which lets a later flush tell whether the
+// turn answers it, and the newest message of any kind, where the turn's reply
+// goes (fileReply).
 func (b *Bot) snapshotForTurn(turn *chatTurn, chatMemory *ChatMemory) []anthropic.BetaMessageParam {
 	b.chatMemoriesMu.RLock()
 	contextMessages := b.buildContextMessages(chatMemory)
-	covered := newestUserMessageID(chatMemory)
-	frontier := newestMessageID(chatMemory, false)
+	covered := newestAnswerableSeq(chatMemory)
+	frontier := newestSeq(chatMemory)
 	b.chatMemoriesMu.RUnlock()
 
 	b.markSnapshot(turn, covered, frontier)
 	return contextMessages
 }
 
-// newestUserMessageID returns the highest database id among the user messages
-// in memory. Ids are monotonic, so "newer" and "higher" agree.
-func newestUserMessageID(chatMemory *ChatMemory) uint {
-	return newestMessageID(chatMemory, true)
-}
-
-// newestMessageID returns the highest database id in memory, among user
-// messages only when usersOnly is set.
-func newestMessageID(chatMemory *ChatMemory, usersOnly bool) uint {
-	var newest uint
+// newestAnswerableSeq is the highest sequence among the answerable user
+// messages in memory, or 0. The caller holds chatMemoriesMu.
+func newestAnswerableSeq(chatMemory *ChatMemory) uint64 {
+	var newest uint64
 	for _, msg := range chatMemory.Messages {
-		if (msg.IsUser || !usersOnly) && msg.ID > newest {
-			newest = msg.ID
+		if answerable(msg) {
+			newest = max(newest, msg.Seq)
 		}
 	}
 	return newest
 }
 
-func (b *Bot) newestUserMessageIDInChat(chatID int64) uint {
+// newestSeq is the highest sequence in memory, or 0. The caller holds
+// chatMemoriesMu.
+func newestSeq(chatMemory *ChatMemory) uint64 {
+	var newest uint64
+	for _, msg := range chatMemory.Messages {
+		newest = max(newest, msg.Seq)
+	}
+	return newest
+}
+
+// newestAnswerableSeqInChat is what a text flush for the chat wants answered.
+func (b *Bot) newestAnswerableSeqInChat(chatID int64) uint64 {
 	chatMemory := b.getOrCreateChatMemory(chatID)
 	b.chatMemoriesMu.RLock()
 	defer b.chatMemoriesMu.RUnlock()
-	return newestUserMessageID(chatMemory)
+	return newestAnswerableSeq(chatMemory)
 }
 
 // buildContextMessages is prepareContextMessages without the lock.
@@ -1000,14 +1062,10 @@ func (b *Bot) screenOutgoingMessage(chatID int64, response string) (Message, err
 // with it, as the API requires, instead of with this reply. Only the user
 // messages the turn covered are marked answered.
 //
-// A nil turn, or one that never read memory, appends and marks every
-// outstanding user message, as for a command's reply.
-//
-// Memory reloads from the database in timestamp order, which puts such a
-// reply back after the messages that arrived during its turn. The model then
-// reads two bot messages in a row, which the API merges into one turn.
+// A nil turn appends and covers every answerable message in memory, as for a
+// command's reply.
 func (b *Bot) recordTurnReply(turn *chatTurn, chatID int64, response string) (Message, error) {
-	frontierID, coveredID := b.contextEnd(turn)
+	frontier, covered := b.contextEnd(turn)
 	if b.config.DebugScreening {
 		start := time.Now()
 		defer func() {
@@ -1021,30 +1079,33 @@ func (b *Bot) recordTurnReply(turn *chatTurn, chatID int64, response string) (Me
 		}()
 	}
 
+	// Memory first: loaded after the store, it would read the reply from the
+	// database and then file it a second time.
+	chatMemory := b.getOrCreateChatMemory(chatID)
 	assistantMessage := b.createMessage(chatID, 0, "", "assistant", response, false)
 	if err := b.storeMessage(&assistantMessage); err != nil {
 		return Message{}, err
 	}
-
-	// Mark every outstanding user message the reply answers, not just the
-	// newest one. A coalesced turn answers the whole batch, so a single-row
-	// update would leave the earlier messages permanently unanswered. This
-	// also drops an UPDATE ... ORDER BY ... LIMIT, which stock SQLite builds
-	// do not support.
-	answered := b.db.Model(&Message{}).
-		Where("chat_id = ? AND bot_id = ? AND is_user = ? AND answered_on IS NULL",
-			chatID, b.botID, true)
-	if coveredID > 0 {
-		answered = answered.Where("id <= ?", coveredID)
+	if turn == nil {
+		covered = b.newestAnswerableSeqInChat(chatID)
 	}
-	if err := answered.Update("answered_on", time.Now()).Error; err != nil {
+	b.markAnswered(chatID, b.fileReply(chatMemory, assistantMessage, frontier, covered))
+	return assistantMessage, nil
+}
+
+// markAnswered records when the user messages with these ids were answered.
+// A coalesced turn answers the whole batch, so every one of them is marked,
+// not just the newest.
+func (b *Bot) markAnswered(chatID int64, ids []uint) {
+	if len(ids) == 0 {
+		return
+	}
+	err := b.db.Model(&Message{}).
+		Where("chat_id = ? AND bot_id = ? AND id IN ? AND answered_on IS NULL", chatID, b.botID, ids).
+		Update("answered_on", time.Now()).Error
+	if err != nil {
 		ErrorLogger.Printf("Error marking user messages as answered: %v", err)
 	}
-
-	chatMemory := b.getOrCreateChatMemory(chatID)
-	b.insertIntoChatMemory(chatMemory, assistantMessage, frontierID)
-
-	return assistantMessage, nil
 }
 
 func (b *Bot) promoteUserToAdmin(promoterID, userToPromoteID int64) error {

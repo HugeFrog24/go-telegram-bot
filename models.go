@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
@@ -48,12 +49,23 @@ type Message struct {
 	// update can find and correct the stored copy. Zero on rows stored before
 	// edits were tracked.
 	TelegramMessageID int `gorm:"index"`
+	// Seq is the message's place in chat memory: a number given when it is
+	// put there, higher than every number given before, so a message added
+	// after a turn read memory has a higher one than all the turn read. It
+	// lives in memory only; a reload gives new ones in load order.
+	Seq uint64 `gorm:"-"`
 }
 
 type ChatMemory struct {
 	Messages             []Message
 	Size                 int
 	BusinessConnectionID string
+
+	// answeredThrough is the highest sequence a model turn's recorded reply
+	// covered: every answerable user message at or below it has been
+	// answered. Written under chatMemoriesMu; read under turnsMu too, where
+	// a text flush checks it without taking the memory lock.
+	answeredThrough atomic.Uint64
 }
 
 const (

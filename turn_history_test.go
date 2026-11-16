@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -10,29 +13,41 @@ import (
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
-// historyTestBot is a bot whose Anthropic client talks to stub and whose
-// Telegram sends and chat actions all succeed.
-func historyTestBot(t *testing.T, stub *anthropicStub) *Bot {
-	t.Helper()
-	b, tg := setupBotForTest(t, 123)
-	useAnthropicStub(b, stub)
-	tg.On("SendMessage", mock.Anything, mock.Anything).Return(&models.Message{ID: 1}, nil).Maybe()
-	tg.On("SendChatAction", mock.Anything, mock.Anything).Return(true, nil).Maybe()
-	return b
+// telegramRecord reads back what a test bot sent to Telegram.
+type telegramRecord struct {
+	sent    func() []bot.SendMessageParams
+	actions func() []bot.SendChatActionParams
 }
 
-// storeUserText puts a user message into the database and chat memory, as
-// screenIncomingMessage does at intake.
+// historyTestBot is a bot whose Anthropic client talks to stub (when given)
+// and whose Telegram sends and chat actions all succeed and are recorded. Its
+// database takes one connection at a time, as in production, so handlers on
+// several goroutines share the one in-memory database.
+func historyTestBot(t *testing.T, stub *anthropicStub) (*Bot, telegramRecord) {
+	t.Helper()
+	b, tg := setupBotForTest(t, 123)
+	if stub != nil {
+		useAnthropicStub(b, stub)
+	}
+	sqlDB, err := b.db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	return b, telegramRecord{sent: recordSends(tg), actions: recordChatActions(tg)}
+}
+
+// storeUserText puts a user message into the database and chat memory, as a
+// text message that joins the conversation does at intake, and returns the
+// memory copy, which carries its sequence. Memory is loaded before the store,
+// as at intake, so a first load cannot read the new row and add it twice.
 func storeUserText(t *testing.T, b *Bot, chatID int64, text string) Message {
 	t.Helper()
+	mem := b.getOrCreateChatMemory(chatID)
 	m := b.createMessage(chatID, 555, "tester", "user", text, true)
 	require.NoError(t, b.storeMessage(&m))
-	b.addMessageToChatMemory(b.getOrCreateChatMemory(chatID), m)
-	return m
+	return b.addMessageToChatMemory(mem, m)
 }
 
 func chatIdle(b *Bot, chatID int64) bool {
@@ -42,24 +57,61 @@ func chatIdle(b *Bot, chatID int64) bool {
 	return !busy
 }
 
+// turnsRegistered is how many turns the bot has registered so far.
+func turnsRegistered(b *Bot) uint64 {
+	b.turnsMu.Lock()
+	defer b.turnsMu.Unlock()
+	return b.turnSeq
+}
+
+// memoryTexts is the text of every message in the chat's memory, in order.
+func memoryTexts(b *Bot, chatID int64) []string {
+	mem := b.getOrCreateChatMemory(chatID)
+	b.chatMemoriesMu.RLock()
+	defer b.chatMemoriesMu.RUnlock()
+	texts := make([]string, 0, len(mem.Messages))
+	for _, m := range mem.Messages {
+		texts = append(texts, m.Text)
+	}
+	return texts
+}
+
+// dropChatMemory forgets the chat's memory, so the next use reloads it from
+// the database, as after a restart.
+func dropChatMemory(b *Bot, chatID int64) {
+	b.chatMemoriesMu.Lock()
+	defer b.chatMemoriesMu.Unlock()
+	delete(b.chatMemories, chatID)
+}
+
+func answeredOn(t *testing.T, b *Bot, id uint) *time.Time {
+	t.Helper()
+	var stored Message
+	require.NoError(t, b.db.First(&stored, id).Error)
+	return stored.AnsweredOn
+}
+
 // The production 400 "This model does not support assistant message
 // prefill": a second message lands just after the first one's quiet window
 // closed, so the turn that answers the first reads both; the second message's
 // own window then closes after that turn has ended. Its flush must not ask the
-// model again, because the history now ends with the bot's reply.
+// model again, register a turn, or show "typing".
 func TestRespondToChat_LateFlushForAnsweredMessageCallsNoModel(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	stub := newAnthropicStub(t, candleFarmStream())
-	b := historyTestBot(t, stub)
+	b, tg := historyTestBot(t, stub)
 	const chatID = int64(777)
 	storeUserText(t, b, chatID, "hi")
 	storeUserText(t, b, chatID, "where is the candle farm?")
 
 	b.respondToChat(textReq(chatID)) // answers both, stores the reply, ends
 	require.Len(t, stub.requestBetas(), 1)
+	turns, typing := turnsRegistered(b), len(tg.actions())
 
 	b.respondToChat(textReq(chatID)) // the second message's flush, after the turn ended
 
 	assert.Len(t, stub.requestBetas(), 1, "an already answered message gets no second model call")
+	assert.Equal(t, turns, turnsRegistered(b), "no turn is registered for it")
+	assert.Len(t, tg.actions(), typing, "and no typing is shown")
 }
 
 // A message that arrives while a turn's answer is already on screen runs as
@@ -73,7 +125,7 @@ func TestRespondToChat_CollectedMessageIsAnsweredAfterTheReply(t *testing.T) { /
 		evMessageEnd("end_turn"),
 	)
 	stub, open := newGatedAnthropicStub(t, events, 4) // message_start and the first text block
-	b := historyTestBot(t, stub)
+	b, _ := historyTestBot(t, stub)
 	const chatID = int64(778)
 	storeUserText(t, b, chatID, "tell me about the farm")
 
@@ -105,7 +157,7 @@ func TestRespondToChat_CollectedMessageIsAnsweredAfterTheReply(t *testing.T) { /
 
 func TestGetAnthropicResponse_RefusesHistoryEndingWithTheBot(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	stub := newAnthropicStub(t, candleFarmStream())
-	b := historyTestBot(t, stub)
+	b, _ := historyTestBot(t, stub)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
@@ -129,16 +181,7 @@ func TestGetAnthropicResponse_RefusesHistoryEndingWithTheBot(t *testing.T) { //N
 // left to answer: no second model call, and no canned sticker reply either.
 func TestRunStickerTurn_AnsweredByTheTurnItWaitedForSaysNothing(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	stub := newAnthropicStub(t, candleFarmStream())
-	b, tg := setupBotForTest(t, 123)
-	useAnthropicStub(b, stub)
-	var mu sync.Mutex
-	var sent []string
-	tg.On("SendMessage", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
-		mu.Lock()
-		defer mu.Unlock()
-		sent = append(sent, args.Get(1).(*bot.SendMessageParams).Text)
-	}).Return(&models.Message{ID: 1}, nil).Maybe()
-	tg.On("SendChatAction", mock.Anything, mock.Anything).Return(true, nil).Maybe()
+	b, tg := historyTestBot(t, stub)
 	const chatID = int64(779)
 	storeUserText(t, b, chatID, "look at this")
 	sticker := b.createMessage(chatID, 555, "tester", "user", "Sent a sticker: 😀", true)
@@ -148,17 +191,13 @@ func TestRunStickerTurn_AnsweredByTheTurnItWaitedForSaysNothing(t *testing.T) { 
 
 	b.respondToChat(textReq(chatID)) // the text turn reads both and answers
 	require.Len(t, stub.requestBetas(), 1)
-	mu.Lock()
-	answered := len(sent)
-	mu.Unlock()
+	answered := len(tg.sent())
 
 	b.runStickerTurn(context.Background(), replyTarget{chatID: chatID}, sticker,
 		&models.Message{Sticker: &models.Sticker{FileID: "sticker-file", Emoji: "😀"}})
 
 	assert.Len(t, stub.requestBetas(), 1, "no second model call")
-	mu.Lock()
-	defer mu.Unlock()
-	assert.Len(t, sent, answered, "no canned sticker reply either")
+	assert.Len(t, tg.sent(), answered, "no canned sticker reply either")
 }
 
 // A turn's reply is recorded right after the newest message its context
@@ -169,7 +208,7 @@ func TestRecordTurnReply_GoesWhereTheTurnsContextEnded(t *testing.T) { //NOSONAR
 	const chatID = int64(780)
 	mem := b.getOrCreateChatMemory(chatID)
 	first := storeUserText(t, b, chatID, "first")
-	turn, _, ok := b.beginTextTurn(textReq(chatID), first.ID)
+	turn, _, ok := b.beginTextTurn(textReq(chatID), first.Seq)
 	require.True(t, ok)
 	b.snapshotForTurn(turn, mem)
 	late := storeUserText(t, b, chatID, "arrived during the turn")
@@ -178,14 +217,200 @@ func TestRecordTurnReply_GoesWhereTheTurnsContextEnded(t *testing.T) { //NOSONAR
 	require.NoError(t, err)
 	b.finishTurn(turn)
 
-	var texts []string
-	for _, m := range mem.Messages {
-		texts = append(texts, m.Text)
+	assert.Equal(t, []string{"first", "answer to first", "arrived during the turn"}, memoryTexts(b, chatID))
+	assert.NotNil(t, answeredOn(t, b, first.ID), "the message the turn read is answered")
+	assert.Nil(t, answeredOn(t, b, late.ID), "the message that arrived during the turn is not")
+}
+
+// Handlers run concurrently, so a message can be stored before another yet
+// reach memory after it. A turn that did not read it must not count it as
+// answered, and its own flush must still answer it (review finding 4).
+func TestRespondToChat_MessageThatReachedMemoryLateIsStillAnswered(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	stub, open := newGatedAnthropicStub(t, candleFarmStream(), 1)
+	b, _ := historyTestBot(t, stub)
+	const chatID = int64(785)
+	mem := b.getOrCreateChatMemory(chatID)
+	first := b.createMessage(chatID, 555, "tester", "user", "first, stored first", true)
+	require.NoError(t, b.storeMessage(&first))
+	second := b.createMessage(chatID, 556, "other", "user", "second, stored second", true)
+	require.NoError(t, b.storeMessage(&second))
+	b.addMessageToChatMemory(mem, second) // second's handler reaches memory first
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.respondToChat(textReq(chatID))
+	}()
+	// The request is out, so the turn has read memory: second only.
+	require.Eventually(t, func() bool { return len(stub.requestBetas()) == 1 }, 5*time.Second, 5*time.Millisecond)
+	b.addMessageToChatMemory(mem, first) // first's handler reaches memory now
+	open()
+	<-done
+
+	assert.Nil(t, answeredOn(t, b, first.ID), "the model never saw first")
+	b.respondToChat(textReq(chatID)) // first's flush
+	require.Len(t, stub.requestBetas(), 2, "first gets an answer of its own")
+	role, text := stub.lastMessage(t, 1)
+	assert.Equal(t, "user", role)
+	assert.Equal(t, "first, stored first", text)
+}
+
+// After a restart, memory reloads from the database. A message the bot had
+// already answered stays answered: its late flush calls no model, registers
+// no turn and shows no "typing".
+func TestReload_AnsweredMessageStaysAnswered(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	stub := newAnthropicStub(t, candleFarmStream())
+	b, tg := historyTestBot(t, stub)
+	const chatID = int64(786)
+	storeUserText(t, b, chatID, "where is the candle farm?")
+	b.respondToChat(textReq(chatID))
+	require.Len(t, stub.requestBetas(), 1)
+	dropChatMemory(b, chatID)
+	turns, typing := turnsRegistered(b), len(tg.actions())
+
+	b.respondToChat(textReq(chatID))
+
+	assert.Len(t, stub.requestBetas(), 1, "no second model call")
+	assert.Equal(t, turns, turnsRegistered(b), "no turn is registered")
+	assert.Len(t, tg.actions(), typing, "and no typing is shown")
+}
+
+// The frontier message was evicted during a long turn: the reply goes to the
+// front and is trimmed straight away, without a panic.
+func TestRecordTurnReply_FrontierEvicted(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	b, _ := setupBotForTest(t, 123)
+	const chatID = int64(787)
+	mem := b.getOrCreateChatMemory(chatID)
+	first := storeUserText(t, b, chatID, "first")
+	turn, _, ok := b.beginTextTurn(textReq(chatID), first.Seq)
+	require.True(t, ok)
+	b.snapshotForTurn(turn, mem)
+	for i := 0; i < mem.Size; i++ {
+		storeUserText(t, b, chatID, "flood")
 	}
-	assert.Equal(t, []string{"first", "answer to first", "arrived during the turn"}, texts)
-	var readByTurn, arrivedLate Message
-	require.NoError(t, b.db.First(&readByTurn, first.ID).Error)
-	assert.NotNil(t, readByTurn.AnsweredOn, "the message the turn read is answered")
-	require.NoError(t, b.db.First(&arrivedLate, late.ID).Error)
-	assert.Nil(t, arrivedLate.AnsweredOn, "the message that arrived during the turn is not")
+	_, err := b.recordTurnReply(turn, chatID, "answer to first")
+	require.NoError(t, err)
+	b.finishTurn(turn)
+
+	b.chatMemoriesMu.RLock()
+	defer b.chatMemoriesMu.RUnlock()
+	for _, m := range mem.Messages {
+		assert.True(t, m.IsUser, "the reply was trimmed at once")
+	}
+	assert.Len(t, mem.Messages, mem.Size)
+}
+
+// An error reply goes where the turn's context ended, like an answer: the
+// message that arrived during the turn stays after it and is answered next.
+func TestRunTurn_ErrorReplyIsFiledWhereTheContextEnded(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	stub := newAnthropicStub(t, candleFarmStream())
+	b, _ := historyTestBot(t, stub)
+	const chatID = int64(-1003) // a group: no draft
+	first := storeUserText(t, b, chatID, "first")
+	req := textReq(chatID)
+	turn, turnCtx, ok := b.beginTextTurn(req, first.Seq)
+	require.True(t, ok)
+	boom := errors.New("boom")
+	var late Message
+
+	b.runTurn(turn, turnCtx, req, func(context.Context, replyOutput) (string, error) {
+		b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatID))
+		late = storeUserText(t, b, chatID, "arrived during the turn")
+		return "", boom
+	})
+
+	assert.Equal(t, []string{"first", b.anthropicErrorResponse(boom, req.userID), "arrived during the turn"},
+		memoryTexts(b, chatID))
+	assert.Nil(t, answeredOn(t, b, late.ID))
+	b.respondToChat(req)
+	require.Len(t, stub.requestBetas(), 1)
+	role, text := stub.lastMessage(t, 0)
+	assert.Equal(t, "user", role)
+	assert.Equal(t, "arrived during the turn", text)
+}
+
+// A stopped partial goes where the turn's context ended, like an answer.
+func TestRunTurn_StoppedPartialIsFiledWhereTheContextEnded(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	b, _ := historyTestBot(t, nil)
+	b.config.StreamDrafts = true
+	const chatID = int64(789) // a private chat: drafts
+	first := storeUserText(t, b, chatID, "first")
+	req := textReq(chatID)
+	turn, turnCtx, ok := b.beginTextTurn(req, first.Seq)
+	require.True(t, ok)
+	var late Message
+
+	b.runTurn(turn, turnCtx, req, func(ctx context.Context, out replyOutput) (string, error) {
+		b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatID))
+		out.onProgress("Partial answer")
+		waitDraftShown(t, b, turn)
+		late = storeUserText(t, b, chatID, "arrived during the turn")
+		require.True(t, b.stopTurn(chatID, int(turn.seq)))
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+
+	assert.Equal(t, []string{"first", "Partial answer", "arrived during the turn"}, memoryTexts(b, chatID))
+	assert.NotNil(t, answeredOn(t, b, first.ID))
+	assert.Nil(t, answeredOn(t, b, late.ID))
+}
+
+// Messages from many senders reach memory at once. Every one gets its own
+// sequence, increasing along memory order, and each sender's messages keep
+// the order they were sent in.
+func TestChatMemory_SequencesStayConsistentUnderConcurrentIntake(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	b, _ := historyTestBot(t, nil)
+	b.config.DebounceMs = int(bufferOnly / time.Millisecond)
+	b.memorySize = 50
+	const chatID = int64(-1002)
+	const senders, each = 8, 4 // within each sender's hourly limit
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	readers := make(chan struct{})
+	go func() { // a reader racing the writers
+		defer close(readers)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				b.newestAnswerableSeqInChat(chatID)
+			}
+		}
+	}()
+	for s := 0; s < senders; s++ {
+		wg.Add(1)
+		go func(s int) {
+			defer wg.Done()
+			for i := 0; i < each; i++ {
+				b.handleUpdate(context.Background(), nil, &models.Update{Message: &models.Message{
+					ID:   s*100 + i,
+					Chat: models.Chat{ID: chatID, Type: models.ChatTypeSupergroup},
+					From: &models.User{ID: int64(1000 + s), Username: fmt.Sprintf("sender%d", s)},
+					Text: fmt.Sprintf("%d:%d", s, i),
+				}})
+			}
+		}(s)
+	}
+	wg.Wait()
+	close(stop)
+	<-readers
+
+	mem := b.getOrCreateChatMemory(chatID)
+	b.chatMemoriesMu.RLock()
+	msgs := slices.Clone(mem.Messages)
+	b.chatMemoriesMu.RUnlock()
+	require.Len(t, msgs, senders*each)
+	last := map[int64]int{}
+	for i, m := range msgs {
+		if i > 0 {
+			assert.Greater(t, m.Seq, msgs[i-1].Seq, "sequences increase along memory order")
+		}
+		if prev, seen := last[m.UserID]; seen {
+			assert.Greater(t, m.TelegramMessageID, prev, "a sender's messages keep their order")
+		}
+		last[m.UserID] = m.TelegramMessageID
+	}
+	assert.Equal(t, msgs[len(msgs)-1].Seq, b.newestAnswerableSeqInChat(chatID))
 }

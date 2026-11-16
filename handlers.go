@@ -242,14 +242,14 @@ func (b *Bot) uploadPhotoItems(ctx context.Context, items []*models.Message, to 
 // If a turn is already running for the chat, beginTextTurn decides whether this
 // flush is dropped, restarts it, or runs after it; see turn.go.
 func (b *Bot) respondToChat(req turnRequest) {
-	wantID := b.newestUserMessageIDInChat(req.chatID)
-	if wantID == 0 {
+	wantSeq := b.newestAnswerableSeqInChat(req.chatID)
+	if wantSeq == 0 {
 		// Nothing of the user's is in memory, for example because /clear
 		// landed after this flush was collected. There is nothing to answer.
 		InfoLogger.Printf("[%s] turn: chat %d has no user message to answer; skipping", b.config.ID, req.chatID)
 		return
 	}
-	turn, turnCtx, ok := b.beginTextTurn(req, wantID)
+	turn, turnCtx, ok := b.beginTextTurn(req, wantSeq)
 	if !ok {
 		return
 	}
@@ -531,6 +531,7 @@ func (b *Bot) handleEditedMessage(ctx context.Context, edited *models.Message) {
 	// stored off the database; a business connection delivers every edit on
 	// the whole account.
 	var msgID uint
+	var msgSeq uint64
 	answered := false
 	b.chatMemoriesMu.Lock()
 	if mem, exists := b.chatMemories[chatID]; exists {
@@ -538,11 +539,9 @@ func (b *Bot) handleEditedMessage(ctx context.Context, edited *models.Message) {
 			m := &mem.Messages[i]
 			if m.IsUser && m.TelegramMessageID == edited.ID {
 				m.Text = text
-				msgID = m.ID
+				msgID, msgSeq = m.ID, m.Seq
+				answered = m.Seq <= mem.answeredThrough.Load()
 				break
-			}
-			if !m.IsUser {
-				answered = true
 			}
 		}
 	}
@@ -571,7 +570,7 @@ func (b *Bot) handleEditedMessage(ctx context.Context, edited *models.Message) {
 		languageCode: edited.From.LanguageCode, isPremium: edited.From.IsPremium, messageTime: edited.Date,
 		businessConnectionID: to.businessConnectionID, threadID: to.threadID, isEmojiOnly: isEmojiOnly,
 	}
-	if b.restartForEdit(req, msgID) {
+	if b.restartForEdit(req, msgSeq) {
 		InfoLogger.Printf("[%s] edit to message %d restarted the running turn for chat %d", b.config.ID, edited.ID, chatID)
 	}
 }

@@ -179,7 +179,7 @@ func TestHandleUpdate_MessageOutsideTopicSendsNoThreadID(t *testing.T) { //NOSON
 func TestHandleEditedMessage_TopicKeepsThreadID(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	b, _ := setupBotForTest(t, 123)
 	msg := storeUserMessage(t, b, topicChatID, 77, "how do I use libtik")
-	turn, _, ok := b.beginTextTurn(textReq(topicChatID), msg.ID)
+	turn, _, ok := b.beginTextTurn(textReq(topicChatID), msg.Seq)
 	require.True(t, ok)
 
 	b.handleUpdate(context.Background(), nil, &models.Update{EditedMessage: &models.Message{

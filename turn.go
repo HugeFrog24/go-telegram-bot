@@ -57,68 +57,78 @@ type chatTurn struct {
 	done   chan struct{}
 
 	// Guarded by Bot.turnsMu.
-	draftID    string       // Telegram draft id shown for this turn, "" if none
-	coveredID  uint         // highest user Message.ID this turn's context includes
-	frontierID uint         // highest Message.ID of any kind this turn's context includes
-	committed  bool         // must not be restarted: output shown, or work not cheaply redone
-	reason     cancelReason // why cancel was called, if it was
-	rerun      *turnRequest // a flush that arrived mid-turn and may still need a turn
-	rerunWant  uint         // the newest user message that flush wanted answered
+	draftID     string       // Telegram draft id shown for this turn, "" if none
+	coveredSeq  uint64       // newest answerable user message (Message.Seq) this turn's context includes
+	frontierSeq uint64       // newest message of any kind this turn's context includes
+	committed   bool         // must not be restarted: output shown, or work not cheaply redone
+	reason      cancelReason // why cancel was called, if it was
+	rerun       *turnRequest // a flush that arrived mid-turn and may still need a turn
+	rerunWant   uint64       // the newest answerable user message that flush wanted answered
 }
 
 func (t *chatTurn) draftIDString() string { return strconv.FormatUint(t.seq, 10) }
 
-func (b *Bot) registerTurnLocked(parent context.Context, chatID int64, coveredID uint, committed bool) (*chatTurn, context.Context) {
+func (b *Bot) registerTurnLocked(parent context.Context, chatID int64, coveredSeq uint64, committed bool) (*chatTurn, context.Context) {
 	ctx, cancel := context.WithCancel(parent)
 	b.turnSeq++
 	t := &chatTurn{
-		seq:       b.turnSeq,
-		chatID:    chatID,
-		cancel:    cancel,
-		done:      make(chan struct{}),
-		coveredID: coveredID,
-		committed: committed,
+		seq:        b.turnSeq,
+		chatID:     chatID,
+		cancel:     cancel,
+		done:       make(chan struct{}),
+		coveredSeq: coveredSeq,
+		committed:  committed,
 	}
 	b.turns[chatID] = t
 	return t, ctx
 }
 
-// beginTextTurn applies the late-message policy for a text flush. wantID is the
-// newest user message the flush wants answered. ok=false means the caller must
-// not run a turn, because one of three things happened instead:
+// beginTextTurn applies the late-message policy for a text flush. wantSeq is
+// the newest answerable user message the flush wants answered. ok=false means
+// the caller must not run a turn, because one of these happened instead:
 //
-//   - dropped: the running turn's context already includes wantID, so its reply
-//     answers this flush too;
+//   - answered: a turn that already recorded its reply covered wantSeq, so
+//     there is nothing left to answer. This is checked before anything is
+//     registered or shown, under the lock finishTurn takes after the ending
+//     turn raised answeredThrough;
+//   - dropped: the running turn's context already includes wantSeq, so its
+//     reply answers this flush too;
 //   - restart: nothing has been shown yet, so the running turn is cancelled and
 //     recorded to rerun with the new message in context. This is the only case
 //     where tokens are wasted, and it is bounded by the time to first output;
 //   - collect: output is already on screen, so the flush is recorded to run as
 //     its own turn once this one finishes, unless the finished turn turns out to
 //     have covered it after all (see finishTurn).
-func (b *Bot) beginTextTurn(req turnRequest, wantID uint) (*chatTurn, context.Context, bool) {
+func (b *Bot) beginTextTurn(req turnRequest, wantSeq uint64) (*chatTurn, context.Context, bool) {
+	chatMemory := b.getOrCreateChatMemory(req.chatID)
 	b.turnsMu.Lock()
 	defer b.turnsMu.Unlock()
 
+	if wantSeq <= chatMemory.answeredThrough.Load() {
+		InfoLogger.Printf("[%s] turn: chat %d flush dropped, message %d already answered",
+			b.config.ID, req.chatID, wantSeq)
+		return nil, nil, false
+	}
 	if running, exists := b.turns[req.chatID]; exists {
 		switch {
-		case wantID <= running.coveredID:
+		case wantSeq <= running.coveredSeq:
 			InfoLogger.Printf("[%s] turn: chat %d flush dropped, message %d already covered by running turn %d",
-				b.config.ID, req.chatID, wantID, running.seq)
+				b.config.ID, req.chatID, wantSeq, running.seq)
 		case !running.committed:
 			running.reason = cancelRestart
-			running.rerun, running.rerunWant = &req, wantID
+			running.rerun, running.rerunWant = &req, wantSeq
 			running.cancel()
 			InfoLogger.Printf("[%s] turn: chat %d restarting turn %d, message %d arrived before any output",
-				b.config.ID, req.chatID, running.seq, wantID)
+				b.config.ID, req.chatID, running.seq, wantSeq)
 		default:
-			running.rerun, running.rerunWant = &req, wantID
+			running.rerun, running.rerunWant = &req, wantSeq
 			InfoLogger.Printf("[%s] turn: chat %d collected message %d, runs after turn %d",
-				b.config.ID, req.chatID, wantID, running.seq)
+				b.config.ID, req.chatID, wantSeq, running.seq)
 		}
 		return nil, nil, false
 	}
 
-	turn, ctx := b.registerTurnLocked(req.ctx, req.chatID, wantID, false)
+	turn, ctx := b.registerTurnLocked(req.ctx, req.chatID, wantSeq, false)
 	return turn, ctx, true
 }
 
@@ -144,31 +154,32 @@ func (b *Bot) beginTurn(parent context.Context, chatID int64) (*chatTurn, contex
 	}
 }
 
-// markSnapshot records the newest user message and the newest message of any
-// kind the turn's context includes, under one lock. The turn's reply is
-// recorded right after the latter (recordTurnReply).
-func (b *Bot) markSnapshot(turn *chatTurn, coveredID, frontierID uint) {
+// markSnapshot records the newest answerable user message and the newest
+// message of any kind the turn's context includes, under one lock. The
+// turn's reply is filed right after the latter (fileReply).
+func (b *Bot) markSnapshot(turn *chatTurn, coveredSeq, frontierSeq uint64) {
 	b.turnsMu.Lock()
 	defer b.turnsMu.Unlock()
-	turn.coveredID = max(turn.coveredID, coveredID)
-	turn.frontierID = max(turn.frontierID, frontierID)
+	turn.coveredSeq = max(turn.coveredSeq, coveredSeq)
+	turn.frontierSeq = max(turn.frontierSeq, frontierSeq)
 }
 
 // contextEnd is where the turn's context ended: the newest message of any kind
-// and the newest user message it included. Both are zero for a nil turn or
-// one that never read memory.
-func (b *Bot) contextEnd(turn *chatTurn) (frontierID, coveredID uint) {
+// and the newest answerable user message it included. The frontier is zero
+// for a turn that never read memory, and both are for a nil turn.
+func (b *Bot) contextEnd(turn *chatTurn) (frontierSeq, coveredSeq uint64) {
 	if turn == nil {
 		return 0, 0
 	}
 	b.turnsMu.Lock()
 	defer b.turnsMu.Unlock()
-	return turn.frontierID, turn.coveredID
+	return turn.frontierSeq, turn.coveredSeq
 }
 
-// markCovered records the newest user message the turn's context includes.
-func (b *Bot) markCovered(turn *chatTurn, coveredID uint) {
-	b.markSnapshot(turn, coveredID, 0)
+// markCovered records the newest answerable user message the turn's context
+// includes.
+func (b *Bot) markCovered(turn *chatTurn, coveredSeq uint64) {
+	b.markSnapshot(turn, coveredSeq, 0)
 }
 
 // markCommitted flags that the user has seen output, so the turn can no longer
@@ -207,19 +218,20 @@ func (b *Bot) stopTurn(chatID int64, draftID int) bool {
 	return true
 }
 
-// restartForEdit reruns a turn that is reading the pre-edit text of message
-// msgID and has shown nothing yet. Reports whether it did. A committed turn
-// keeps going: the user has already seen a reply to the old wording.
-func (b *Bot) restartForEdit(req turnRequest, msgID uint) bool {
+// restartForEdit reruns a turn that is reading the pre-edit text of the
+// message at msgSeq and has shown nothing yet. Reports whether it did. A
+// committed turn keeps going: the user has already seen a reply to the old
+// wording.
+func (b *Bot) restartForEdit(req turnRequest, msgSeq uint64) bool {
 	b.turnsMu.Lock()
 	defer b.turnsMu.Unlock()
 
 	running, exists := b.turns[req.chatID]
-	if !exists || running.committed || running.coveredID < msgID {
+	if !exists || running.committed || running.coveredSeq < msgSeq {
 		return false
 	}
 	running.reason = cancelRestart
-	running.rerun, running.rerunWant = &req, msgID
+	running.rerun, running.rerunWant = &req, msgSeq
 	running.cancel()
 	return true
 }
@@ -249,7 +261,7 @@ func (b *Bot) finishTurn(turn *chatTurn) *turnRequest {
 	if b.turns[turn.chatID] == turn {
 		delete(b.turns, turn.chatID)
 	}
-	rerun, want, reason, covered := turn.rerun, turn.rerunWant, turn.reason, turn.coveredID
+	rerun, want, reason, covered := turn.rerun, turn.rerunWant, turn.reason, turn.coveredSeq
 	b.turnsMu.Unlock()
 
 	turn.cancel()
