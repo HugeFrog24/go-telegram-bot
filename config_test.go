@@ -1035,6 +1035,25 @@ func TestValidateConfig_Video(t *testing.T) { //NOSONAR go:S100 -- underscore se
 		if cfg.Video == nil || cfg.Video.MaxDurationSeconds != 90 || cfg.Video.FontFile != "f.ttf" {
 			t.Errorf("Video = %+v, want max_duration_seconds 90 and font_file f.ttf", cfg.Video)
 		}
+		if cfg.Video.AllowUnsandboxed {
+			t.Error("allow_unsandboxed defaults to false: no sandbox, no video")
+		}
+	})
+
+	t.Run("allow_unsandboxed loads, needs no bounds and survives the defaults", func(t *testing.T) {
+		var cfg BotConfig
+		if err := json.Unmarshal([]byte(`{"video": {"allow_unsandboxed": true}}`), &cfg); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if cfg.Video == nil || !cfg.Video.AllowUnsandboxed {
+			t.Fatalf("Video = %+v, want allow_unsandboxed true", cfg.Video)
+		}
+		if err := validate(cfg.Video); err != nil {
+			t.Errorf("validateConfig(video.allow_unsandboxed) = %v, want nil", err)
+		}
+		if !cfg.Video.withDefaults().AllowUnsandboxed {
+			t.Error("withDefaults dropped allow_unsandboxed")
+		}
 	})
 }
 

@@ -37,6 +37,12 @@ type VideoConfig struct {
 	MaxFramesPerLookup int    `json:"max_frames_per_lookup,omitempty"`
 	RetentionHours     int    `json:"retention_hours,omitempty"`
 	FontFile           string `json:"font_file,omitempty"`
+	// AllowUnsandboxed runs ffmpeg without the Landlock sandbox where there is
+	// none (any OS but Linux, or a kernel or seccomp profile without it).
+	// Otherwise video watching stays off there. It is for development: an
+	// exploit in a video could then read every bot's tokens, the chat
+	// database and other chats' media.
+	AllowUnsandboxed bool `json:"allow_unsandboxed,omitempty"`
 }
 
 // The video block's defaults and inclusive bounds.
