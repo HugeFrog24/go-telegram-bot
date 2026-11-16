@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // toolMemoryCapped is true: on Linux every tool runs under the memory cap,
@@ -45,6 +47,22 @@ func toolCommand(bin, dir, font string, cpu int, args []string) (string, []strin
 func setToolProcAttr(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL, Setpgid: true}
 	cmd.Cancel = func() error { return killProcessGroup(cmd.Process.Pid) }
+}
+
+// endToolGroup waits for the tool to exit and then kills its whole process
+// group, on every run and not only on a timeout, so nothing the tool forked
+// outlives it (Ruling 16 item 3). The wait leaves the tool a zombie (WNOWAIT):
+// until cmd.Wait reaps it, its PID, which is also the group's ID, cannot be
+// reused, so the kill reaches only that group.
+func endToolGroup(cmd *exec.Cmd) {
+	var info unix.Siginfo
+	for {
+		err := unix.Waitid(unix.P_PID, cmd.Process.Pid, &info, unix.WEXITED|unix.WNOWAIT, nil)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
+	_ = killProcessGroup(cmd.Process.Pid)
 }
 
 // killProcessGroup SIGKILLs the process group that pid leads. A group that is

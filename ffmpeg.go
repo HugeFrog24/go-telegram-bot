@@ -909,7 +909,10 @@ func runToolCmd(ctx context.Context, name string, build func(context.Context) (*
 	stdout := &boundedBuffer{limit: toolOutputLimit, onOverflow: cancel}
 	stderr := &tailBuffer{max: toolStderrTail}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
-	err = cmd.Run()
+	if err = cmd.Start(); err == nil {
+		endToolGroup(cmd) // on Linux: whatever the tool started dies with it (Ruling 16 item 3)
+		err = cmd.Wait()
+	}
 	switch {
 	case stdout.overflow:
 		return nil, fmt.Errorf("%s: %w", name, errToolOutputTooLarge)

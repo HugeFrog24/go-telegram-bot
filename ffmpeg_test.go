@@ -746,6 +746,32 @@ wait`)
 		"the sleeping grandchild %s died with the tool's process group", child)
 }
 
+// After every run, not only a timeout, the tool's whole process group is
+// killed: a stand-in that leaves a sleeping child and exits 0 leaves no
+// survivor, and runTool does not wait for the child's copy of stdout
+// (Ruling 16 item 3). The seccomp filter would stop the fork itself, so the
+// "noseccomp-" name tells the test build's helper to leave the filter off.
+func TestRunTool_KillsGroupAfterExit(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	fakeTool(t, "noseccomp-forker", `sleep 300 &
+echo $!`)
+	start := time.Now()
+	out, err := runTool(context.Background(), "noseccomp-forker", t.TempDir(), "", nil)
+	elapsed := time.Since(start)
+	require.NoError(t, err, "%q", toolStderr(err))
+	child := strings.TrimSpace(string(out))
+	require.NotEmpty(t, child)
+	t.Cleanup(func() {
+		if pid, err := strconv.Atoi(child); err == nil && !processGone(child) {
+			if p, err := os.FindProcess(pid); err == nil {
+				_ = p.Kill()
+			}
+		}
+	})
+	assert.Less(t, elapsed, toolWaitDelay, "nothing held stdout open after the tool exited")
+	assert.Eventually(t, func() bool { return processGone(child) }, 3*time.Second, 20*time.Millisecond,
+		"the sleeping child %s died with the tool's process group", child)
+}
+
 func TestFFmpegMajor(t *testing.T) {
 	for line, want := range map[string]int{
 		"ffmpeg version 9.0.2-essentials_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers": 9,

@@ -33,3 +33,8 @@ func toolCommand(bin, _, _ string, _ int, args []string) (string, []string, erro
 func setToolProcAttr(*exec.Cmd) {
 	// Nothing to set off Linux, as explained above.
 }
+
+// endToolGroup does nothing here: there is no process group to end.
+func endToolGroup(*exec.Cmd) {
+	// The tool runs without a group off Linux; Wait reaps it alone.
+}
