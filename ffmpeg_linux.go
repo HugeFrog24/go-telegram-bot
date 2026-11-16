@@ -50,7 +50,8 @@ func toolCommand(bin, dir, font string, cpu int, args []string) (string, []strin
 // timeout's group kill still ends it; it outlives only a bot that dies, and
 // then only outside a supervisor: Docker's PID namespace and systemd's
 // default KillMode=control-group kill it. The gaps line says so
-// (sandboxGapList).
+// (sandboxGapList), and, where the opt-out runs a tool without the filter,
+// that a process it forks can leave the group and outlive the run.
 //
 // The child also leads its own process group, and a timeout or the output
 // bound kills that whole group: a wrapper script on PATH cannot leave a

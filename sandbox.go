@@ -91,7 +91,11 @@ func sandboxUsable(abi int, err error) error {
 // de_thread keeps its PID. That orphan keeps Landlock, the filter, the
 // rlimits, its PID and its group; it outlives only a bot that dies, and only
 // outside a supervisor: Docker's PID namespace and systemd's default
-// KillMode=control-group kill it.
+// KillMode=control-group kill it. Without the filter (the opt-out) the tool
+// can also fork, and a child that calls setsid leaves the group, so it
+// outlives the run even while the bot lives, with a fresh RLIMIT_CPU budget
+// (Ruling 21 item 2); the entry that is always printed does not claim the
+// group kill covers it.
 var sandboxGapList = []struct {
 	abi     int  // the Landlock ABI that denies it; 0 for none
 	seccomp bool // whether the seccomp filter denies it
@@ -108,11 +112,13 @@ var sandboxGapList = []struct {
 	{0, true, "file metadata changes (mode, owner, times, extended attributes)"},
 	{0, true, "SysV IPC, inotify and fanotify"},
 	{0, true, "ioctl requests (TIOCSTI among them), priority-inheriting futexes and other prctl options"},
-	{0, true, "every other system call (new processes, ptrace, namespaces, io_uring, bpf)"},
+	{0, true, "new processes: one the tool forks can leave its group with setsid and outlive the run even while the bot lives, " +
+		"with a fresh CPU-time budget and, below Landlock ABI 10, UDP"},
+	{0, true, "every other system call (ptrace, namespaces, io_uring, bpf)"},
 	{0, false, "file and process metadata (stat: whether a path exists, its size and times, and through /proc/<pid> whether a process does)"},
 	{0, false, "readlink targets and statfs"},
-	{0, false, "the parent-death signal, which a thread the tool starts drops by exec: while the bot lives a timeout still kills the tool's group, " +
-		"but a tool that outlives a dead bot, still sandboxed, ends only with Docker's PID namespace or a systemd unit's control-group kill"},
+	{0, false, "the parent-death signal, which a thread the tool starts drops by exec: a tool that outlives a dead bot, still sandboxed, " +
+		"ends only with Docker's PID namespace or a systemd unit's control-group kill"},
 	{0, false, "the user's pending-signal quota, which the tool shares but may fill only to 64 queued signals (RLIMIT_SIGPENDING)"},
 }
 

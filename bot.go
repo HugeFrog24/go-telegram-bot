@@ -91,15 +91,14 @@ func resolveVideo(config *BotConfig) *VideoConfig {
 	noSandbox := sandboxUsable(abi, probeErr)
 	granted := false
 	// A sandbox that is not whole turns video off, unless the block's
-	// video.allow_unsandboxed accepts it, with a loud warning.
+	// video.allow_unsandboxed accepts it; the loud warning comes once the
+	// self-test has reported which layers are missing.
 	acceptUnsandboxed := func(why error) bool {
 		if !config.Video.AllowUnsandboxed {
 			InfoLogger.Printf("[%s] video: no sandbox for ffmpeg (%v); video watching is off (video.allow_unsandboxed runs ffmpeg without one)",
 				config.ID, why)
 			return false
 		}
-		ErrorLogger.Printf("[%s] Warning: video: ffmpeg runs WITHOUT a full sandbox (%v) because video.allow_unsandboxed is set: "+
-			"a video that exploits ffmpeg could %s", config.ID, why, unsandboxedHarm(sandboxHelper, abi, why))
 		unsandboxedGrants.Add(1)
 		granted = true
 		return true
@@ -124,6 +123,12 @@ func resolveVideo(config *BotConfig) *VideoConfig {
 		InfoLogger.Printf("[%s] video: the ffmpeg self-test failed: %v, stderr %q; video watching is off", config.ID, err, toolStderr(err))
 		return nil
 	}
+	if noSandbox != nil {
+		// From the self-test's report, so every missing layer is named, not
+		// only the first the probe met (Ruling 21 item 2).
+		ErrorLogger.Printf("[%s] Warning: video: ffmpeg runs WITHOUT a full sandbox (%v) because video.allow_unsandboxed is set: "+
+			"a video that exploits ffmpeg could, %s", config.ID, noSandbox, unsandboxedHarm(sandboxHelper, report))
+	}
 	logSandbox(config.ID, noSandbox == nil, report)
 	logToolVersion(config.ID)
 	video := config.Video.withDefaults()
@@ -144,30 +149,36 @@ func videoRunnable() error {
 }
 
 // unsandboxedHarm is what a video that exploits ffmpeg could do for want of
-// the layer why names, for the opt-out's warning (Ruling 19 item 8): helper
-// is whether the sandbox helper runs the tools (sandboxHelper), abi the
-// kernel's Landlock ABI. The gaps line, once the self-test passes, lists
+// each layer the self-test's report r shows missing, for the opt-out's
+// warning: Landlock (Ruling 19 item 8: reading, writing and running files),
+// the seccomp filter, and a task cap that binds the user, every one of them
+// (Ruling 21 item 2). helper is whether the sandbox helper runs the tools
+// (sandboxHelper); without it there is no layer at all. The gaps line lists
 // the rest.
-func unsandboxedHarm(helper bool, abi int, why error) string {
-	switch {
-	case errors.Is(why, errTaskCapUnbound):
-		return "start threads until the host, or a container's pids limit, runs out of them"
-	case !helper:
-		return "do anything the bot's user can: read, write and run any file (every bot's token, the chat database, other chats' media) " +
-			"and use the network"
+func unsandboxedHarm(helper bool, r sandboxReport) string {
+	if !helper {
+		return "with no sandbox on this OS, do anything the bot's user can: read, write and run any file " +
+			"(every bot's token, the chat database, other chats' media) and use the network"
 	}
 	var harms []string
 	switch {
-	case abi == 0:
-		harms = append(harms, "read, write and run any file the bot's user can (every bot's token, the chat database, other chats' media)")
-	case abi < minSandboxABI:
-		harms = append(harms, "empty any file the bot's user can write (the chat database, stored videos, a writable config)")
+	case r.ABI == 0:
+		harms = append(harms, "without Landlock, read, write and run any file the bot's user can (every bot's token, the chat database, other chats' media)")
+	case r.ABI < minSandboxABI:
+		harms = append(harms, fmt.Sprintf("with Landlock ABI %d, below %d, empty any file the bot's user can write "+
+			"(the chat database, stored videos, a writable config)", r.ABI, minSandboxABI))
 	}
-	if errors.Is(why, errNoSeccomp) {
-		harms = append(harms, "use what only the seccomp filter closes, as the gaps line lists (other processes, SysV IPC, ptrace, "+
-			"the sockets its Landlock ABI allows)")
+	if !r.Seccomp {
+		harms = append(harms, "without the seccomp filter, fork processes that leave the tool's group and outlive the run, and use what else "+
+			"only the filter closes, as the gaps line lists (other processes, SysV IPC, ptrace, the sockets its Landlock ABI allows)")
 	}
-	return strings.Join(harms, "; and ")
+	if !r.TaskCap {
+		harms = append(harms, "without a task cap (root), start threads until the host, or a container's pids limit, runs out of them")
+	}
+	if len(harms) == 0 {
+		return "do what the gaps line lists"
+	}
+	return strings.Join(harms, "; and, ")
 }
 
 // logSandbox logs the sandbox the self-test reported, in every mode that runs
