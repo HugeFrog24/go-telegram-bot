@@ -253,7 +253,8 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		b := videoGateBot(t, db, &VideoConfig{AllowUnsandboxed: true})
 		assert.False(t, b.videoOn())
 		assert.Nil(t, b.video)
-		assert.Contains(t, logged.String(), "[video_gate_bot] video: the ffmpeg self-test failed: probe: ")
+		assert.Contains(t, logged.String(), "[video_gate_bot] video: the ffmpeg self-test failed: probe: the tool failed: ffprobe: exit status 1",
+			"a tool's exit is errToolFailed, not unsupported media (Ruling 19 item 2)")
 		assert.Contains(t, logged.String(), `stderr "probe \"exploded\"\n"; video watching is off`)
 	})
 

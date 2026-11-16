@@ -113,9 +113,18 @@ var probeOutput = []string{
 var matroskaDuration = regexp.MustCompile(`^(\d{1,6}):([0-5]\d):([0-5]\d(?:\.\d{1,9})?)$`)
 
 var (
-	// errUnsupportedMedia means the file is not something the bot watches, or
-	// ffprobe/ffmpeg failed on it (a non-zero exit or a signal).
+	// errUnsupportedMedia means the file is not something the bot watches:
+	// the bot's own checks refused it (its kind, format, codec, stream
+	// count, size or duration), or a render ran cleanly and found no frame
+	// (errNoFrame).
 	errUnsupportedMedia = errors.New("unsupported media")
+	// errToolFailed means ffprobe or ffmpeg itself failed: a non-zero exit or
+	// a signal. That may be the file (a whitelist refusal, a broken stream)
+	// or the run, which a retry can get past: a thread it could not start
+	// while other runs held the user's shared task cap (Ruling 19 item 2).
+	// The exit status alone cannot tell them apart, and stderr is never
+	// parsed.
+	errToolFailed = errors.New("the tool failed")
 	// errToolOutputTooLarge means a run wrote more than toolOutputLimit to stdout.
 	errToolOutputTooLarge = errors.New("output over the limit")
 )
@@ -154,8 +163,9 @@ func extForFormat(format string) string {
 
 // probeMedia runs ffprobe on path under the allowlists for kind (a watchable
 // kind: "video", "animation", "video_note", "document" or "sticker"), then
-// checks the result in Go. Anything not watchable, and any ffprobe failure,
-// is errUnsupportedMedia; a timeout or cancellation is the context's error.
+// checks the result in Go. Anything the checks refuse is errUnsupportedMedia,
+// an ffprobe failure (a whitelist refusal among them) errToolFailed; a
+// timeout or cancellation is the context's error.
 func probeMedia(ctx context.Context, path, kind string) (mediaProbe, error) {
 	formats, ok := kindFormats[kind]
 	if !ok {
@@ -169,7 +179,7 @@ func probeMedia(ctx context.Context, path, kind string) (mediaProbe, error) {
 	defer cancel()
 	out, err := runTool(ctx, "ffprobe", filepath.Dir(abs), "", probeArgs(abs, formats))
 	if err != nil {
-		return mediaProbe{}, decodeFailure(err)
+		return mediaProbe{}, toolFailure(err)
 	}
 	return parseProbe(out, kind)
 }
@@ -351,13 +361,13 @@ func tagDuration(tag string) (float64, bool) {
 	return d, d > 0
 }
 
-// decodeFailure turns a run that ffprobe/ffmpeg itself failed into
-// errUnsupportedMedia. Timeouts, cancellation, the output bound and a missing
-// tool stay what they are.
-func decodeFailure(err error) error {
+// toolFailure turns a run that ffprobe/ffmpeg itself failed into
+// errToolFailed. Timeouts, cancellation, the output bound and a missing tool
+// stay what they are.
+func toolFailure(err error) error {
 	var te *toolError
 	if errors.As(err, &te) {
-		return fmt.Errorf("%w: %w", errUnsupportedMedia, err)
+		return fmt.Errorf("%w: %w", errToolFailed, err)
 	}
 	return err
 }
@@ -492,8 +502,8 @@ type sheetPlan struct {
 // passes its context as is, and a lookup passes one made with
 // context.WithTimeout(ctx, lookupTimeout).
 //
-// A failed run is errUnsupportedMedia; out-of-range input is
-// errInvalidSheet; a timeout is the context's error.
+// A failed run is errToolFailed, a clean one with no frame errNoFrame;
+// out-of-range input is errInvalidSheet; a timeout is the context's error.
 func renderSheet(ctx context.Context, path string, probe mediaProbe, spec sheetSpec) (jpeg []byte, frameTimes []float64, err error) {
 	plan, err := planSheet(probe, spec)
 	if err != nil {
@@ -516,12 +526,13 @@ func renderSheet(ctx context.Context, path string, probe mediaProbe, spec sheetS
 // renderOutcome sorts out a render run. A clean exit that wrote nothing means
 // no frame reached the encoder: errNoFrame (on 6.x that can also be a
 // refusal). ffmpeg 7 and later exit with −22 when no frame comes, the same
-// status as a refused decoder or an unusable font, so such a run cannot be
-// told apart by its status and stays a plain decode failure.
+// status as a refused decoder, an unusable font or a thread it could not
+// start, so such a run cannot be told apart by its status and stays a plain
+// errToolFailed.
 func renderOutcome(out []byte, err error) ([]byte, error) {
 	switch {
 	case err != nil:
-		return nil, decodeFailure(err)
+		return nil, toolFailure(err)
 	case len(out) == 0:
 		return nil, fmt.Errorf("%w (%w)", errNoFrame, errUnsupportedMedia)
 	}
