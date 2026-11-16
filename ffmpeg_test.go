@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -291,7 +292,7 @@ func TestProbeMedia_KindPicksFormatWhitelist(t *testing.T) { //NOSONAR go:S100 -
 func TestMagicDemuxer(t *testing.T) {
 	pad := func(s string) []byte { return append([]byte(s), make([]byte, probeMagicLen)...)[:probeMagicLen] }
 	atom := func(name string) []byte { return pad("\x00\x00\x00\x20" + name + "isom") }
-	for _, name := range []string{"ftyp", "moov", "mdat", "free", "skip", "wide"} {
+	for _, name := range []string{"ftyp", "moov", "mdat", "free", "skip", "wide", "uuid", "junk", "pnot", "PICT", "moof", "styp", "sidx"} {
 		assert.Equal(t, "mov", magicDemuxer(atom(name)), name)
 	}
 	for name, head := range map[string][]byte{
@@ -306,19 +307,135 @@ func TestMagicDemuxer(t *testing.T) {
 		assert.Equal(t, want, magicDemuxer(head), name)
 	}
 	for name, head := range map[string][]byte{
-		"wav":                pad("RIFF\x24\x00\x00\x00WAVE"),
-		"avi":                pad("RIFF\x24\x00\x00\x00AVI "),
-		"mpegts":             pad("\x47\x40\x00\x10\x00"),
-		"an atom at 0":       pad("ftypisom\x00\x00\x02\x00"),
-		"another atom":       atom("uuid"),
-		"a GIF of another":   pad("GIF90a"),
-		"EBML one byte off":  pad("\x1a\x45\xdf\xa2"),
-		"11 bytes":           atom("ftyp")[:probeMagicLen-1],
-		"nothing":            nil,
-		"a playlist":         pad("#EXTM3U\n#EXT-X"),
-		"an ftyp too far on": pad("\x00\x00\x00\x00\x00ftyp"),
+		"wav":                 pad("RIFF\x24\x00\x00\x00WAVE"),
+		"avi":                 pad("RIFF\x24\x00\x00\x00AVI "),
+		"mpegts":              pad("\x47\x40\x00\x10\x00"),
+		"an atom at 0":        pad("ftypisom\x00\x00\x02\x00"),
+		"another atom":        atom("abcd"),
+		"a box in lower case": atom("pict"),
+		"a GIF of another":    pad("GIF90a"),
+		"EBML one byte off":   pad("\x1a\x45\xdf\xa2"),
+		"11 bytes":            atom("ftyp")[:probeMagicLen-1],
+		"nothing":             nil,
+		"a playlist":          pad("#EXTM3U\n#EXT-X"),
+		"an ftyp too far on":  pad("\x00\x00\x00\x00\x00ftyp"),
 	} {
 		assert.Empty(t, magicDemuxer(head), name)
+	}
+}
+
+// MP4 and QuickTime files may start with other boxes than ftyp (Ruling 21
+// item 4): a uuid or junk box before a plain MP4, legacy QuickTime's pnot
+// and PICT preview, and, in fragmented MP4, styp and sidx. All still pin
+// -f mov. The files are well-formed: before a plain MP4 the prefix moves
+// its chunk offsets with it (prefixBox); a fragmented MP4 counts from each
+// moof and needs nothing moved. A DASH or HLS segment starts with styp too,
+// and passes the magic, but has no moov, so ffprobe itself refuses it.
+func TestProbeMedia_LeadingBoxes(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	plain := ffmpegFixture(t, mp4Args...)
+	frag := ffmpegFixture(t, append(slices.Clone(mp4Args[:len(mp4Args)-2]),
+		"-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4")...)
+	uuid := append([]byte("\xbe\x7a\xcf\xcb\x97\xa9\x42\xe8\x9c\x71\x99\x94\x91\xe3\xaf\xac"), "a self-made uuid box"...)
+	pnot := []byte{0, 0, 0, 0, 0, 0, 'P', 'I', 'C', 'T', 0, 1} // modification date, version, the preview's type and index
+	styp := []byte("msdh\x00\x00\x00\x00msdhmsix")
+	for _, tc := range []struct {
+		name, base string
+		prefix     []byte
+	}{
+		{"uuid, plain MP4", plain, mp4Box("uuid", uuid)},
+		{"junk, plain MP4", plain, mp4Box("junk", make([]byte, 8))},
+		{"pnot and PICT, plain MP4", plain, append(mp4Box("pnot", pnot), mp4Box("PICT", make([]byte, 16))...)},
+		{"PICT, plain MP4", plain, mp4Box("PICT", make([]byte, 16))},
+		{"uuid, fragmented MP4", frag, mp4Box("uuid", uuid)},
+		{"styp, fragmented MP4", frag, mp4Box("styp", styp)},
+		{"sidx, fragmented MP4", frag, mp4Box("sidx", make([]byte, 24))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := prefixBox(t, tc.base, tc.prefix)
+			assert.Equal(t, "mov", magicDemuxer(fileHead(t, path)))
+			for _, kind := range []string{"video", "animation", "video_note", "document"} {
+				p, err := probeMedia(context.Background(), path, kind)
+				require.NoError(t, err, "%s: %q", kind, toolStderr(err))
+				assert.Equal(t, "h264", p.Codec, kind)
+				assert.InDelta(t, 3, p.Duration, 0.2, kind)
+			}
+			_, err := probeMedia(context.Background(), path, "sticker")
+			assert.ErrorIs(t, err, errUnsupportedMedia, "mov is no sticker's container")
+		})
+	}
+
+	t.Run("a DASH segment: styp, no moov", func(t *testing.T) {
+		dir := t.TempDir()
+		cmd := exec.Command("ffmpeg", append(append([]string{"-hide_banner", "-loglevel", "error"}, mp4Args[:len(mp4Args)-2]...),
+			"-f", "dash", "-seg_duration", "1", "x.mpd")...)
+		cmd.Dir = dir // some builds write the segments to the working directory, not beside the manifest
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "%s", out)
+		segments, err := filepath.Glob(filepath.Join(dir, "chunk-stream0-*.m4s"))
+		require.NoError(t, err)
+		require.NotEmpty(t, segments)
+		data, err := os.ReadFile(segments[0]) // #nosec G304 -- the test's own segment
+		require.NoError(t, err)
+		path := textFixture(t, "media", string(data))
+		require.Equal(t, "styp", string(fileHead(t, path)[4:8]))
+		_, err = probeMedia(context.Background(), path, "video")
+		assert.ErrorIs(t, err, errToolFailed, "past the magic, ffprobe refuses a segment it cannot read alone")
+	})
+}
+
+// mp4Box is an ISO BMFF box: a 32-bit size, the type and the payload.
+func mp4Box(typ string, payload []byte) []byte {
+	b := binary.BigEndian.AppendUint32(nil, uint32(8+len(payload))) // #nosec G115 -- a small test box
+	return append(append(b, typ...), payload...)
+}
+
+// prefixBox writes prefix and then the MP4 at path to a new file, with
+// every chunk offset (stco, co64) moved by the prefix's length, so the file
+// stays well-formed. A fragmented MP4 whose fragments count from their moof
+// has no such offsets to move.
+func prefixBox(t *testing.T, path string, prefix []byte) string {
+	t.Helper()
+	data, err := os.ReadFile(path) // #nosec G304 -- a fixture of the test's own
+	require.NoError(t, err)
+	data = slices.Clone(data)
+	shiftChunkOffsets(t, data, uint64(len(prefix)))
+	return textFixture(t, "media", string(prefix)+string(data))
+}
+
+// shiftChunkOffsets adds delta to every stco and co64 entry in the boxes of
+// data, descending into the boxes that hold them.
+func shiftChunkOffsets(t *testing.T, data []byte, delta uint64) {
+	t.Helper()
+	for len(data) >= 8 {
+		size, typ := uint64(binary.BigEndian.Uint32(data)), string(data[4:8])
+		header := uint64(8)
+		switch size {
+		case 0:
+			size = uint64(len(data))
+		case 1:
+			require.GreaterOrEqual(t, len(data), 16)
+			size, header = binary.BigEndian.Uint64(data[8:]), 16
+		}
+		require.True(t, size >= header && size <= uint64(len(data)), "box %q of %d bytes", typ, size)
+		body := data[header:size]
+		switch typ {
+		case "moov", "trak", "mdia", "minf", "stbl":
+			shiftChunkOffsets(t, body, delta)
+		case "stco":
+			n := binary.BigEndian.Uint32(body[4:])
+			for i := range n {
+				p := body[8+4*i:]
+				binary.BigEndian.PutUint32(p, binary.BigEndian.Uint32(p)+uint32(delta)) // #nosec G115 -- a small prefix
+			}
+		case "co64":
+			n := binary.BigEndian.Uint32(body[4:])
+			for i := range n {
+				p := body[8+8*i:]
+				binary.BigEndian.PutUint64(p, binary.BigEndian.Uint64(p)+delta)
+			}
+		}
+		data = data[size:]
 	}
 }
 

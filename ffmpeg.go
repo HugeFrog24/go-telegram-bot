@@ -211,8 +211,12 @@ const probeMagicLen = 12
 
 // magicDemuxer is the demuxer the first probeMagicLen bytes of a file name
 // (Ruling 20 item 2), or "" for none or a shorter head: an ISO BMFF or
-// QuickTime atom type at offset 4 (ftyp, moov, mdat, free, skip or wide) is
-// mov, the EBML magic 1A 45 DF A3 matroska, and GIF87a or GIF89a gif.
+// QuickTime box type at offset 4 is mov, the EBML magic 1A 45 DF A3
+// matroska, and GIF87a or GIF89a gif. The box types are those a file may
+// start with: ftyp, moov, mdat, free, skip and wide; uuid and junk before
+// any of them; legacy QuickTime's pnot and PICT preview; and fragmented
+// MP4's moof, styp and sidx (Ruling 21 item 4). All of them pin mov, so no
+// other demuxer becomes reachable.
 func magicDemuxer(head []byte) string {
 	if len(head) < probeMagicLen {
 		return ""
@@ -224,7 +228,7 @@ func magicDemuxer(head []byte) string {
 		return "gif"
 	}
 	switch string(head[4:8]) {
-	case "ftyp", "moov", "mdat", "free", "skip", "wide":
+	case "ftyp", "moov", "mdat", "free", "skip", "wide", "uuid", "junk", "pnot", "PICT", "moof", "styp", "sidx":
 		return "mov"
 	}
 	return ""
