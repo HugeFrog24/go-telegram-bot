@@ -535,11 +535,20 @@ func latestTimestamp(messages []Message) time.Time {
 // moved past it (one clock tick, or a clock set back), so stamps given in
 // memory order sort in that order.
 func (b *Bot) stampAfter(latest time.Time) time.Time {
-	now := b.clock.Now()
+	now := wallUTC(b.clock.Now())
 	if next := latest.Add(time.Microsecond); now.Before(next) {
-		return next
+		return wallUTC(next)
 	}
 	return now
+}
+
+// wallUTC is t as a conversation stamp: wall-clock UTC with the monotonic
+// reading stripped. The database sorts stamps as text, so they share one
+// offset; and Go compares two times by their monotonic readings when both
+// carry one, which, after the wall clock is set back, contradicts the wall
+// times the database sorts by.
+func wallUTC(t time.Time) time.Time {
+	return t.Round(0).UTC()
 }
 
 // insertLocked puts message into memory at index at with the next sequence
@@ -615,13 +624,13 @@ func (b *Bot) replyStamp(messages []Message, at int) time.Time {
 		}
 	}
 	if at == 0 {
-		return next.Add(-time.Microsecond)
+		return wallUTC(next.Add(-time.Microsecond))
 	}
 	latest := latestTimestamp(messages[:at])
 	if stamp := latest.Add(time.Microsecond); stamp.Before(next) {
-		return stamp
+		return wallUTC(stamp)
 	}
-	return latest.Add(next.Sub(latest) / 2)
+	return wallUTC(latest.Add(next.Sub(latest) / 2))
 }
 
 // replyIndex is where a reply to a context that ended at frontier goes: right
