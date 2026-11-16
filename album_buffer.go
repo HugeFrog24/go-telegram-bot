@@ -18,6 +18,7 @@ type pendingAlbum struct {
 	isPremium                                   bool
 	messageTime                                 int
 	timer                                       *time.Timer
+	pending                                     *turnRequest // text batch the album took over (takeIntake)
 }
 
 func (b *Bot) bufferAlbumItem(
@@ -29,6 +30,7 @@ func (b *Bot) bufferAlbumItem(
 	isPremium bool,
 	languageCode string,
 	messageTime int,
+	pending *turnRequest,
 ) {
 	b.albumBuffersMu.Lock()
 	defer b.albumBuffersMu.Unlock()
@@ -48,6 +50,9 @@ func (b *Bot) bufferAlbumItem(
 		b.albumBuffers[msg.MediaGroupID] = album
 	}
 	album.items = append(album.items, msg)
+	if pending != nil {
+		album.pending = pending
+	}
 
 	if album.timer != nil {
 		album.timer.Stop()
@@ -74,11 +79,12 @@ func (b *Bot) flushAlbum(ctx context.Context, mediaGroupID string) {
 
 	if !b.checkRateLimits(captured.userID) {
 		b.sendRateLimitExceededMessage(ctx, captured.to)
+		b.answerPending(captured.pending)
 		return
 	}
 
 	b.handlePhotoMessage(
-		ctx, items,
+		ctx, items, captured.pending,
 		captured.to, captured.userID,
 		captured.username, captured.firstName, captured.lastName,
 		captured.isPremium, captured.languageCode, captured.messageTime,

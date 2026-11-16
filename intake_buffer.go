@@ -92,10 +92,16 @@ func (b *Bot) flushIntake(ctx context.Context, chatID int64, seq uint64) {
 			b.config.ID, captured.count, chatID)
 	}
 
-	req := captured.turnRequest
+	req := captured.request()
 	req.ctx = ctx
-	req.isEmojiOnly = captured.allEmojiOnly
 	b.respondToChat(req)
+}
+
+// request is the turn the batch's flush runs.
+func (p *pendingIntake) request() turnRequest {
+	req := p.turnRequest
+	req.isEmojiOnly = p.allEmojiOnly
+	return req
 }
 
 // cancelIntake drops a chat's pending buffer without dispatching, returning how
@@ -108,18 +114,50 @@ func (b *Bot) flushIntake(ctx context.Context, chatID int64, seq uint64) {
 // chat memory, and a surviving buffer would repopulate it moments later with
 // content the user asked to have removed.
 func (b *Bot) cancelIntake(chatID int64) int {
+	if pending := b.removeIntake(chatID); pending != nil {
+		return pending.count
+	}
+	return 0
+}
+
+// takeIntake drops a chat's pending buffer like cancelIntake, for a media
+// message whose own turn will read and answer the batch, and hands back the
+// request the flush would have run, or nil. The media path passes it to
+// answerPending if it ends without a model turn.
+func (b *Bot) takeIntake(chatID int64) *turnRequest {
+	pending := b.removeIntake(chatID)
+	if pending == nil {
+		return nil
+	}
+	req := pending.request()
+	return &req
+}
+
+// removeIntake stops and removes a chat's pending buffer, returning it, or nil.
+func (b *Bot) removeIntake(chatID int64) *pendingIntake {
 	b.intakeBuffersMu.Lock()
 	defer b.intakeBuffersMu.Unlock()
 
 	pending, exists := b.intakeBuffers[chatID]
 	if !exists {
-		return 0
+		return nil
 	}
 	if pending.timer != nil {
 		pending.timer.Stop()
 	}
 	delete(b.intakeBuffers, chatID)
-	return pending.count
+	return pending
+}
+
+// answerPending runs, as a text turn of its own, the batch a media path took
+// over (takeIntake) and then ended without a model turn to answer it: a voice
+// note refused or not transcribed, a photo rate-limited, not uploaded or not
+// stored. Called inside the media path's turn, it is collected behind that
+// turn and runs once it ends.
+func (b *Bot) answerPending(pending *turnRequest) {
+	if pending != nil {
+		b.respondToChat(*pending)
+	}
 }
 
 // hasPendingIntake reports whether a chat currently holds a buffered batch.

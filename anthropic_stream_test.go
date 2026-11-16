@@ -162,6 +162,10 @@ func newGatedAnthropicStub(t *testing.T, events []string, split int) (stub *anth
 func serveAnthropicStub(t *testing.T, stub *anthropicStub) *anthropicStub {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/v1/files") {
+			serveFilesStub(w, r)
+			return
+		}
 		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/v1/messages") {
 			http.NotFound(w, r)
 			return
@@ -192,6 +196,22 @@ func serveAnthropicStub(t *testing.T, stub *anthropicStub) *anthropicStub {
 	t.Cleanup(srv.Close)
 	stub.url = srv.URL
 	return stub
+}
+
+// serveFilesStub answers the Files API calls a photo turn makes: every
+// upload becomes file_stub, and every delete succeeds.
+func serveFilesStub(w http.ResponseWriter, r *http.Request) {
+	_, _ = io.Copy(io.Discard, r.Body)
+	w.Header().Set("Content-Type", "application/json")
+	switch r.Method {
+	case http.MethodPost:
+		_, _ = io.WriteString(w, `{"id":"file_stub","type":"file","filename":"photo.jpg","mime_type":"image/jpeg",`+
+			`"size_bytes":4,"created_at":"2026-11-16T00:00:00Z","downloadable":false}`)
+	case http.MethodDelete:
+		_, _ = io.WriteString(w, `{"id":"file_stub","type":"file_deleted"}`)
+	default:
+		http.NotFound(w, r)
+	}
 }
 
 // body is request i's body. It fails the test when the stub never saw

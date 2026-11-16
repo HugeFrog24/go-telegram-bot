@@ -13,14 +13,16 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, userMsg Message, to replyTarget, userID int64, username, firstName, lastName string, isPremium bool, languageCode string, messageTime int) {
+// handleVoiceMessage answers a voice note as its own committed turn. pending
+// is the text batch the note took over from the quiet window, or nil.
+func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, userMsg Message, pending *turnRequest, to replyTarget, userID int64, username, firstName, lastName string, isPremium bool, languageCode string, messageTime int) {
 	if b.config.ElevenLabsAPIKey == "" {
-		b.refuseVoice(ctx, &userMsg, to, "I don't understand voice messages.")
+		b.refuseVoice(ctx, &userMsg, pending, to, "I don't understand voice messages.")
 		return
 	}
 
 	if !b.hasScope(userID, ScopeTTSUse) {
-		b.refuseVoice(ctx, &userMsg, to, "You don't have permission to use voice features.")
+		b.refuseVoice(ctx, &userMsg, pending, to, "You don't have permission to use voice features.")
 		return
 	}
 
@@ -40,7 +42,7 @@ func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, u
 	}
 	if err != nil {
 		ErrorLogger.Printf("Error transcribing voice message from user %d: %v", userID, err)
-		b.refuseVoice(ctx, &userMsg, to, "Sorry, I couldn't understand your voice message.")
+		b.refuseVoice(ctx, &userMsg, pending, to, "Sorry, I couldn't understand your voice message.")
 		return
 	}
 
@@ -111,12 +113,13 @@ func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, u
 }
 
 // refuseVoice sets a voice note that will not be transcribed aside, with the
-// notice that tells the user why.
-func (b *Bot) refuseVoice(ctx context.Context, userMsg *Message, to replyTarget, notice string) {
+// notice that tells the user why, and answers the text batch it took over.
+func (b *Bot) refuseVoice(ctx context.Context, userMsg *Message, pending *turnRequest, to replyTarget, notice string) {
 	b.setAside(userMsg)
 	if err := b.sendResponse(ctx, to, notice); err != nil {
 		ErrorLogger.Printf("Error sending voice notice: %v", err)
 	}
+	b.answerPending(pending)
 }
 
 func (b *Bot) uploadPhotoFromItem(ctx context.Context, item *models.Message, chatID int64) (string, error) {
@@ -129,9 +132,13 @@ func (b *Bot) uploadPhotoFromItem(ctx context.Context, item *models.Message, cha
 	return b.uploadImageToAnthropic(ctx, data, filename, "image/jpeg")
 }
 
+// handlePhotoMessage answers a photo or an album as its own committed turn.
+// pending is the text batch the photos took over from the quiet window, or
+// nil; it is answered on its own when no photo turn reaches the model.
 func (b *Bot) handlePhotoMessage(
 	ctx context.Context,
 	items []*models.Message,
+	pending *turnRequest,
 	to replyTarget,
 	userID int64,
 	username, firstName, lastName string,
@@ -150,6 +157,7 @@ func (b *Bot) handlePhotoMessage(
 	finalUploaded, caption, err := b.uploadPhotoItems(ctx, items, to)
 	stopTyping()
 	if err != nil || len(finalUploaded) == 0 {
+		b.answerPending(pending)
 		return
 	}
 
@@ -173,6 +181,7 @@ func (b *Bot) handlePhotoMessage(
 			if sendErr := b.sendResponse(ctx, to, "Sorry, I had trouble saving your message."); sendErr != nil {
 				ErrorLogger.Printf("Error sending store failure message: %v", sendErr)
 			}
+			b.answerPending(pending) // collected: runs once this turn ends
 			return "", errTurnSilent
 		}
 		b.joinConversation(userMessage)
@@ -359,22 +368,24 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 		}
 	}
 
-	// Media never waits on the text debounce window. Cancelling here does not
-	// discard the buffered text: those messages are already in chat memory, so
-	// the turn this media triggers answers them too.
+	// Media never waits on the text debounce window. Taking the batch over
+	// does not discard the buffered text: those messages have joined chat
+	// memory, so the turn this media triggers answers them too. When the
+	// media path ends without a model turn, it answers the batch on its own
+	// (answerPending).
 	if message.MediaGroupID != "" && len(message.Photo) > 0 {
-		b.cancelIntake(chatID)
 		b.bufferAlbumItem(ctx, message, to, userID, username, firstName, lastName,
-			isPremium, languageCode, messageTime)
+			isPremium, languageCode, messageTime, b.takeIntake(chatID))
 		return
 	}
 	if len(message.Photo) > 0 {
-		b.cancelIntake(chatID)
+		pending := b.takeIntake(chatID)
 		if !b.checkRateLimits(userID) {
 			b.sendRateLimitExceededMessage(ctx, to)
+			b.answerPending(pending)
 			return
 		}
-		b.handlePhotoMessage(ctx, []*models.Message{message},
+		b.handlePhotoMessage(ctx, []*models.Message{message}, pending,
 			to, userID, username, firstName, lastName,
 			isPremium, languageCode, messageTime)
 		return
@@ -398,8 +409,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	}
 
 	if message.Voice != nil {
-		b.cancelIntake(chatID)
-		b.handleVoiceMessage(ctx, message, userMsg, to, userID, username, firstName, lastName, isPremium, languageCode, messageTime)
+		b.handleVoiceMessage(ctx, message, userMsg, b.takeIntake(chatID), to, userID, username, firstName, lastName, isPremium, languageCode, messageTime)
 		return
 	}
 

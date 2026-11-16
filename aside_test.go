@@ -71,8 +71,29 @@ func waitIdle(t *testing.T, b *Bot, chatID int64) {
 	require.Eventually(t, func() bool { return chatIdle(b, chatID) }, 5*time.Second, 5*time.Millisecond)
 }
 
+// serveTelegramFiles makes every Telegram file download succeed from a local
+// server. release, when not nil, holds each GetFile until it is closed.
+func serveTelegramFiles(t *testing.T, tg *MockTelegramClient, release chan struct{}) {
+	t.Helper()
+	files := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "OggS")
+	}))
+	t.Cleanup(files.Close)
+	tg.GetFileFunc = func(ctx context.Context, _ *bot.GetFileParams) (*models.File, error) {
+		if release != nil {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return &models.File{FilePath: "file"}, nil
+	}
+	tg.FileDownloadLinkFunc = func(*models.File) string { return files.URL }
+}
+
 // voiceStubs stands in for Telegram's file download and ElevenLabs. Speech
-// to text answers with text, or fails while fail is set; text to speech
+// to text answers with text, or fails when text is empty; text to speech
 // always fails, so a voice turn falls back to a text reply. release, when
 // set, holds every download until it is closed.
 type voiceStubs struct {
@@ -82,21 +103,7 @@ type voiceStubs struct {
 
 func (v *voiceStubs) install(t *testing.T, b *Bot, tg *MockTelegramClient) {
 	t.Helper()
-	files := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "OggS")
-	}))
-	t.Cleanup(files.Close)
-	tg.GetFileFunc = func(ctx context.Context, _ *bot.GetFileParams) (*models.File, error) {
-		if v.release != nil {
-			select {
-			case <-v.release:
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		return &models.File{FilePath: "voice.ogg"}, nil
-	}
-	tg.FileDownloadLinkFunc = func(*models.File) string { return files.URL }
+	serveTelegramFiles(t, tg, v.release)
 	stt := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		if v.text == "" {
@@ -229,7 +236,7 @@ func TestHandleVoiceMessage_InvisibleUntilTranscribed(t *testing.T) { //NOSONAR 
 	assert.Equal(t, "one more thing", text)
 	assert.False(t, requestHas(t, stub, 0, "[Voice message]"), "the untranscribed voice note is not read")
 
-	b.handleVoiceMessage(context.Background(), voice, userMsg, replyTarget{chatID: chatID},
+	b.handleVoiceMessage(context.Background(), voice, userMsg, nil, replyTarget{chatID: chatID},
 		123, "owner", "", "", false, "en", 0)
 
 	require.Len(t, stub.requestBetas(), 2, "the voice turn asks the model")
@@ -257,7 +264,7 @@ func TestHandleVoiceMessage_TranscriptionFailureLeavesCollectedTextAnswered(t *t
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		b.handleVoiceMessage(context.Background(), voice, userMsg, replyTarget{chatID: chatID},
+		b.handleVoiceMessage(context.Background(), voice, userMsg, nil, replyTarget{chatID: chatID},
 			123, "owner", "", "", false, "en", 0)
 	}()
 	require.Eventually(t, func() bool { return !chatIdle(b, chatID) }, 5*time.Second, 5*time.Millisecond,
