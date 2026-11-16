@@ -82,8 +82,25 @@ func resolveVideo(config *BotConfig) *VideoConfig {
 		InfoLogger.Printf("[%s] video: %v; video watching is off", config.ID, err)
 		return nil
 	}
+	logToolVersion(config.ID)
 	video := config.Video.withDefaults()
 	return &video
+}
+
+// logToolVersion logs the ffmpeg version line when the gate turns video on,
+// and warns when the version is below minFFmpegMajor or cannot be read. It is
+// never fatal (Ruling 12 item 6).
+func logToolVersion(botID string) {
+	line, err := toolVersion(context.Background())
+	if err != nil {
+		ErrorLogger.Printf("[%s] Warning: video: could not read the ffmpeg version: %v", botID, err)
+		return
+	}
+	InfoLogger.Printf("[%s] video: %q", botID, line)
+	if major, ok := ffmpegMajor(line); !ok || major < minFFmpegMajor {
+		ErrorLogger.Printf("[%s] Warning: video: ffmpeg below version %d or of unknown version; it may lack security fixes for untrusted media",
+			botID, minFFmpegMajor)
+	}
 }
 
 func messageType(msg *models.Message) string {

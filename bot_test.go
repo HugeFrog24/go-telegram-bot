@@ -130,10 +130,10 @@ func videoGateBot(t *testing.T, db *gorm.DB, video *VideoConfig) *Bot {
 }
 
 func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
-	var logged bytes.Buffer
-	prev := InfoLogger
-	InfoLogger = log.New(&logged, "", 0)
-	t.Cleanup(func() { InfoLogger = prev })
+	var logged, warned bytes.Buffer
+	prev, prevErr := InfoLogger, ErrorLogger
+	InfoLogger, ErrorLogger = log.New(&logged, "", 0), log.New(&warned, "", 0)
+	t.Cleanup(func() { InfoLogger, ErrorLogger = prev, prevErr })
 
 	t.Run("no video block: off", func(t *testing.T) {
 		b := videoGateBot(t, setupTestDB(t), nil)
@@ -148,12 +148,41 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 				t.Skipf("%s not on PATH", tool)
 			}
 		}
+		logged.Reset()
 		b := videoGateBot(t, setupTestDB(t), &VideoConfig{SheetFrames: 8})
 		assert.True(t, b.videoOn())
 		assert.Equal(t, VideoConfig{
 			MaxDurationSeconds: 600, SheetFrames: 8, MaxLookups: 6, MaxFramesPerLookup: 12, RetentionHours: 24,
 		}, *b.video)
+		assert.Contains(t, logged.String(), `[video_gate_bot] video: "ffmpeg version `, "the version line is logged once video is on")
 	})
+
+	// The version check never turns video off; it only warns (Ruling 12 item 6).
+	for _, tc := range []struct{ name, ffmpeg, logs, warns string }{
+		{"ffmpeg older than 8", "echo 'ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023 the FFmpeg developers'",
+			`[video_gate_bot] video: "ffmpeg version 6.1.1-3ubuntu5`, "[video_gate_bot] Warning: video: ffmpeg below version 8"},
+		{"a git build", "echo 'ffmpeg version N-118000-gabcdef0123 Copyright'",
+			`[video_gate_bot] video: "ffmpeg version N-118000`, "[video_gate_bot] Warning: video: ffmpeg below version 8 or of unknown version"},
+		{"-version fails", "exit 1", "", "[video_gate_bot] Warning: video: could not read the ffmpeg version"},
+		{"ffmpeg 8", "echo 'ffmpeg version 8.1.3 Copyright (c) 2000-2026 the FFmpeg developers'",
+			`[video_gate_bot] video: "ffmpeg version 8.1.3`, ""},
+	} {
+		t.Run(tc.name+": on, version logged", func(t *testing.T) {
+			db := setupTestDB(t)
+			fakeTool(t, "ffprobe", "exit 0")
+			fakeTool(t, "ffmpeg", tc.ffmpeg)
+			logged.Reset()
+			warned.Reset()
+			b := videoGateBot(t, db, &VideoConfig{})
+			assert.True(t, b.videoOn(), "never fatal")
+			assert.Contains(t, logged.String(), tc.logs)
+			if tc.warns == "" {
+				assert.Empty(t, warned.String())
+				return
+			}
+			assert.Contains(t, warned.String(), tc.warns)
+		})
+	}
 
 	// On Linux every tool runs through /bin/sh, which applies the memory cap:
 	// without it the feature fails closed. Other OSes have no cap and need no shell.

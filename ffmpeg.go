@@ -792,6 +792,51 @@ func toolRunnerReady() error {
 	return nil
 }
 
+// The gate's one version check (Ruling 12 item 6).
+const (
+	versionTimeout = 5 * time.Second
+	minFFmpegMajor = 8   // older releases lack fixes the security decisions rely on
+	maxVersionLine = 200 // bytes of the version line kept for the log
+)
+
+// ffmpegVersionLine reads the major version from the first line of
+// `ffmpeg -version`, such as "ffmpeg version 8.1.3 Copyright …" or
+// "ffmpeg version n7.1 …". Git builds ("N-118000-g…") have none.
+var ffmpegVersionLine = regexp.MustCompile(`^ffmpeg version n?(\d{1,4})\.`)
+
+// toolVersion runs `ffmpeg -hide_banner -version` once through runTool,
+// within versionTimeout and in an empty directory, and returns the first line
+// of its output, cut to maxVersionLine bytes.
+func toolVersion(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, versionTimeout)
+	defer cancel()
+	dir, err := os.MkdirTemp("", "ffmpeg-version-")
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	out, err := runTool(ctx, "ffmpeg", dir, []string{"-hide_banner", "-version"})
+	if err != nil {
+		return "", err
+	}
+	line, _, _ := strings.Cut(string(out), "\n")
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return "", errors.New("ffmpeg -version printed nothing")
+	}
+	return line[:min(len(line), maxVersionLine)], nil
+}
+
+// ffmpegMajor is the major version in a toolVersion line, when it has one.
+func ffmpegMajor(line string) (int, bool) {
+	m := ffmpegVersionLine.FindStringSubmatch(line)
+	if m == nil {
+		return 0, false
+	}
+	major, err := strconv.Atoi(m[1])
+	return major, err == nil
+}
+
 // toolSlots bounds concurrent ffprobe/ffmpeg processes across the whole bot
 // (item 8). Each run takes a slot for itself alone: never across two runs.
 var toolSlots = make(chan struct{}, toolConcurrency(runtime.NumCPU()))

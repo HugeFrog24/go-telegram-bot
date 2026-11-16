@@ -705,6 +705,57 @@ wait`)
 	assert.Less(t, elapsed, toolWaitDelay, "no orphan held the output pipes open after the kill")
 }
 
+func TestFFmpegMajor(t *testing.T) {
+	for line, want := range map[string]int{
+		"ffmpeg version 9.0.2-essentials_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers": 9,
+		"ffmpeg version 8.1.3 Copyright (c) 2000-2026 the FFmpeg developers":                               8,
+		"ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023 the FFmpeg developers":                      6,
+		"ffmpeg version n7.1 Copyright (c) 2000-2024 the FFmpeg developers":                                7,
+		"ffmpeg version 10.0 Copyright": 10,
+		// Unreadable: a git build, another tool, nothing, a number out of range.
+		"ffmpeg version N-118000-gabcdef0123 Copyright (c) 2000-2026": -1,
+		"ffmpeg version git-2026-11-01-abcdef":                        -1,
+		"ffprobe version 8.1.3 Copyright":                             -1,
+		"":                                                            -1,
+		"ffmpeg version 99999999999999999999.0":                       -1,
+		" ffmpeg version 8.1.3":                                       -1,
+	} {
+		major, ok := ffmpegMajor(line)
+		assert.Equal(t, want >= 0, ok, "%q", line)
+		if ok {
+			assert.Equal(t, want, major, "%q", line)
+		}
+	}
+}
+
+func TestToolVersion(t *testing.T) {
+	requireFFmpeg(t)
+	line, err := toolVersion(context.Background())
+	require.NoError(t, err)
+	t.Log(line)
+	assert.True(t, strings.HasPrefix(line, "ffmpeg version "), line)
+	assert.NotContains(t, line, "\n")
+	_, ok := ffmpegMajor(line)
+	assert.True(t, ok, "the local builds have release version numbers")
+
+	t.Run("first line only, bounded", func(t *testing.T) {
+		fakeTool(t, "ffmpeg", `printf 'ffmpeg version 8.1.3 %0300d\nsecond line\n' 0`)
+		line, err := toolVersion(context.Background())
+		require.NoError(t, err)
+		assert.True(t, strings.HasPrefix(line, "ffmpeg version 8.1.3 000"), line)
+		assert.Len(t, line, maxVersionLine)
+	})
+
+	t.Run("a run that fails or prints nothing is an error", func(t *testing.T) {
+		fakeTool(t, "ffmpeg", "exit 0")
+		_, err := toolVersion(context.Background())
+		assert.Error(t, err)
+		fakeTool(t, "ffmpeg", "echo 'ffmpeg version 8.1.3'; exit 1")
+		_, err = toolVersion(context.Background())
+		assert.Error(t, err)
+	})
+}
+
 func TestLookupTool(t *testing.T) {
 	t.Run("missing", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir())
