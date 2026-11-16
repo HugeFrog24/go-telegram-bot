@@ -28,6 +28,15 @@ func captureErrors(t *testing.T) *bytes.Buffer {
 	return &logged
 }
 
+// oneConnection makes b's in-memory database take one connection at a time,
+// as in production, so goroutines share it rather than open an empty one.
+func oneConnection(t *testing.T, b *Bot) {
+	t.Helper()
+	sqlDB, err := b.db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+}
+
 func clearUpdate(chatID int64) *models.Update {
 	return commandUpdate(chatID, 970, &models.User{ID: 123, Username: "owner"}, "/clear")
 }
@@ -47,6 +56,7 @@ func TestClear_BetweenRegisterAndSnapshotCancelsTheTurnSilently(t *testing.T) { 
 	stub := newAnthropicStub(t, candleFarmStream())
 	b, tg := setupBotForTest(t, 123)
 	useAnthropicStub(b, stub)
+	oneConnection(t, b)
 	sent := recordSends(tg)
 	errs := captureErrors(t)
 	const chatID = int64(123)
@@ -84,6 +94,7 @@ func TestClear_DuringTheModelCallDropsTheTurn(t *testing.T) { //NOSONAR go:S100 
 	stub, open := newGatedAnthropicStub(t, events, 4) // message_start and the first text block
 	b, tg := setupBotForTest(t, 123)
 	useAnthropicStub(b, stub)
+	oneConnection(t, b)
 	sent := recordSends(tg)
 	errs := captureErrors(t)
 	const chatID = int64(123)
@@ -144,9 +155,7 @@ func TestHandlePhotoMessage_ClearBetweenStoreAndJoinReadsTheNewMemory(t *testing
 	stub := newAnthropicStub(t, candleFarmStream())
 	b, tg := setupBotForTest(t, 123)
 	useAnthropicStub(b, stub)
-	sqlDB, err := b.db.DB()
-	require.NoError(t, err)
-	sqlDB.SetMaxOpenConns(1)
+	oneConnection(t, b)
 	recordSends(tg)
 	serveTelegramFiles(t, tg, nil)
 	const chatID = int64(123)
