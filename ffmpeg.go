@@ -306,7 +306,7 @@ func formatSeconds(s float64) string {
 
 // Bounds on a sheet request. Numbers outside them never reach ffmpeg (item 11).
 const (
-	maxSheetFrames    = 20                         // the config's largest sheet_frames and max_frames_per_lookup
+	maxSheetFrames    = max(maxVideoSheetFrames, maxVideoMaxFramesPerLookup)
 	minSheetEdge      = 64                         // smallest MaxEdge
 	maxSheetSeconds   = maxVideoMaxDurationSeconds // no watchable video is longer
 	maxSheetRate      = 1000.0                     // frames per second of source time a sheet may sample

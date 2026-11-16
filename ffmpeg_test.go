@@ -941,35 +941,56 @@ func TestFilterValue(t *testing.T) {
 	assert.Equal(t, "caf\xe9\xff", filterValue("caf\xe9\xff"), "bytes kept as they are")
 }
 
+// copyFile copies src to dst for a test.
+func copyFile(t *testing.T, src, dst string) string {
+	t.Helper()
+	data, err := os.ReadFile(src) // #nosec G304 -- a system font chosen by the test
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(dst, data, 0o600))
+	return dst
+}
+
+// otherFont finds a second, differently drawn font next to the built-in one.
+func otherFont(builtIn string) string {
+	for _, name := range []string{"DejaVuSerif.ttf", "DejaVuSansMono.ttf", "times.ttf", "cour.ttf"} {
+		if p := filepath.Join(filepath.Dir(builtIn), name); usableFontFile(p) {
+			return p
+		}
+	}
+	return ""
+}
+
 func TestRenderSheet_FontPathEscaping(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	requireFFmpeg(t)
-	system := resolveFontFile("")
-	if system == "" {
-		t.Skip("no built-in font file on this system")
+	builtIn := resolveFontFile("")
+	other := otherFont(builtIn)
+	if builtIn == "" || other == "" {
+		t.Skip("needs two built-in fonts")
 	}
-	font, err := os.ReadFile(system) // #nosec G304 -- a built-in candidate path
-	require.NoError(t, err)
 	dir := filepath.Join(t.TempDir(), "it's [a],b;c")
 	require.NoError(t, os.Mkdir(dir, 0o700))
-	odd := filepath.Join(dir, "font's,[1];x.ttf")
-	require.NoError(t, os.WriteFile(odd, font, 0o600))
+	odd := copyFile(t, other, filepath.Join(dir, "font's,[1];x.ttf"))
 	require.Equal(t, odd, resolveFontFile(odd))
 	t.Logf("font path: %s", odd) // on Windows it also holds ':' and '\'
 
 	path := ffmpegFixture(t, gifArgs...)
 	probe, err := probeMedia(context.Background(), path, "animation")
 	require.NoError(t, err)
-	spec := sheetSpec{Start: 0, End: probe.Duration, Frames: 4, MaxEdge: maxImageEdge, FontFile: odd}
-	data, _, err := renderSheet(context.Background(), path, probe, spec)
-	require.NoError(t, err, "drawtext found the font through both escaping levels")
-	decodeSheet(t, data, maxImageEdge)
+	render := func(font string) []byte {
+		t.Helper()
+		data, _, err := renderSheet(context.Background(), path, probe, sheetSpec{Start: 0, End: probe.Duration, Frames: 4, MaxEdge: maxImageEdge, FontFile: font})
+		require.NoError(t, err, font)
+		decodeSheet(t, data, maxImageEdge)
+		return data
+	}
 
-	// A regular file that is not a font makes drawtext fail: so the escaped path really reached it.
-	notFont := filepath.Join(dir, "not, a [font].ttf")
-	require.NoError(t, os.WriteFile(notFont, []byte("not a font"), 0o600))
-	spec.FontFile = notFont
-	_, _, err = renderSheet(context.Background(), path, probe, spec)
-	assert.ErrorIs(t, err, errUnsupportedMedia)
+	// drawtext quietly falls back to a default font when it cannot load
+	// fontfile (through fontconfig on Linux), so a render that works proves
+	// little. The odd path must draw exactly like the same font at a plain
+	// path, and unlike the built-in font a fallback would use.
+	plain := render(copyFile(t, other, filepath.Join(t.TempDir(), "plain.ttf")))
+	assert.Equal(t, plain, render(odd), "drawtext loaded the font through both escaping levels")
+	assert.NotEqual(t, plain, render(builtIn), "the two fonts draw differently")
 }
 
 func TestResolveFontFile(t *testing.T) {
