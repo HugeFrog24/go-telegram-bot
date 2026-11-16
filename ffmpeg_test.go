@@ -692,6 +692,78 @@ func TestParseProbe(t *testing.T) {
 	})
 }
 
+// Two invariants the stay on ffmpeg 8.1.3 relies on (Ruling 20 item 3), over
+// every argument vector the bot builds: the probe for every kind and the
+// demuxer each accepts, the render for every kind and plan (a sheet, one
+// frame, an unknown duration, with and without a font, each alpha decoder),
+// and the version check.
+//   - AV1 decodes through libdav1d alone: no decoder list, and no input
+//     -c:v, holds ffmpeg's native av1 decoder.
+//   - Nothing reaches for swscale's flags (sws_flags) or anything
+//     "unstable", such as SWS_UNSTABLE's ops backend, whose fixes are in
+//     9.0 only.
+func TestToolArgs_Invariants(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	in := filepath.Join(t.TempDir(), "media")
+	runs := map[string][]string{"version": {"-hide_banner", "-version"}}
+	for kind, formats := range kindFormats {
+		for _, demuxer := range formats {
+			runs["probe "+kind+" "+demuxer] = probeArgs(in, formats, demuxer)
+		}
+	}
+	const mov, mkv = "mov,mp4,m4a,3gp,3g2,mj2", "matroska,webm"
+	probes := map[string]mediaProbe{
+		"video h264":           {Format: mov, Codec: "h264", Duration: 37, Width: 720, Height: 1280},
+		"video hevc":           {Format: mov, Codec: "hevc", Duration: 12, Width: 3840, Height: 2160, StartTime: 0.5, ContainerStart: 0.5},
+		"video av1":            {Format: mkv, Codec: "av1", Duration: 12, Width: 1920, Height: 1080},
+		"video vp9, no length": {Format: mkv, Codec: "vp9", Width: 640, Height: 360},
+		"video_note":           {Format: mov, Codec: "h264", Duration: 30, Width: 384, Height: 384},
+		"animation gif":        {Format: "gif", Codec: "gif", Duration: 2, Width: 160, Height: 120},
+		"animation mp4":        {Format: mov, Codec: "h264", Duration: 4, Width: 480, Height: 270},
+		"sticker vp9 alpha":    {Format: mkv, Codec: "vp9", Duration: 3, Width: 512, Height: 512, HasAlpha: true},
+		"sticker vp8 alpha":    {Format: mkv, Codec: "vp8", Duration: 3, Width: 512, Height: 512, HasAlpha: true},
+		"sticker vp9 opaque":   {Format: mkv, Codec: "vp9", Duration: 3, Width: 512, Height: 512},
+	}
+	for name, probe := range probes {
+		edge, frames := maxImageEdge, maxVideoSheetFrames
+		if strings.HasPrefix(name, "sticker") {
+			edge, frames = stickerSheetEdge, stickerSheetFrames
+		}
+		for _, spec := range []sheetSpec{
+			{Start: 0, End: probe.Duration, Frames: frames, MaxEdge: edge},
+			{Start: probe.Duration / 2, Frames: 1, MaxEdge: edge},
+			{Start: 0, End: probe.Duration, Frames: maxVideoMaxFramesPerLookup, MaxEdge: minSheetEdge},
+		} {
+			plan, err := planSheet(probe, spec)
+			require.NoError(t, err, "%s %+v", name, spec)
+			for _, font := range []string{"", "/fonts/DejaVuSans.ttf"} {
+				runs[fmt.Sprintf("render %s, %d frames, font %q", name, spec.Frames, font)] = renderArgs(in, plan, font, 120)
+			}
+		}
+	}
+	alpha := 0
+	for name, args := range runs {
+		for i, arg := range args {
+			lower := strings.ToLower(arg)
+			assert.NotContains(t, lower, "sws_flags", "%s: %q", name, arg)
+			assert.NotContains(t, lower, "unstable", "%s: %q", name, arg)
+			if i == 0 {
+				continue
+			}
+			switch args[i-1] {
+			case "-codec_whitelist":
+				assert.NotContains(t, strings.Split(arg, ","), "av1", "%s: the native av1 decoder", name)
+				assert.Contains(t, strings.Split(arg, ","), "libdav1d", "%s: AV1 through libdav1d", name)
+			case "-c:v":
+				if args[i+1] == "-i" || slices.Contains(args[i+1:], "-i") {
+					alpha++
+					assert.NotEqual(t, "av1", arg, "%s: an input decoder", name)
+				}
+			}
+		}
+	}
+	assert.Equal(t, 2*2*3, alpha, "the alpha path is covered: two codecs, two fonts, three specs")
+}
+
 func TestToolArgs_Probe(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	in := filepath.Join(t.TempDir(), "media")
 	got := probeArgs(in, []string{"mov", "matroska"}, "mov")
