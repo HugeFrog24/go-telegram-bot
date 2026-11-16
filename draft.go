@@ -257,6 +257,11 @@ func (b *Bot) newAnswerOutput(turnCtx context.Context, turn *chatTurn, to replyT
 
 	return replyOutput{
 		onSegment: func(seg string) error {
+			if turnCtx.Err() != nil {
+				// Cancelled (restart, Stop, /clear): the stream may still hold
+				// text that arrived first, but nothing more goes out.
+				return nil
+			}
 			b.markCommitted(turn)
 			return b.sendOneSegment(turnCtx, to, seg)
 		},
