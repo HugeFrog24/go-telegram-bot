@@ -34,13 +34,14 @@ const (
 // section of docs/superpowers/research/2026-11-16-untrusted-video-parsing-decisions.md
 // ("item N" below refers to it).
 const (
-	toolMaxPixels   = 16777216 // -max_pixels on both tools (item 5)
-	probeMaxSide    = 8192     // the probe refuses a wider or taller stream (item 5)
-	probeMaxArea    = 16777216 // ... or one with more pixels (item 5)
-	toolMaxStreams  = 32       // -max_streams on both tools (item 6)
-	toolThreads     = 2        // -threads as an input option (item 6)
-	toolOutputLimit = 8 << 20  // stdout bytes a run may write; one more kills it (item 7)
-	toolStderrTail  = 64 << 10 // stderr bytes kept for the log (item 7)
+	toolMaxAlloc    = 134217728 // -max_alloc on both tools: the largest single allocation (Ruling 12 item 1)
+	toolMaxPixels   = 16777216  // -max_pixels on both tools (item 5)
+	probeMaxSide    = 8192      // the probe refuses a wider or taller stream (item 5)
+	probeMaxArea    = 16777216  // ... or one with more pixels (item 5)
+	toolMaxStreams  = 32        // -max_streams on both tools (item 6)
+	toolThreads     = 2         // -threads as an input option (item 6)
+	toolOutputLimit = 8 << 20   // stdout bytes a run may write; one more kills it (item 7)
+	toolStderrTail  = 64 << 10  // stderr bytes kept for the log (item 7)
 	toolWaitDelay   = 2 * time.Second
 )
 
@@ -353,7 +354,7 @@ func toolArgs(r toolRun) []string {
 	if ffmpeg {
 		args = append(args, "-nostdin")
 	}
-	args = append(args, "-loglevel", "error")
+	args = append(args, "-loglevel", "error", "-max_alloc", strconv.Itoa(toolMaxAlloc))
 	if ffmpeg {
 		args = append(args, "-timelimit", strconv.Itoa(r.timeLimit), "-filter_threads", "1", "-copyts")
 	}

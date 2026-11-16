@@ -16,6 +16,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -459,7 +460,7 @@ func TestToolArgs_Probe(t *testing.T) { //NOSONAR go:S100 -- underscore separati
 	in := filepath.Join(t.TempDir(), "media")
 	got := toolArgs(toolRun{tool: "ffprobe", formats: "mov,matroska", codecs: probeCodecs, input: in, output: probeOutput})
 	assert.Equal(t, []string{
-		"-hide_banner", "-loglevel", "error",
+		"-hide_banner", "-loglevel", "error", "-max_alloc", "134217728",
 		"-protocol_whitelist", "file", "-format_whitelist", "mov,matroska",
 		"-codec_whitelist", probeCodecs, "-max_pixels", "16777216", "-max_streams", "32", "-threads", "2",
 		"-i", "file:" + in,
@@ -469,6 +470,35 @@ func TestToolArgs_Probe(t *testing.T) { //NOSONAR go:S100 -- underscore separati
 	assert.NotContains(t, got, "-nostdin", "ffprobe rejects -nostdin; its stdin stays nil")
 	assert.NotContains(t, got, "-timelimit", "ffprobe rejects -timelimit")
 	assertNoForbiddenArgs(t, got)
+}
+
+// -max_alloc reaches both tools' allocator: the probe and render runs work
+// with the real cap, and the same runs with it lowered to 16 KiB fail.
+func TestToolArgs_MaxAlloc(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	path := ffmpegFixture(t, mp4Args...)
+	probe, err := probeMedia(context.Background(), path, "video")
+	require.NoError(t, err)
+	plan, err := planSheet(probe, sheetSpec{Start: 0, End: probe.Duration, Frames: 4, MaxEdge: maxImageEdge})
+	require.NoError(t, err)
+	for tool, args := range map[string][]string{
+		"ffprobe": probeArgs(path, kindFormats["video"]),
+		"ffmpeg":  renderArgs(path, plan, resolveFontFile(""), 120),
+	} {
+		t.Run(tool, func(t *testing.T) {
+			i := slices.Index(args, "-max_alloc")
+			require.GreaterOrEqual(t, i, 0, "%s gets -max_alloc", tool)
+			assert.Equal(t, strconv.Itoa(toolMaxAlloc), args[i+1])
+			_, err := runTool(context.Background(), tool, filepath.Dir(path), args)
+			require.NoError(t, err, "the real cap leaves a normal file alone")
+
+			low := slices.Clone(args)
+			low[i+1] = "16384"
+			_, err = runTool(context.Background(), tool, filepath.Dir(path), low)
+			var te *toolError
+			assert.ErrorAs(t, err, &te, "a 16 KiB cap fails the run, so the option is in effect")
+		})
+	}
 }
 
 // assertNoForbiddenArgs checks the security decisions' never-list.
@@ -1238,7 +1268,7 @@ func TestToolArgs_Render(t *testing.T) { //NOSONAR go:S100 -- underscore separat
 	require.NoError(t, err)
 	got := renderArgs(in, plan, `C:\Windows\Fonts\arial.ttf`, 120)
 	assert.Equal(t, []string{
-		"-hide_banner", "-nostdin", "-loglevel", "error",
+		"-hide_banner", "-nostdin", "-loglevel", "error", "-max_alloc", "134217728",
 		"-timelimit", "120", "-filter_threads", "1", "-copyts",
 		"-protocol_whitelist", "file", "-format_whitelist", "mov", "-f", "mov",
 		"-codec_whitelist", renderCodecs, "-max_pixels", "16777216", "-max_streams", "32", "-threads", "2",
