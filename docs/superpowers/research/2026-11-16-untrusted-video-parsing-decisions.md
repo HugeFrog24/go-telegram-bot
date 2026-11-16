@@ -126,3 +126,27 @@ Numbers like "#5" refer to rows of the research's recommendation table.
 - #24: `-err_detect explode`.
 - #25: running ffmpeg under another UID via `Credential`.
 - (#20 `-timelimit` is now adopted; see Task 2 item 10.)
+
+## Addendum: blind review of Task 1 (Ruling 9)
+
+The blind security review of Task 1 (the config block and the on/off gate) raised these points. They are binding like the rest of this file.
+
+- **Task 2: absolute tool paths.**
+  - `ffmpeg.go` gets `lookupTool(name string) (string, error)`: `exec.LookPath`, then an error unless `filepath.IsAbs(result)`. An `exec.ErrDot` result, or a relative one under `GODEBUG=execerrdot=0`, is an error.
+  - Every run uses the absolute path that `lookupTool` returns. Resolve it per run, with no caching, so tests that set PATH keep working.
+  - `resolveVideo` in `bot.go` switches to `lookupTool`.
+  - Also add a field comment on `Bot.video`: it is the only switch for the feature, and later code must never test `b.config.Video`.
+- **Task 2: decode window.**
+  - `renderSheet` passes an input `-t <window>` before `-i`. For `Frames > 1` the window is `End − Start` plus one frame step; for `Frames == 1` it is a small constant, such as 1 s.
+  - This bounds the decode work even when the container's duration is a lie. The wall-clock timeouts, the semaphore and the pixel caps from Task 2 items 5–10 stay as they are.
+- **Task 2: font file.** `resolveFontFile` accepts the configured path only when it is absolute and names a regular file. Otherwise it logs once and falls back to the built-in candidates. The path is still escaped as item 11 says, and it is never shown to users.
+- **Task 3: total-size cap.**
+  - The video store gets a per-bot cap, `maxVideoStoreBytes = 2 GiB`, as a constant.
+  - After each save, the oldest videos are deleted first until the total is under the cap. Their records then read as expired, the same path as retention.
+  - Task 8's README states the cap.
+  - **Why:** retention limits age only, and the rate limiter is per user, so many senders could fill the data volume and break the SQLite database next to it.
+- **Declined:**
+  - A per-turn frame budget. Each lookup returns one tiled image, and `max_lookups` ≤ 20 plus `maxToolSteps` bound the number of calls.
+  - An owner-only mode. The feature is already opt-in per bot.
+  - A lower maximum for `retention_hours`. The size cap bounds the disk.
+  - Naming the missing tool in the gate log. The log string is set by the plan.
