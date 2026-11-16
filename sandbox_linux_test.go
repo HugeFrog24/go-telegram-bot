@@ -349,6 +349,15 @@ var probeActions = map[string]func(args []string) error{
 	},
 	// pdeathsig: clear the parent-death signal, to outlive the bot.
 	"pdeathsig": func([]string) error { return unix.Prctl(unix.PR_SET_PDEATHSIG, 0, 0, 0, 0) },
+	// mlock <bytes>: lock that much of its own memory, as libgcrypt locks
+	// 16 KiB of secure memory on Ubuntu.
+	"mlock": func(args []string) error {
+		n, err := strconv.Atoi(args[0])
+		if err != nil {
+			return err
+		}
+		return unix.Mlock(make([]byte, n))
+	},
 	// futex-lock-pi: take an uncontended priority-inheriting futex of its
 	// own, a kernel path with a history of bugs (CVE-2014-3153).
 	"futex-lock-pi": func([]string) error {
@@ -835,6 +844,20 @@ func TestKernelUIDTasks_Terminates(t *testing.T) { //NOSONAR go:S100 -- undersco
 	assert.LessOrEqual(t, *calls, 128)
 }
 
+// A tool may lock only 64 KiB of memory (RLIMIT_MEMLOCK, Ruling 19 item 3),
+// not all of its 1.5 GiB: libgcrypt's 16 KiB still fits (the Ubuntu
+// renders take that path on every run), 128 KiB does not.
+func TestMediaSandbox_LockedMemoryCap(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	allowUnsandboxedWhereNeeded(t)
+	standInTool(t, "sandbox-probe")
+	_, err := runTool(context.Background(), "sandbox-probe", inputDir(t), "", []string{"mlock", "16384"})
+	require.NoError(t, err, "16 KiB fits: %q", toolStderr(err))
+	_, err = runTool(context.Background(), "sandbox-probe", inputDir(t), "", []string{"mlock", "131072"})
+	var te *toolError
+	require.ErrorAs(t, err, &te, "128 KiB is over the cap")
+	assert.Contains(t, te.Stderr(), "cannot allocate memory")
+}
+
 // A tool cannot exhaust the uid's tasks: RLIMIT_NPROC holds it to the
 // uid's task count at its start plus toolThreadHeadroom (Ruling 18 item 2).
 // A stand-in that starts 64 threads, well within its 32 GiB of address
@@ -1056,6 +1079,7 @@ func TestMediaSandbox_Limits(t *testing.T) { //NOSONAR go:S100 -- underscore sep
 	assert.Equal(t, []string{"0", "0", "bytes"}, limitFields(t, limits, "Max core file size"))
 	assert.Equal(t, []string{"0", "0", "bytes"}, limitFields(t, limits, "Max file size"))
 	assert.Equal(t, []string{"64", "64", "files"}, limitFields(t, limits, "Max open files"), "Go's exec must not restore its saved limit")
+	assert.Equal(t, []string{"65536", "65536", "bytes"}, limitFields(t, limits, "Max locked memory"), "RLIMIT_MEMLOCK: 64 KiB (Ruling 19 item 3)")
 	cpu := strconv.Itoa(cpuTimeLimit(context.Background())) // twice the call's timeout (Ruling 16 item 2)
 	assert.Equal(t, []string{cpu, cpu, "seconds"}, limitFields(t, limits, "Max cpu time"), "ffprobe has no -timelimit: RLIMIT_CPU covers both tools")
 	tasks := limitFields(t, limits, "Max processes") // RLIMIT_NPROC: the user's tasks at the start plus toolThreadHeadroom (Ruling 18 item 2)

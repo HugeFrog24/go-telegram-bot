@@ -44,6 +44,12 @@ const sandboxExe = "/proc/self/exe"
 // toolOpenFiles is RLIMIT_NOFILE inside the sandbox.
 const toolOpenFiles = 64
 
+// toolLockedMemory is RLIMIT_MEMLOCK inside the sandbox, in bytes (Ruling 19
+// item 3): the only mlock the traces saw is libgcrypt's 16 KiB of secure
+// memory on Ubuntu, and the rest of the 1.5 GiB a tool may map stays
+// swappable.
+const toolLockedMemory = 64 << 10
+
 // toolThreadHeadroom is how many tasks a tool may add to its user's count
 // (RLIMIT_NPROC, Ruling 18 item 2): ffmpeg's decoder, filter and encoder
 // threads with room to spare, but no thread bomb. With compose's pids_limit
@@ -412,15 +418,16 @@ type lastLimits struct {
 	tasks  uint64 // the user's tasks
 }
 
-// setToolLimits sets core and file size to 0, open files to toolOpenFiles
-// and CPU time to cpu seconds (Ruling 16 item 2: ffprobe has no -timelimit),
-// and works out the last limits: the address space, memory, where a hard
-// limit already below it is an error, never clamped (Ruling 14 note 3), and
-// the user's tasks, its count now plus toolThreadHeadroom (Ruling 18 item
-// 2), counted here, before Landlock takes /proc away. A lower inherited
-// open-files, CPU or task hard limit is kept: it is only stricter.
+// setToolLimits sets core and file size to 0, open files to toolOpenFiles,
+// locked memory to toolLockedMemory and CPU time to cpu seconds (Ruling 16
+// item 2: ffprobe has no -timelimit), and works out the last limits: the
+// address space, memory, where a hard limit already below it is an error,
+// never clamped (Ruling 14 note 3), and the user's tasks, its count now plus
+// toolThreadHeadroom (Ruling 18 item 2), counted here, before Landlock takes
+// /proc away. A lower inherited open-files, locked-memory, CPU or task hard
+// limit is kept: it is only stricter.
 func setToolLimits(memory, cpu uint64) (lastLimits, error) {
-	var as, files, cpuTime, tasks syscall.Rlimit
+	var as, files, locked, cpuTime, tasks syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_AS, &as); err != nil {
 		return lastLimits{}, fmt.Errorf("getrlimit RLIMIT_AS: %w", err)
 	}
@@ -430,7 +437,7 @@ func setToolLimits(memory, cpu uint64) (lastLimits, error) {
 	for _, l := range []struct {
 		resource int
 		limit    *syscall.Rlimit
-	}{{syscall.RLIMIT_NOFILE, &files}, {syscall.RLIMIT_CPU, &cpuTime}, {unix.RLIMIT_NPROC, &tasks}} {
+	}{{syscall.RLIMIT_NOFILE, &files}, {unix.RLIMIT_MEMLOCK, &locked}, {syscall.RLIMIT_CPU, &cpuTime}, {unix.RLIMIT_NPROC, &tasks}} {
 		if err := syscall.Getrlimit(l.resource, l.limit); err != nil {
 			return lastLimits{}, fmt.Errorf("getrlimit %d: %w", l.resource, err)
 		}
@@ -451,6 +458,7 @@ func setToolLimits(memory, cpu uint64) (lastLimits, error) {
 		{"RLIMIT_CORE", syscall.RLIMIT_CORE, 0},
 		{"RLIMIT_FSIZE", syscall.RLIMIT_FSIZE, 0},
 		{"RLIMIT_NOFILE", syscall.RLIMIT_NOFILE, min(toolOpenFiles, files.Max)},
+		{"RLIMIT_MEMLOCK", unix.RLIMIT_MEMLOCK, min(toolLockedMemory, locked.Max)},
 		{"RLIMIT_CPU", syscall.RLIMIT_CPU, min(cpu, cpuTime.Max)},
 	} {
 		// syscall's Setrlimit, not unix's: for RLIMIT_NOFILE it also stops
