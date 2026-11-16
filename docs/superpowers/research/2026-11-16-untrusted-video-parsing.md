@@ -36,7 +36,7 @@ Research for the video-watching feature (Task 0 of `docs/superpowers/plans/2026-
 3. **Most memory-corruption CVEs sit in codecs a 20 MB Telegram video never needs.** They can still reach the process inside an allowed container:
    - **Examples:** MagicYUV (CVE-2026-8461), CineForm (CVE-2026-70632), JPEG 2000 (CVE-2025-9951) and VVC (CVE-2026-125244) inside MOV/MKV.
    - **Fix:** an explicit decoder allowlist (`-codec_whitelist`). It cuts the 544 decoders in the local build [L2] to about 8.
-   - **Pitfall found locally:** ffprobe exits 1 if **any** stream's decoder is off the list. The probe call needs a longer list (with common audio decoders) than the render call [L5, L6; `ffprobe.c` lines 2659–2662, S39].
+   - **Pitfall found locally:** ffprobe exits 1 if **any** stream's decoder is off the list. The probe call needs a longer list than the render call [L5, L6; `ffprobe.c` lines 2659–2662, S39]. It adds common audio, simple PCM, text subtitles and cover art (§6.1, verified on 20 clips [L16]).
 4. **ffprobe has no `-nostdin`.** `ffprobe -nostdin` fails with "Option not found" [L9]. The global constraint "every ffmpeg/ffprobe call uses `-nostdin`" must say `-nostdin` for ffmpeg only. For ffprobe, `cmd.Stdin` stays nil (the null device) [S37].
 5. **Input options must come before `-i`.**
    - `-protocol_whitelist file` placed after `-i` becomes an output option. It then blocks the `pipe:1` output [L8].
@@ -236,7 +236,7 @@ Targets: **Task 2** (ffmpeg flags, allowlists, limits), **Task 8** (Docker image
 | # | Recommendation (exact) | Threats | Cost here | Target |
 |---|---|---|---|---|
 | 1 | Pass **`-format_whitelist mov,matroska,gif`** as an input option (before `-i`) on **every** ffprobe and ffmpeg call: probe, first sheet, sticker sheet, every lookup. Keep the planned `format_name` prefix check as a second line. Correct the hardening line: `-protocol_whitelist file` alone does not stop local file reads. Verified [L4]: short names match the full `mov,mp4,m4a,3gp,3g2,mj2` names, and HLS is refused in both tools. | T1–T7, T9 | 1 argument; test: the `.m3u8` fixture fails with "Format not on whitelist" | **Task 2** |
-| 2 | **Decoder allowlists.** Render (ffmpeg): `-codec_whitelist h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,libaom-av1,gif` plus `-map 0:V:0 -an -sn -dn`. Probe (ffprobe): the same list plus `aac,aac_fixed,mp3,mp3float,opus,libopus,vorbis,libvorbis,flac,alac,ac3,eac3,pcm_s16le,pcm_s16be,pcm_s24le,pcm_f32le,amrnb,amrwb,libopencore_amrnb,libopencore_amrwb,mov_text`, because ffprobe exits 1 if any stream's decoder is refused [L5]. Also check in Go that the chosen video stream's `codec_name` ∈ {h264, hevc, vp8, vp9, av1, gif}. Keep native `av1` off both lists (hwaccel-only [L10]; CVE-2026-30997). Verified on 8 clips [L6, L11]. Trade-off: files with an unlisted audio codec, or with **cover art** (PNG/MJPEG attached picture), fail the probe and become "could not be decoded" [L14]. Adding `mjpeg,png` to the probe list only would accept them, at the cost of two more decoders (CVE-2026-125255, a UAF in mjpegdec, is open in 9.0.2). Controller's call; default: reject. | T11, T12 | two constant lists plus one check | **Task 2** |
+| 2 | **Decoder allowlists.** Render (ffmpeg): `-codec_whitelist h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,libaom-av1,gif` plus `-map 0:V:0 -an -sn -dn`. Probe (ffprobe): the **probe list in §6.1**, which adds common audio, simple PCM, text-subtitle and cover-art decoders to the video list. The probe needs the longer list because ffprobe exits 1 if any stream's decoder is refused [L5]. The probe-only decoders run only during ffprobe's stream-info decode: the render maps only `0:V:0` and uses the video list. Also check in Go that the chosen video stream's `codec_name` ∈ {h264, hevc, vp8, vp9, av1, gif}. Keep native `av1` off both lists (hwaccel-only [L10]; CVE-2026-30997). Verified on 20 synthetic clips [L6, L11, L16]. §6.1 has the full inventory of what is still rejected, and why. | T11, T12 | two constant lists plus one check | **Task 2** |
 | 3 | **Fix the flag line.** `-nostdin` is for **ffmpeg only**: ffprobe rejects it [L9]; leave `cmd.Stdin` nil. Every input option goes before `-i`, since after `-i` it applies to the output [L8, S15]. Pass the input as `"file:" + absolute path` (works on Windows too [L4]). Add `-hide_banner -loglevel error` to both. | T13; constraint fix | trivial | **Task 2** |
 | 4 | **Bot-chosen file names.** Download to `<ref>` with **no extension**; probing works from content [L4]. After the probe, rename using a fixed map: `mov…`→`.mp4`, `matroska,webm`→`.webm`, `gif`→`.gif`. Never use the extension from Telegram's `file_path` or the user's `file_name`. | T7 | small helper; Tasks 3/5 call it when naming files | **Task 2** |
 | 5 | **Pixel caps.** Probe-side: reject if width or height > 4096 or width × height > 8,294,400 (3840×2160, as Mastodon and pict-rs do [S23, S25]). Decoder-side on both tools: **`-max_pixels 16777216`**, which also catches mid-stream resolution changes. Keep the headroom: the decoder checks the *coded* size (a 720×1280 clip was checked as 768×1280 [L7]), so a cap of 8,294,400 would reject real 4K. Verified that it does not break 3840×2160 [L11]. | T10 | 1 argument plus 1 check | **Task 2** |
@@ -272,12 +272,46 @@ Targets: **Task 2** (ffmpeg flags, allowlists, limits), **Task 8** (Docker image
 - T14: #9;
 - T15: #8, #14, #16.
 
+### 6.1 Probe decoder inventory (for #2)
+
+ffprobe opens a decoder for every stream, and exits 1 when one is refused [L5; `ffprobe.c` L2659–2662, S39]. So each stream class in a legitimate file needs a decision. "Probe-only" decoders are reached only by ffprobe's stream-info decode, never by the render, which maps `0:V:0` with the video list.
+
+| Stream class | codec_name → decoder name(s) | Decision | Reason |
+|---|---|---|---|
+| Main video | h264, hevc, vp8, vp9 (`libvpx`, `libvpx-vp9`), av1 (`libdav1d`, `libaom-av1`), gif | **add** (also on the render list) | the formats the bot watches; native `av1` stays off (hwaccel-only [L10]) |
+| Common audio | aac (`aac`, `aac_fixed`), mp3 (`mp3`, `mp3float`), mp2 (`mp2`, `mp2float`), opus (`opus`, `libopus`), vorbis (`vorbis`, `libvorbis`), flac, alac, ac3, eac3 | **add**, probe only | AAC is in phone video, Opus/Vorbis in WebM, MP2 in broadcast/DV-era files. The only 2022+ NVD record near mp2 (CVE-2026-125072) is in the `mp3adu` decoder through the libavcodec API, not mp2 [S2] |
+| AMR (3GP phones) | amrnb, amrwb, `libopencore_amrnb`, `libopencore_amrwb` | **add**, probe only | old phone recordings |
+| Simple PCM | pcm_s8, pcm_u8, pcm_s16le/be, pcm_s24le/be, pcm_s32le/be, pcm_f32le/be, pcm_f64le/be, pcm_mulaw, pcm_alaw | **add**, probe only | cameras write PCM in MOV: `pcm_s24be` failed the old list [L16]. No decoder CVE for these in the 2022+ NVD set. The PCM records there are `pcm_bluray` (CVE-2026-125214: M2TS, big-endian hosts) and the `pcm_dvd` **encoder** (CVE-2026-125194), so those two stay off [S2] |
+| QuickTime ADPCM | adpcm_ima_qt | **add**, probe only | old QuickTime files; the only ADPCM record in the set is an encoder (CVE-2026-125195) [S2] |
+| Other audio | wmav1/wmav2, wmapro, cook, ape, tak, dts (`dca`), truehd, mlp, … | **reject** | rare in phone/Telegram video, and several have open records: cook (CVE-2026-125182, CVE-2026-125203), ape (CVE-2026-125104), tak (CVE-2026-125102) [S2]. WMAv2 verified rejected [L16] |
+| Text subtitles | mov_text, subrip (ffprobe opens decoder **`srt`**), ass (opens **`ssa`**), webvtt, text | **add**, probe only; list both names (`srt,subrip,ssa,ass`) | MKV+SRT, MKV+ASS and WebM+WebVTT all failed the old list [L16]. `subrip` alone and `ass` alone are not enough [L17]. No decoder CVEs for these in the 2022+ NVD set [S2] |
+| Bitmap subtitles | dvd_subtitle, hdmv_pgs_subtitle, dvb_subtitle, xsub | **reject** | rare in user video. Recent memory-corruption records in this family: DVD subtitle parser OOB write (CVE-2026-6385), DVB subtitle parser heap overflow (CVE-2026-70628) [S2]. **Not tested locally:** ffmpeg has no text→bitmap path to generate them |
+| Data / timecode tracks | tmcd, iPhone metadata (`mebx`) | nothing to add | these have no decoder, so ffprobe skips them. Verified with `tmcd` [L6, L16]; `mebx` not generated (unverified) |
+| Matroska attachments (fonts) | ttf/otf | nothing to add | no decoder; verified [L16] |
+| **Attached pictures (cover art)** | png, mjpeg | **add, probe only** (default flipped from "reject") | The two mjpegdec records open in 9.0.2 are reached only through hwaccel. CVE-2026-125245 leaks "under VAAPI or NVDEC decoding"; CVE-2026-125255 passes a stale pointer "to hwaccel decoders like NVDEC". #9 forbids `-hwaccel`, so neither applies. The PNG records in the set are **encoder** bugs (CVE-2026-66040, CVE-2026-125218). The one that applies without hwaccel is CVE-2026-125180: EXIF-parser quadratic memory in JPEG/PNG, **DoS only**, contained by the 10 s probe timeout, #7b and #14 [S2]. The render never decodes covers [L16] |
+| Other secondary video (mpeg4, rawvideo, VVC, …) | — | **reject** | keeps T12 covered |
+
+**Revised probe list** (exact, for Task 2):
+
+```text
+h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,libaom-av1,gif,
+aac,aac_fixed,mp3,mp3float,mp2,mp2float,opus,libopus,vorbis,libvorbis,flac,alac,ac3,eac3,
+amrnb,amrwb,libopencore_amrnb,libopencore_amrwb,adpcm_ima_qt,
+pcm_s8,pcm_u8,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,pcm_s32be,
+pcm_f32le,pcm_f32be,pcm_f64le,pcm_f64be,pcm_mulaw,pcm_alaw,
+mov_text,srt,subrip,ssa,ass,webvtt,text,mjpeg,png
+```
+
+(Written without the line breaks.) The render list is unchanged: `h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,libaom-av1,gif`.
+
+**Still rejected,** as "could not be decoded": files with any stream in the "reject" rows. That means WMA/RealAudio/APE/TAK/DTS/TrueHD audio, bitmap subtitles, or a second video track in another codec.
+
 ### Resulting argument vectors (for Task 2's tests)
 
 ```text
 ffprobe -hide_banner -loglevel error
         -protocol_whitelist file -format_whitelist mov,matroska,gif
-        -codec_whitelist <probe list from #2> -max_pixels 16777216
+        -codec_whitelist <probe list from §6.1> -max_pixels 16777216
         -show_entries <Task 2's choice> -of json
         file:<absolute path>                         # no -nostdin; Stdin nil
 
@@ -310,6 +344,9 @@ Locally, this full render line (with a plain `scale` filter) produced a JPEG for
 - **The Black Hat 2016 slides** [S17] could not be rendered (no PDF text tool locally). The AVI/GAB2 detail comes from a secondary write-up [S19]. The neex README says only that it generates an AVI that leaks a server file [S18]. HackerOne report 237381 (Automattic, ffmpeg SSRF and local file disclosure) needs JavaScript; only its title is known from search.
 - **Discourse:** no server-side ffmpeg was found, but this rests on meta-forum threads, not code.
 - **CVSS of CVE-2025-59728…59734:** not in the NVD keyword results. The FFmpeg security page lists them as fixed in 8.0.
+- **Fix round 1 gaps:**
+  - Bitmap subtitles (DVD, PGS, DVB) and iPhone `mebx` metadata tracks could not be generated locally, so their §6.1 decisions are untested.
+  - The 2–10 album size [S45] was not re-fetched.
 - **Reachability judgements** marked "our reading" (CVE-2025-63757, CVE-2026-107676) come from the CVE text, not code review.
 - **Not tested here:** Linux behaviour of the flag line (all local checks ran on Windows 9.0.2), `drawtext` under a minimal `cmd.Env`, and Alpine's 8.1.3 with the exact lists. Task 2's tests and Task 8's image check cover these.
 
@@ -381,5 +418,46 @@ All accessed 2026-11-16.
 - [L11] The full render line of §6 produced a JPEG for 3840×2160 H.264, AV1 (libaom), HEVC, VP8, GIF and mp4+AAC, and for VP9 alpha via `-c:v libvpx-vp9`. `-max_alloc 268435456` did not break the 4K case.
 - [L12] `ffmpeg -version`: `--enable-avisynth`, `--enable-libaom`, `--enable-libvpx`, no `--enable-libdav1d`. `-buildconf` has no LCEVC.
 - [L13] `grep -ri ffmpeg` over `go-telegram/bot@v1.28.0` in the module cache → no matches.
-- [L14] An MP4 with a PNG cover (`attached_pic`) fails the #2 probe list ("Codec (png) not on whitelist"). The render with `-map 0:V:0` and the video list still succeeds.
+- [L14] An MP4 with a PNG cover (`attached_pic`) failed the first probe list ("Codec (png) not on whitelist"). The render with `-map 0:V:0` and the video list still succeeds. The revised §6.1 list accepts it [L16].
 - [L15] `ffmpeg -protocol_whitelist pipe -ss 2 -i pipe:0` on an MP4 with `mdat` before `moov` → "partial file … Invalid data found when processing input".
+- [L16] Probe-list inventory, 20 synthetic clips (fix round 1).
+  - **Clips:** made with `ffmpeg -f lavfi -i testsrc2=… [-f lavfi -i sine=…]`. Encoders:
+    - core 1: libx265 + `-tag:v hvc1 -c:a aac -timecode 00:00:00:00` in `.mov`;
+    - subtitles: `-i subs.srt -c:s srt|ass|webvtt|mov_text`;
+    - audio: `-c:a pcm_s24be|pcm_f32be|pcm_s32le|pcm_mulaw|pcm_alaw|adpcm_ima_qt` in `.mov`, and `-c:a mp2|wmav2` in `.mkv`;
+    - covers: `-disposition:v:1 attached_pic` with a PNG or JPEG;
+    - attachment: `-attach font.ttf -metadata:s:t mimetype=font/ttf`.
+  - **Probe command:** `ffprobe -hide_banner -v error -protocol_whitelist file -format_whitelist mov,matroska,gif -codec_whitelist <list> -max_pixels 16777216 -show_entries format=format_name -of csv=p=0 file:<abs>`, run with the old list (#2 as first published) and the revised §6.1 list.
+  - **Render command:** the §6 render line with `-ss 0.5 -vf scale=320:-2`, plus `-c:v libvpx-vp9` for the sticker.
+
+  | Clip (streams) | old probe rc | revised probe rc | render rc |
+  |---|---|---|---|
+  | core 1 iPhone-like `.mov` (hevc, aac, tmcd data) | 0 | 0 | 0 |
+  | core 2 Android-like `.mp4` (h264, aac) | 0 | 0 | 0 |
+  | core 3 round video 640×640 `.mp4` (h264, aac) | 0 | 0 | 0 |
+  | core 4 GIF | 0 | 0 | 0 |
+  | core 5 VP9-alpha sticker `.webm` | 0 | 0 | 0 |
+  | MKV + SRT (subrip) | **1** | 0 | 0 |
+  | MKV + ASS | **1** | 0 | 0 |
+  | WebM + WebVTT | **1** | 0 | 0 |
+  | MP4 + mov_text | 0 | 0 | 0 |
+  | MOV + pcm_s24be / pcm_f32be / pcm_s32le / pcm_mulaw / pcm_alaw | **1** each | 0 each | 0 each |
+  | MOV + adpcm_ima_qt | **1** | 0 | 0 |
+  | MKV + mp2 | **1** | 0 | 0 |
+  | MP4 + PNG cover (attached_pic) | **1** | 0 | 0 |
+  | MP4 + MJPEG cover (attached_pic) | **1** | 0 | 0 |
+  | MKV + font attachment | 0 | 0 | 0 |
+  | MKV + wmav2 (negative control) | 1 | **1** ("Codec (wmav2) not on whitelist") | 0 |
+
+- [L17] Decoder names, each tested with `-codec_whitelist h264,aac,vp8,<one name>`:
+
+  | Clip | Name(s) tested | rc |
+  |---|---|---|
+  | MKV + SRT | `subrip` alone | 1 ("Codec (srt)") |
+  | MKV + SRT | `srt` | 0 |
+  | MKV + ASS | `ass` alone | 1 ("Codec (ssa)") |
+  | MKV + ASS | `ssa` | 0 |
+  | WebM + WebVTT | `webvtt` | 0 |
+  | MP4 + mov_text | `mov_text` | 0 |
+
+  `ffmpeg -decoders` lists both `srt` ("codec subrip") and `subrip`, and both `ssa` ("codec ass") and `ass`.
