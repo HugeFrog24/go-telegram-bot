@@ -868,6 +868,24 @@ func TestMediaSandbox_RenderSameAsUnsandboxed(t *testing.T) { //NOSONAR go:S100 
 	assert.True(t, err != nil || !bytes.Equal(out, sandboxed), "the font rule is what lets ffmpeg read the font")
 }
 
+// With no font file at all, drawtext asks fontconfig for its default, which
+// reads its configuration and the font directories and tries to write and
+// chmod its cache. That fallback still renders under the sandbox, the seccomp
+// allowlist included (Ruling 18 item 1).
+func TestMediaSandbox_NoFontFallback(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	requireLandlock(t)
+	clip := ffmpegFixture(t, mp4Args...)
+	ctx := context.Background()
+	probe, err := probeMedia(ctx, clip, "video")
+	require.NoError(t, err, "%q", toolStderr(err))
+	plan, err := planSheet(probe, sheetSpec{Start: 0, End: probe.Duration, Frames: 4, MaxEdge: 512})
+	require.NoError(t, err)
+	out, err := runTool(ctx, "ffmpeg", filepath.Dir(clip), "", renderArgs(clip, plan, "", 120))
+	require.NoError(t, err, "%q", toolStderr(err))
+	decodeSheet(t, out, 512)
+}
+
 // On ABI 4 and later a sandboxed tool cannot open a TCP connection, not even
 // to the loopback; the same stand-in connects fine outside the sandbox. The
 // seccomp filter refuses the socket itself; without it ("noseccomp-")
