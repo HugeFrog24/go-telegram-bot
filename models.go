@@ -68,6 +68,11 @@ type ChatMemory struct {
 	Size                 int
 	BusinessConnectionID string
 
+	// generation tells this memory from the one /clear dropped before it: a
+	// turn files its reply only into the memory it read (fileReply). Set
+	// once, when the memory is created.
+	generation uint64
+
 	// answeredThrough is the highest sequence a model turn's recorded reply
 	// covered: every answerable user message at or below it has been
 	// answered. Written under chatMemoriesMu; read under turnsMu too, where

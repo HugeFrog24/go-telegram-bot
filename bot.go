@@ -38,8 +38,9 @@ type Bot struct {
 	turnSeq         uint64
 
 	// memorySeq is the last sequence given to a message in chat memory
-	// (Message.Seq). Guarded by chatMemoriesMu.
-	memorySeq uint64
+	// (Message.Seq), and memoryGen the last generation given to a chat
+	// memory (ChatMemory.generation). Guarded by chatMemoriesMu.
+	memorySeq, memoryGen uint64
 
 	// ElevenLabs endpoints: fields so tests can point them at a stand-in.
 	sttURL, ttsURL string
@@ -416,7 +417,8 @@ func (b *Bot) getOrCreateChatMemory(chatID int64) *ChatMemory {
 		return chatMemory
 	}
 	history := b.loadChatHistory(chatID)
-	chatMemory = &ChatMemory{Messages: make([]Message, 0, len(history)), Size: b.memorySize * 2}
+	b.memoryGen++
+	chatMemory = &ChatMemory{Messages: make([]Message, 0, len(history)), Size: b.memorySize * 2, generation: b.memoryGen}
 	for _, message := range history {
 		b.insertLocked(chatMemory, message, len(chatMemory.Messages))
 	}
@@ -564,10 +566,19 @@ func (b *Bot) insertLocked(chatMemory *ChatMemory, message Message, at int) Mess
 // The reply is stamped, stored and inserted in one step under the memory
 // lock, so nothing can join between choosing its slot and its timestamp: a
 // reload, which goes by timestamp, then keeps memory's order (replyStamp).
-func (b *Bot) fileReply(chatMemory *ChatMemory, reply *Message, frontier, covered uint64) ([]uint, error) {
+//
+// A turn that read a memory /clear has since dropped (memoryGen no longer
+// the chat's) answers a history that is gone: its reply is stored aside and
+// not filed.
+func (b *Bot) fileReply(chatMemory *ChatMemory, reply *Message, frontier, covered, memoryGen uint64) ([]uint, error) {
 	b.chatMemoriesMu.Lock()
 	defer b.chatMemoriesMu.Unlock()
 
+	if memoryGen != 0 && (memoryGen != chatMemory.generation || b.chatMemories[reply.ChatID] != chatMemory) {
+		InfoLogger.Printf("[%s] reply for chat %d kept aside: the history it answers was cleared", b.config.ID, reply.ChatID)
+		reply.Aside = true
+		return nil, b.storeMessage(reply)
+	}
 	at := replyIndex(chatMemory, frontier)
 	reply.Timestamp = b.replyStamp(chatMemory.Messages, at)
 	if err := b.storeMessage(reply); err != nil {
@@ -640,7 +651,7 @@ func (b *Bot) snapshotForTurn(turn *chatTurn, chatMemory *ChatMemory) []anthropi
 	frontier := newestSeq(chatMemory)
 	b.chatMemoriesMu.RUnlock()
 
-	b.markSnapshot(turn, covered, frontier)
+	b.markSnapshot(turn, covered, frontier, chatMemory.generation)
 	return contextMessages
 }
 
@@ -1133,7 +1144,7 @@ func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
 //
 // Notices outside a model turn never come here: they are aside (sendResponse).
 func (b *Bot) recordTurnReply(turn *chatTurn, chatID int64, response string) (Message, error) {
-	frontier, covered := b.contextEnd(turn)
+	frontier, covered, memoryGen := b.contextEnd(turn)
 	if b.config.DebugScreening {
 		start := time.Now()
 		defer func() {
@@ -1151,7 +1162,7 @@ func (b *Bot) recordTurnReply(turn *chatTurn, chatID int64, response string) (Me
 	// database and then file it a second time.
 	chatMemory := b.getOrCreateChatMemory(chatID)
 	assistantMessage := b.createMessage(chatID, 0, "", "assistant", response, false)
-	answered, err := b.fileReply(chatMemory, &assistantMessage, frontier, covered)
+	answered, err := b.fileReply(chatMemory, &assistantMessage, frontier, covered, memoryGen)
 	if err != nil {
 		return Message{}, err
 	}

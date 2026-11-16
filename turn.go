@@ -20,6 +20,9 @@ const (
 	cancelRestart
 	// cancelStop: the user pressed Telegram's Stop button under the draft.
 	cancelStop
+	// cancelClear: /clear or /clear_hard emptied the chat's history. The turn
+	// ends silently: no reply, no rerun, nothing filed.
+	cancelClear
 )
 
 // errTurnSilent marks a failure runTurn must not report: the turn body has
@@ -60,6 +63,7 @@ type chatTurn struct {
 	draftID     string       // Telegram draft id shown for this turn, "" if none
 	coveredSeq  uint64       // newest answerable user message (Message.Seq) this turn's context includes
 	frontierSeq uint64       // newest message of any kind this turn's context includes
+	memoryGen   uint64       // generation of the memory its context was read from; 0 before it read any
 	committed   bool         // must not be restarted: output shown, or work not cheaply redone
 	reason      cancelReason // why cancel was called, if it was
 	rerun       *turnRequest // a flush that arrived mid-turn and may still need a turn
@@ -155,31 +159,36 @@ func (b *Bot) beginTurn(parent context.Context, chatID int64) (*chatTurn, contex
 }
 
 // markSnapshot records the newest answerable user message and the newest
-// message of any kind the turn's context includes, under one lock. The
-// turn's reply is filed right after the latter (fileReply).
-func (b *Bot) markSnapshot(turn *chatTurn, coveredSeq, frontierSeq uint64) {
+// message of any kind the turn's context includes, and the generation of the
+// memory it read, under one lock. The turn's reply is filed right after the
+// frontier (fileReply), in that memory only.
+func (b *Bot) markSnapshot(turn *chatTurn, coveredSeq, frontierSeq, memoryGen uint64) {
 	b.turnsMu.Lock()
 	defer b.turnsMu.Unlock()
 	turn.coveredSeq = max(turn.coveredSeq, coveredSeq)
 	turn.frontierSeq = max(turn.frontierSeq, frontierSeq)
+	if memoryGen != 0 {
+		turn.memoryGen = memoryGen
+	}
 }
 
 // contextEnd is where the turn's context ended: the newest message of any kind
-// and the newest answerable user message it included. The frontier is zero
-// for a turn that never read memory, and both are for a nil turn.
-func (b *Bot) contextEnd(turn *chatTurn) (frontierSeq, coveredSeq uint64) {
+// and the newest answerable user message it included, and the generation of
+// the memory it read. The frontier and the generation are zero for a turn
+// that never read memory, and all three are for a nil turn.
+func (b *Bot) contextEnd(turn *chatTurn) (frontierSeq, coveredSeq, memoryGen uint64) {
 	if turn == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	b.turnsMu.Lock()
 	defer b.turnsMu.Unlock()
-	return turn.frontierSeq, turn.coveredSeq
+	return turn.frontierSeq, turn.coveredSeq, turn.memoryGen
 }
 
 // markCovered records the newest answerable user message the turn's context
 // includes.
 func (b *Bot) markCovered(turn *chatTurn, coveredSeq uint64) {
-	b.markSnapshot(turn, coveredSeq, 0)
+	b.markSnapshot(turn, coveredSeq, 0, 0)
 }
 
 // markCommitted flags that the user has seen output, so the turn can no longer
@@ -236,15 +245,23 @@ func (b *Bot) restartForEdit(req turnRequest, msgSeq uint64) bool {
 	return true
 }
 
-// discardRerun drops a flush collected behind the chat's running turn. Used
-// by /clear, where rerunning against an emptied chat would call the model
-// with no user message at all.
-func (b *Bot) discardRerun(chatID int64) {
+// cancelForClear stops the chat's running turn for /clear or /clear_hard: it
+// ends silently, with no reply, and the flush collected behind it is
+// dropped, since rerunning it against the emptied chat would answer history
+// the user just deleted.
+func (b *Bot) cancelForClear(chatID int64) {
 	b.turnsMu.Lock()
 	defer b.turnsMu.Unlock()
 	if running, exists := b.turns[chatID]; exists {
+		running.reason = cancelClear
 		running.rerun, running.rerunWant = nil, 0
+		running.cancel()
 	}
+}
+
+// clearedTurn reports whether /clear cancelled the turn (cancelForClear).
+func (b *Bot) clearedTurn(turn *chatTurn) bool {
+	return b.turnReason(turn) == cancelClear
 }
 
 // finishTurn unregisters the turn and returns the flush that still needs a turn
@@ -313,6 +330,10 @@ func (b *Bot) runTurn(turn *chatTurn, turnCtx context.Context, req turnRequest,
 	defer out.close()
 
 	joined, err := call(turnCtx, out)
+	if b.clearedTurn(turn) {
+		InfoLogger.Printf("[%s] turn %d for chat %d dropped: the chat's history was cleared", b.config.ID, turn.seq, req.chatID)
+		return
+	}
 	if err != nil {
 		if errors.Is(err, errTurnSilent) {
 			return

@@ -57,6 +57,9 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, chatID int64, messages [
 	var lastMsg anthropic.BetaMessage
 	fileRetries, pauseContinuations := 0, 0
 	for {
+		if err := ctx.Err(); err != nil {
+			return "", err // the turn was cancelled (restart, Stop, /clear): no request
+		}
 		if len(history) == 0 || history[len(history)-1].OfUser == nil {
 			ErrorLogger.Printf("[%s] BUG: chat %d: the request's history does not end with a user message (%d messages); no model call",
 				b.config.ID, chatID, len(history))

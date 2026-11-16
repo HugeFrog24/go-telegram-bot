@@ -41,6 +41,9 @@ func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, u
 	if err == nil && strings.TrimSpace(transcript) == "" {
 		err = errors.New("empty transcript")
 	}
+	if b.clearedTurn(turn) {
+		return
+	}
 	if err != nil {
 		ErrorLogger.Printf("Error transcribing voice message from user %d: %v", userID, err)
 		b.refuseVoice(ctx, pending, to, "Sorry, I couldn't understand your voice message.")
@@ -70,6 +73,9 @@ func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, u
 	contextMessages := b.snapshotForTurn(turn, b.getOrCreateChatMemory(to.chatID))
 	response, err := b.getAnthropicResponse(ctx, to.chatID, contextMessages, false, username, firstName, lastName, isPremium, languageCode, messageTime, sinks)
 	freezeStatus()
+	if b.clearedTurn(turn) {
+		return
+	}
 	if err != nil {
 		ErrorLogger.Printf("Error getting Anthropic response for voice: %v", err)
 		closeStatus()
@@ -167,7 +173,6 @@ func (b *Bot) handlePhotoMessage(
 	turn, turnCtx := b.beginTurn(ctx, to.chatID)
 
 	b.runTurn(turn, turnCtx, req, func(ctx context.Context, out replyOutput) (string, error) {
-		chatMemory := b.getOrCreateChatMemory(to.chatID)
 		userMessage := b.createMessage(to.chatID, userID, username, "user", caption, true)
 		userMessage.ImageFileIDs = finalUploaded
 		userMessage.TelegramMessageID = items[0].ID
@@ -183,7 +188,9 @@ func (b *Bot) handlePhotoMessage(
 		}
 		b.joinConversation(userMessage)
 
-		contextMessages := b.snapshotForTurn(turn, chatMemory)
+		// The memory the photo just joined, which /clear may have replaced
+		// since this turn began.
+		contextMessages := b.snapshotForTurn(turn, b.getOrCreateChatMemory(to.chatID))
 		return b.getAnthropicResponse(
 			ctx, to.chatID, contextMessages, false,
 			username, firstName, lastName, isPremium, languageCode, messageTime,
@@ -657,6 +664,9 @@ func (b *Bot) runStickerTurn(ctx context.Context, to replyTarget, userMsg Messag
 func (b *Bot) handleStickerMessage(ctx context.Context, turn *chatTurn, to replyTarget, userMessage Message, message *models.Message, contextMessages []anthropic.BetaMessageParam) {
 
 	response, err := b.generateStickerResponse(ctx, to, userMessage, contextMessages)
+	if b.clearedTurn(turn) {
+		return
+	}
 	if err != nil {
 		ErrorLogger.Printf("Error generating sticker response: %v", err)
 		if message.Sticker.IsAnimated {
@@ -795,7 +805,7 @@ func (b *Bot) clearChatHistory(ctx context.Context, to replyTarget, currentUserI
 	}
 	// Likewise a flush collected behind a running turn: rerun against the
 	// emptied chat, it would call the model with no user message at all.
-	b.discardRerun(clearedChatID)
+	b.cancelForClear(clearedChatID)
 
 	b.chatMemoriesMu.Lock()
 	if targetUserID == currentUserID {

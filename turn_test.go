@@ -118,15 +118,27 @@ func TestFinishTurn_StopKeepsCollectedFlush(t *testing.T) { //NOSONAR go:S100 --
 	assert.NotNil(t, b.finishTurn(turn), "a message sent before the Stop tap still deserves an answer")
 }
 
-func TestDiscardRerun_DropsCollectedFlush(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+// dropRerun drops the flush collected behind the chat's running turn, for a
+// test about the turn alone.
+func dropRerun(b *Bot, chatID int64) {
+	b.turnsMu.Lock()
+	defer b.turnsMu.Unlock()
+	if running, exists := b.turns[chatID]; exists {
+		running.rerun, running.rerunWant = nil, 0
+	}
+}
+
+func TestCancelForClear_StopsTheTurnAndDropsItsRerun(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	b, _ := setupBotForTest(t, 123)
-	turn, _, _ := b.beginTextTurn(textReq(8), 5)
+	turn, ctx, _ := b.beginTextTurn(textReq(8), 5)
 	b.markCommitted(turn)
 	_, _, ok := b.beginTextTurn(textReq(8), 7)
 	require.False(t, ok)
 
-	b.discardRerun(8)
+	b.cancelForClear(8)
 
+	assert.ErrorIs(t, ctx.Err(), context.Canceled, "the turn stops, committed or not")
+	assert.True(t, b.clearedTurn(turn))
 	assert.Nil(t, b.finishTurn(turn), "/clear must not let the collected flush rerun on an empty chat")
 }
 

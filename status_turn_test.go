@@ -395,7 +395,7 @@ func TestRunTurn_RestartDeletesStatus(t *testing.T) { //NOSONAR go:S100 -- under
 		require.False(t, ok)
 		require.Equal(t, cancelRestart, b.turnReason(turn), "a shown note must not commit the turn")
 		// The rerun would call the model; this test is about the abandoned turn.
-		b.discardRerun(notesGroupChat)
+		dropRerun(b, notesGroupChat)
 
 		<-ctx.Done()
 		return "", ctx.Err()
