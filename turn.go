@@ -57,12 +57,13 @@ type chatTurn struct {
 	done   chan struct{}
 
 	// Guarded by Bot.turnsMu.
-	draftID   string       // Telegram draft id shown for this turn, "" if none
-	coveredID uint         // highest user Message.ID this turn's context includes
-	committed bool         // must not be restarted: output shown, or work not cheaply redone
-	reason    cancelReason // why cancel was called, if it was
-	rerun     *turnRequest // a flush that arrived mid-turn and may still need a turn
-	rerunWant uint         // the newest user message that flush wanted answered
+	draftID    string       // Telegram draft id shown for this turn, "" if none
+	coveredID  uint         // highest user Message.ID this turn's context includes
+	frontierID uint         // highest Message.ID of any kind this turn's context includes
+	committed  bool         // must not be restarted: output shown, or work not cheaply redone
+	reason     cancelReason // why cancel was called, if it was
+	rerun      *turnRequest // a flush that arrived mid-turn and may still need a turn
+	rerunWant  uint         // the newest user message that flush wanted answered
 }
 
 func (t *chatTurn) draftIDString() string { return strconv.FormatUint(t.seq, 10) }
@@ -143,13 +144,31 @@ func (b *Bot) beginTurn(parent context.Context, chatID int64) (*chatTurn, contex
 	}
 }
 
-// markCovered records the newest user message the turn's context includes.
-func (b *Bot) markCovered(turn *chatTurn, coveredID uint) {
+// markSnapshot records the newest user message and the newest message of any
+// kind the turn's context includes, under one lock. The turn's reply is
+// recorded right after the latter (recordTurnReply).
+func (b *Bot) markSnapshot(turn *chatTurn, coveredID, frontierID uint) {
 	b.turnsMu.Lock()
 	defer b.turnsMu.Unlock()
-	if coveredID > turn.coveredID {
-		turn.coveredID = coveredID
+	turn.coveredID = max(turn.coveredID, coveredID)
+	turn.frontierID = max(turn.frontierID, frontierID)
+}
+
+// contextEnd is where the turn's context ended: the newest message of any kind
+// and the newest user message it included. Both are zero for a nil turn or
+// one that never read memory.
+func (b *Bot) contextEnd(turn *chatTurn) (frontierID, coveredID uint) {
+	if turn == nil {
+		return 0, 0
 	}
+	b.turnsMu.Lock()
+	defer b.turnsMu.Unlock()
+	return turn.frontierID, turn.coveredID
+}
+
+// markCovered records the newest user message the turn's context includes.
+func (b *Bot) markCovered(turn *chatTurn, coveredID uint) {
+	b.markSnapshot(turn, coveredID, 0)
 }
 
 // markCommitted flags that the user has seen output, so the turn can no longer
@@ -283,7 +302,7 @@ func (b *Bot) runTurn(turn *chatTurn, turnCtx context.Context, req turnRequest,
 
 	joined, err := call(turnCtx, out)
 	if err != nil {
-		if errors.Is(err, errTurnSilent) {
+		if errors.Is(err, errTurnSilent) || errors.Is(err, errNothingToAnswer) {
 			return
 		}
 		switch b.turnReason(turn) {
@@ -296,7 +315,7 @@ func (b *Bot) runTurn(turn *chatTurn, turnCtx context.Context, req turnRequest,
 		}
 		ErrorLogger.Printf("Error getting Anthropic response: %v", err)
 		out.dropStatus()
-		if sendErr := b.sendResponse(req.ctx, req.target(), b.anthropicErrorResponse(err, req.userID)); sendErr != nil {
+		if sendErr := b.sendTurnReply(req.ctx, turn, req.target(), b.anthropicErrorResponse(err, req.userID)); sendErr != nil {
 			ErrorLogger.Printf("Error sending response: %v", sendErr)
 		}
 		return
@@ -306,7 +325,7 @@ func (b *Bot) runTurn(turn *chatTurn, turnCtx context.Context, req turnRequest,
 		ErrorLogger.Printf("[%s] delivering reply to chat %d: %v", b.config.ID, req.chatID, finishErr)
 		return
 	}
-	if _, storeErr := b.screenOutgoingMessage(req.chatID, joined); storeErr != nil {
+	if _, storeErr := b.recordTurnReply(turn, req.chatID, joined); storeErr != nil {
 		ErrorLogger.Printf("Error recording assistant turn: %v", storeErr)
 	}
 }
@@ -327,7 +346,7 @@ func (b *Bot) deliverStoppedTurn(turn *chatTurn, req turnRequest, out replyOutpu
 		ErrorLogger.Printf("[%s] sending stopped partial to chat %d: %v", b.config.ID, req.chatID, err)
 		return
 	}
-	if _, err := b.screenOutgoingMessage(req.chatID, partial); err != nil {
+	if _, err := b.recordTurnReply(turn, req.chatID, partial); err != nil {
 		ErrorLogger.Printf("Error recording stopped assistant turn: %v", err)
 	}
 }

@@ -15,6 +15,12 @@ import (
 
 var ErrModelNotFound = errors.New("model not found or deprecated")
 
+// errNothingToAnswer means the conversation ends with the bot's own message,
+// so no user message is left to answer. Every current model rejects such a
+// request as an assistant prefill (400); older ones would have continued the
+// bot's reply. The turn has nothing to do and says nothing.
+var errNothingToAnswer = errors.New("nothing to answer: the conversation ends with the bot's message")
+
 const maxFileNotFoundRetries = 3
 
 const maxPauseTurnContinuations = 5
@@ -28,6 +34,11 @@ var mcpUnsupportedCount atomic.Uint64
 type mcpCall struct{ server, name, input string }
 
 func (b *Bot) getAnthropicResponse(ctx context.Context, chatID int64, messages []anthropic.BetaMessageParam, isEmojiOnly bool, username string, firstName string, lastName string, isPremium bool, languageCode string, messageTime int, sinks replySinks) (string, error) {
+	if len(messages) == 0 || messages[len(messages)-1].OfUser == nil {
+		InfoLogger.Printf("[%s] chat %d: nothing new to answer, the conversation ends with the bot's message; no model call",
+			b.config.ID, chatID)
+		return "", errNothingToAnswer
+	}
 	InfoLogger.Printf("Sending %d messages to Anthropic", len(messages))
 
 	params := b.buildMessageParams(messages, isEmojiOnly, username, firstName, lastName, isPremium, languageCode, messageTime)

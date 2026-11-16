@@ -136,8 +136,9 @@ type anthropicStub struct {
 	gate  chan struct{}
 	split int
 
-	mu    sync.Mutex
-	betas []string // the anthropic-beta header of each request, in order
+	mu     sync.Mutex
+	betas  []string // the anthropic-beta header of each request, in order
+	bodies [][]byte // each request's body, in order
 }
 
 func newAnthropicStub(t *testing.T, streams ...[]string) *anthropicStub {
@@ -165,10 +166,11 @@ func serveAnthropicStub(t *testing.T, stub *anthropicStub) *anthropicStub {
 			http.NotFound(w, r)
 			return
 		}
-		_, _ = io.Copy(io.Discard, r.Body)
+		body, _ := io.ReadAll(r.Body)
 		stub.mu.Lock()
 		n := len(stub.betas)
 		stub.betas = append(stub.betas, r.Header.Get("anthropic-beta"))
+		stub.bodies = append(stub.bodies, body)
 		stub.mu.Unlock()
 
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -190,6 +192,33 @@ func serveAnthropicStub(t *testing.T, stub *anthropicStub) *anthropicStub {
 	t.Cleanup(srv.Close)
 	stub.url = srv.URL
 	return stub
+}
+
+// lastMessage is the role and text of the final entry in request i's
+// messages, the turn the model is asked to answer.
+func (s *anthropicStub) lastMessage(t *testing.T, i int) (role, text string) {
+	t.Helper()
+	s.mu.Lock()
+	body := s.bodies[i]
+	s.mu.Unlock()
+	var req struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || len(req.Messages) == 0 {
+		t.Fatalf("request %d has no messages: %v", i, err)
+	}
+	last := req.Messages[len(req.Messages)-1]
+	var sb strings.Builder
+	for _, c := range last.Content {
+		sb.WriteString(c.Text)
+	}
+	return last.Role, sb.String()
 }
 
 func (s *anthropicStub) requestBetas() []string {

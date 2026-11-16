@@ -76,10 +76,14 @@ func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, u
 	contextMessages := b.snapshotForTurn(turn, b.getOrCreateChatMemory(to.chatID))
 	response, err := b.getAnthropicResponse(ctx, to.chatID, contextMessages, false, username, firstName, lastName, isPremium, languageCode, messageTime, sinks)
 	freezeStatus()
+	if errors.Is(err, errNothingToAnswer) {
+		closeStatus()
+		return
+	}
 	if err != nil {
 		ErrorLogger.Printf("Error getting Anthropic response for voice: %v", err)
 		closeStatus()
-		if err := b.sendResponse(ctx, to, b.anthropicErrorResponse(err, userID)); err != nil {
+		if err := b.sendTurnReply(ctx, turn, to, b.anthropicErrorResponse(err, userID)); err != nil {
 			ErrorLogger.Printf("Error sending anthropic error response: %v", err)
 		}
 		return
@@ -94,13 +98,13 @@ func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, u
 	audioReader, err := b.generateSpeech(ctx, response)
 	if err != nil {
 		ErrorLogger.Printf("Error generating speech, falling back to text: %v", err)
-		if err := b.sendResponse(ctx, to, response); err != nil {
+		if err := b.sendTurnReply(ctx, turn, to, response); err != nil {
 			ErrorLogger.Printf("Error sending text fallback: %v", err)
 		}
 		return
 	}
 
-	if _, err := b.screenOutgoingMessage(to.chatID, response); err != nil {
+	if _, err := b.recordTurnReply(turn, to.chatID, response); err != nil {
 		ErrorLogger.Printf("Error storing assistant voice response: %v", err)
 	}
 
@@ -477,10 +481,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 
 	if message.Sticker != nil {
 		b.cancelIntake(chatID)
-		turn, turnCtx := b.beginTurn(ctx, chatID)
-		defer b.endTurn(turn)
-		contextMessages := b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatID))
-		b.handleStickerMessage(turnCtx, to, userMsg, message, contextMessages)
+		b.runStickerTurn(ctx, to, userMsg, message)
 		return
 	}
 
@@ -591,9 +592,22 @@ func (b *Bot) sendRateLimitExceededMessage(ctx context.Context, to replyTarget) 
 	}
 }
 
-func (b *Bot) handleStickerMessage(ctx context.Context, to replyTarget, userMessage Message, message *models.Message, contextMessages []anthropic.BetaMessageParam) {
+// runStickerTurn answers a sticker as its own committed turn, after any turn
+// already running on the chat.
+func (b *Bot) runStickerTurn(ctx context.Context, to replyTarget, userMsg Message, message *models.Message) {
+	turn, turnCtx := b.beginTurn(ctx, to.chatID)
+	defer b.endTurn(turn)
+	contextMessages := b.snapshotForTurn(turn, b.getOrCreateChatMemory(to.chatID))
+	b.handleStickerMessage(turnCtx, turn, to, userMsg, message, contextMessages)
+}
+
+func (b *Bot) handleStickerMessage(ctx context.Context, turn *chatTurn, to replyTarget, userMessage Message, message *models.Message, contextMessages []anthropic.BetaMessageParam) {
 
 	response, err := b.generateStickerResponse(ctx, to, userMessage, contextMessages)
+	if errors.Is(err, errNothingToAnswer) {
+		// The turn this one waited for read the sticker and answered it.
+		return
+	}
 	if err != nil {
 		ErrorLogger.Printf("Error generating sticker response: %v", err)
 		if message.Sticker.IsAnimated {
@@ -605,7 +619,7 @@ func (b *Bot) handleStickerMessage(ctx context.Context, to replyTarget, userMess
 		}
 	}
 
-	if err := b.sendResponse(ctx, to, response); err != nil {
+	if err := b.sendTurnReply(ctx, turn, to, response); err != nil {
 		ErrorLogger.Printf("Error sending response: %v", err)
 		return
 	}

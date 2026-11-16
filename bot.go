@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -459,10 +460,27 @@ func (b *Bot) stripDeadFileIDFromMemory(chatID int64, deadFileID string) {
 }
 
 func (b *Bot) addMessageToChatMemory(chatMemory *ChatMemory, message Message) {
+	b.insertIntoChatMemory(chatMemory, message, 0)
+}
+
+// insertIntoChatMemory puts message right after the last message whose id is
+// at or below frontierID, or at the end when frontierID is 0, then trims the
+// window from the front.
+func (b *Bot) insertIntoChatMemory(chatMemory *ChatMemory, message Message, frontierID uint) {
 	b.chatMemoriesMu.Lock()
 	defer b.chatMemoriesMu.Unlock()
 
-	chatMemory.Messages = append(chatMemory.Messages, message)
+	at := len(chatMemory.Messages)
+	if frontierID > 0 {
+		at = 0
+		for i := len(chatMemory.Messages) - 1; i >= 0; i-- {
+			if chatMemory.Messages[i].ID <= frontierID {
+				at = i + 1
+				break
+			}
+		}
+	}
+	chatMemory.Messages = slices.Insert(chatMemory.Messages, at, message)
 
 	if len(chatMemory.Messages) > chatMemory.Size {
 		chatMemory.Messages = chatMemory.Messages[len(chatMemory.Messages)-chatMemory.Size:]
@@ -484,18 +502,25 @@ func (b *Bot) snapshotForTurn(turn *chatTurn, chatMemory *ChatMemory) []anthropi
 	b.chatMemoriesMu.RLock()
 	contextMessages := b.buildContextMessages(chatMemory)
 	covered := newestUserMessageID(chatMemory)
+	frontier := newestMessageID(chatMemory, false)
 	b.chatMemoriesMu.RUnlock()
 
-	b.markCovered(turn, covered)
+	b.markSnapshot(turn, covered, frontier)
 	return contextMessages
 }
 
 // newestUserMessageID returns the highest database id among the user messages
 // in memory. Ids are monotonic, so "newer" and "higher" agree.
 func newestUserMessageID(chatMemory *ChatMemory) uint {
+	return newestMessageID(chatMemory, true)
+}
+
+// newestMessageID returns the highest database id in memory, among user
+// messages only when usersOnly is set.
+func newestMessageID(chatMemory *ChatMemory, usersOnly bool) uint {
 	var newest uint
 	for _, msg := range chatMemory.Messages {
-		if msg.IsUser && msg.ID > newest {
+		if (msg.IsUser || !usersOnly) && msg.ID > newest {
 			newest = msg.ID
 		}
 	}
@@ -687,7 +712,14 @@ func initTelegramBot(token string, b *Bot) (TelegramClient, error) {
 }
 
 func (b *Bot) sendResponse(ctx context.Context, to replyTarget, text string) error {
-	_, err := b.screenOutgoingMessage(to.chatID, text)
+	return b.sendTurnReply(ctx, nil, to, text)
+}
+
+// sendTurnReply records text as the bot's message, then sends it. With a
+// turn, the record goes where that turn's context ended (recordTurnReply);
+// without one, at the end of memory, as for a command's reply.
+func (b *Bot) sendTurnReply(ctx context.Context, turn *chatTurn, to replyTarget, text string) error {
+	_, err := b.recordTurnReply(turn, to.chatID, text)
 	if err != nil {
 		ErrorLogger.Printf("Error storing assistant message: %v", err)
 		return err
@@ -958,6 +990,24 @@ func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
 }
 
 func (b *Bot) screenOutgoingMessage(chatID int64, response string) (Message, error) {
+	return b.recordTurnReply(nil, chatID, response)
+}
+
+// recordTurnReply stores the bot's message for a turn. It goes into chat
+// memory right after the newest message the turn's context included, not at
+// the end: a message that arrived while the turn ran is not what this reply
+// answers, and it stays after the reply, so the turn that answers it next ends
+// with it, as the API requires, instead of with this reply. Only the user
+// messages the turn covered are marked answered.
+//
+// A nil turn, or one that never read memory, appends and marks every
+// outstanding user message, as for a command's reply.
+//
+// Memory reloads from the database in timestamp order, which puts such a
+// reply back after the messages that arrived during its turn. The model then
+// reads two bot messages in a row, which the API merges into one turn.
+func (b *Bot) recordTurnReply(turn *chatTurn, chatID int64, response string) (Message, error) {
+	frontierID, coveredID := b.contextEnd(turn)
 	if b.config.DebugScreening {
 		start := time.Now()
 		defer func() {
@@ -976,22 +1026,23 @@ func (b *Bot) screenOutgoingMessage(chatID int64, response string) (Message, err
 		return Message{}, err
 	}
 
-	// Mark every outstanding user message in the chat, not just the newest one.
-	// A coalesced turn answers the whole batch, so a single-row update would
-	// leave the earlier messages permanently unanswered. This also drops an
-	// UPDATE ... ORDER BY ... LIMIT, which stock SQLite builds do not support.
-	now := time.Now()
-	err := b.db.Model(&Message{}).
+	// Mark every outstanding user message the reply answers, not just the
+	// newest one. A coalesced turn answers the whole batch, so a single-row
+	// update would leave the earlier messages permanently unanswered. This
+	// also drops an UPDATE ... ORDER BY ... LIMIT, which stock SQLite builds
+	// do not support.
+	answered := b.db.Model(&Message{}).
 		Where("chat_id = ? AND bot_id = ? AND is_user = ? AND answered_on IS NULL",
-			chatID, b.botID, true).
-		Update("answered_on", now).Error
-
-	if err != nil {
+			chatID, b.botID, true)
+	if coveredID > 0 {
+		answered = answered.Where("id <= ?", coveredID)
+	}
+	if err := answered.Update("answered_on", time.Now()).Error; err != nil {
 		ErrorLogger.Printf("Error marking user messages as answered: %v", err)
 	}
 
 	chatMemory := b.getOrCreateChatMemory(chatID)
-	b.addMessageToChatMemory(chatMemory, assistantMessage)
+	b.insertIntoChatMemory(chatMemory, assistantMessage, frontierID)
 
 	return assistantMessage, nil
 }
