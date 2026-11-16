@@ -294,3 +294,53 @@ These items are binding for a Task 2b fix round.
    - compose `init: true`, so stray zombies are reaped if the bot is PID 1;
    - `pids_limit` as already planned;
    - the systemd example's `TasksMax` as already planned.
+
+## Seccomp allowlist (Ruling 18)
+
+A blind re-check and a scoped re-review of the Ruling 16 round agreed that the deny-list filter still lets a compromised tool hurt same-uid processes. Reproduced with the filter on:
+- `prlimit64` on the bot at any ABI. Setting `RLIMIT_CPU` to 1 gets the bot SIGKILLed; `RLIMIT_NOFILE` set to 3 leaves it silently broken.
+- `fcntl` `F_SETOWN`/`F_SETSIG` signals below ABI 6.
+- SysV shared memory left behind after the run, beyond `RLIMIT_AS` (2 GiB measured).
+- Thread and PID exhaustion that crashes the bot.
+- `chmod`/`chown`/`utimensat`/xattr on files the tool can't read. Mode 000 on `bot.db` causes a crash loop.
+- `setpriority`/`sched_*`/`ioprio` on other processes.
+- Clearing Pdeathsig.
+- inotify on bot directories.
+
+A deny-list keeps missing classes like these, and it automatically allows every syscall a new kernel adds. These items are binding, and they **replace Ruling 16 item 1's deny-list design**.
+
+1. **An allowlist filter.**
+   - The architecture check comes first, unchanged.
+   - Only syscalls on an explicit per-architecture allowlist are allowed. Everything else returns `ENOSYS`, so libc falls back the way it does for an unknown syscall. Argument-checked refusals return `EPERM`.
+   - **How the allowlist is built:** trace ffprobe and ffmpeg (`strace -f -c`) on Alpine (musl) and Ubuntu (glibc) across the whole fixture matrix:
+     - every codec and container: H.264, HEVC 10-bit, VP8, VP9, VP9 alpha via libvpx, AV1 via dav1d, GIF, MP4/MOV, MKV/WebM;
+     - probe and render;
+     - font and no-font fallback;
+     - `-version`;
+     - error paths: refused formats, timeouts, the output bound.
+   - Add the libc baseline both libcs need.
+   - Document each group in code with its reason.
+   - **Argument checks on the allowed calls:**
+     - `prlimit64`, `sched_getaffinity`, `sched_setaffinity`, `sched_getparam`, `sched_getscheduler`, and the `*_rt_sig*`/`kill`/`tkill`/`tgkill` family: allowed only for target 0 or the tool's own PID.
+     - `clone`: only with `CLONE_THREAD` and no namespace flags.
+     - `fcntl`: only an explicit set of commands, for example `F_GETFD`, `F_SETFD`, `F_GETFL`, `F_SETFL`, `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETLK`. `F_SETOWN`, `F_SETOWN_EX`, `F_SETSIG`, `F_SETLEASE` and `F_NOTIFY` are refused.
+     - `prctl`: only the options the tools are seen to use, such as `PR_SET_NAME`/`PR_GET_NAME`. `PR_SET_PDEATHSIG` and anything else are refused.
+     - `ioctl`: refuse `TIOCSTI` and `TIOCLINUX`, if `ioctl` is needed at all.
+   - **Also allowed, because the helper needs them after the filter is installed:**
+     - `prlimit64(0)`, `execve`, `write`, `exit_group`;
+     - in check mode, the check's own probes. Those may fail with either `EPERM` or `ENOSYS`, and both count as denied.
+   - **arm64** gets its own list, derived from the amd64 trace by name. It is tested with the BPF evaluator only, because no arm64 runtime is available. A wrong arm64 list fails closed through the gate self-test. Document that.
+2. **`RLIMIT_NPROC`.** The helper sets it, soft and hard, to the uid's current task count plus `toolThreadHeadroom` (32), counted from `/proc` before Landlock. Verify that a 4K HEVC and an AV1 render stay within the headroom. Combined with compose `pids_limit` 256 (Task 8), four runs plus the bot fit.
+3. **The self-check tests only the layers that are present.**
+   - File checks run only when the Landlock ABI is above 0. Seccomp probes run only when seccomp is on. This restores `allow_unsandboxed` on hosts without Landlock, which the round broke, against Ruling 14 note 5.
+   - New probes when seccomp is on:
+     - `prlimit64` on the parent;
+     - `F_SETOWN`;
+     - `shmget`;
+     - `chmod` on a file outside the input directory;
+     - `inotify_init1`.
+4. **The gaps line is accurate.**
+   - It names what neither layer covers. With the allowlist, that is `stat` metadata reads plus whatever the trace forces.
+   - It never claims "signals" or "metadata" are covered when they aren't.
+5. **Check Alpine's libvpx 1.15.2-r1 for CVE-2026-1861**, using the Alpine secdb or the package changelog. Report the result. If it is unfixed, libvpx (the sticker alpha path) is refused until it is fixed.
+6. **Nit:** the `sandboxSparesBot` comment names the current grants.
