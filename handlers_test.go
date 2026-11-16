@@ -58,6 +58,7 @@ func TestHandleUpdate_NewChat(t *testing.T) {
 
 	b, err := NewBot(db, config, mockClock, mockTgClient)
 	assert.NoError(t, err)
+	useAnthropicStub(b, newAnthropicStub(t, candleFarmStream()))
 
 	testCases := []struct {
 		name       string
@@ -67,12 +68,12 @@ func TestHandleUpdate_NewChat(t *testing.T) {
 		{
 			name:       "Owner First Message",
 			userID:     123,
-			wantSubstr: "Anthropic call failed:",
+			wantSubstr: "Open the Farm tab.",
 		},
 		{
 			name:       "Regular User First Message",
 			userID:     456,
-			wantSubstr: "I'm sorry, I'm having trouble processing your request right now.",
+			wantSubstr: "Open the Farm tab.",
 		},
 	}
 
@@ -613,9 +614,6 @@ func setupBotForTest(t *testing.T, ownerID int64) (*Bot, *MockTelegramClient) {
 	b, err := NewBot(db, config, mockClock, mockTgClient)
 	assert.NoError(t, err)
 	if b != nil {
-		// No test reaches ElevenLabs: one that needs speech installs a
-		// stand-in (voiceStubs); any other call fails here, locally.
-		b.sttURL, b.ttsURL = "http://127.0.0.1:1/stt", "http://127.0.0.1:1/tts/"
 		t.Cleanup(func() { stopPendingTimers(b) })
 	}
 	return b, mockTgClient

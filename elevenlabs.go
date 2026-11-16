@@ -10,10 +10,13 @@ import (
 	"net/http"
 )
 
-const (
-	elevenLabsTTSURL       = "https://api.elevenlabs.io/v1/text-to-speech/"
-	elevenLabsSTTURL       = "https://api.elevenlabs.io/v1/speech-to-text"
-	elevenLabsDefaultModel = "eleven_multilingual_v2"
+const elevenLabsDefaultModel = "eleven_multilingual_v2"
+
+// The ElevenLabs endpoints every new bot starts with; variables so the test
+// binary can point them at this machine before any bot exists.
+var (
+	elevenLabsTTSURL = "https://api.elevenlabs.io/v1/text-to-speech/"
+	elevenLabsSTTURL = "https://api.elevenlabs.io/v1/speech-to-text"
 )
 
 func (b *Bot) generateSpeech(ctx context.Context, text string) (io.Reader, error) {

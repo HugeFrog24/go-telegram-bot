@@ -31,7 +31,26 @@ func TestMain(m *testing.M) {
 		os.Exit(run(os.Args[1:]))
 	}
 	initLoggers()
-	os.Exit(m.Run())
+	os.Exit(runIsolated(m))
+}
+
+// runIsolated runs the tests cut off from every real API (isolateFromRealAPIs)
+// and fails the run if any test tried to leave this machine.
+func runIsolated(m *testing.M) int {
+	cleanup, err := isolateFromRealAPIs()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "test isolation:", err)
+		return 1
+	}
+	defer cleanup()
+	code := m.Run()
+	if n := blockedRequests.Load(); n > 0 {
+		fmt.Fprintln(os.Stderr, "test isolation:", n, "request(s) to another machine were blocked")
+		if code == 0 {
+			code = 1
+		}
+	}
+	return code
 }
 
 func TestBotConfig_UnmarshalJSON(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
