@@ -583,16 +583,18 @@ func assertNoForbiddenArgs(t *testing.T, args []string) {
 }
 
 func TestDecoderLists(t *testing.T) {
-	assert.Equal(t, "h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,gif,"+
+	assert.Equal(t, "h264,hevc,vp8,vp9,libdav1d,gif,"+
 		"aac,aac_fixed,mp3,mp3float,mp2,mp2float,opus,libopus,vorbis,libvorbis,flac,alac,ac3,eac3,"+
 		"amrnb,amrwb,libopencore_amrnb,libopencore_amrwb,adpcm_ima_qt,"+
 		"pcm_s8,pcm_u8,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,pcm_s32be,"+
 		"pcm_f32le,pcm_f32be,pcm_f64le,pcm_f64be,pcm_mulaw,pcm_alaw,"+
 		"mov_text,srt,subrip,ssa,ass,webvtt,text", probeCodecs)
-	assert.Equal(t, "h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,gif", renderCodecs)
+	assert.Equal(t, "h264,hevc,vp8,vp9,libdav1d,gif", renderCodecs)
 	for _, list := range []string{probeCodecs, renderCodecs} {
 		for name := range strings.SplitSeq(list, ",") {
 			assert.NotContains(t, []string{"mjpeg", "png", "av1"}, name, "cover-art decoders and native av1 stay off")
+			assert.NotContains(t, []string{"libvpx", "libvpx-vp9"}, name,
+				"libvpx, which -max_pixels does not bound, is added only for a sticker's alpha (Ruling 16 item 5)")
 			assert.NotEqual(t, "libaom-av1", name, "libaom checks a frame's size only after decoding it: AV1 is libdav1d's alone")
 		}
 	}
@@ -1618,7 +1620,7 @@ func TestToolArgs_Render(t *testing.T) { //NOSONAR go:S100 -- underscore separat
 		"-hide_banner", "-nostdin", "-loglevel", "error", "-max_alloc", "134217728",
 		"-timelimit", "120", "-filter_threads", "1", "-copyts",
 		"-protocol_whitelist", "file", "-format_whitelist", "mov", "-f", "mov",
-		"-codec_whitelist", renderCodecs, "-max_pixels", "16777216", "-max_streams", "32", "-threads", "2",
+		"-codec_whitelist", "h264,hevc,vp8,vp9,libdav1d,gif", "-max_pixels", "16777216", "-max_streams", "32", "-threads", "2",
 		"-ss", "6.000000", "-t", "23.000000", // 10 s lookback before Start 16
 		"-i", "file:" + in,
 		"-map", "0:V:0", "-an", "-sn", "-dn",
@@ -1637,6 +1639,8 @@ func TestToolArgs_Render(t *testing.T) { //NOSONAR go:S100 -- underscore separat
 		got := renderArgs(in, plan, "", 40)
 		i := slices.Index(got, "-i")
 		assert.Equal(t, []string{"-c:v", "libvpx-vp9", "-ss", "0.000000", "-t", "11.000000"}, got[i-6:i], "decoder and window are input options")
+		assert.Equal(t, "h264,hevc,vp8,vp9,libdav1d,gif,libvpx-vp9", got[slices.Index(got, "-codec_whitelist")+1],
+			"libvpx is whitelisted only when the plan forces it (Ruling 16 item 5)")
 		assert.Equal(t, "trim=end_frame=1,loop=loop=5:size=1,setpts=0,trim=end_frame=6,"+
 			"format=yuva420p,split[fg][bgsrc];[bgsrc]lutyuv=y=128:u=128:v=128:a=255[bg];[bg][fg]overlay=format=yuv420,"+
 			"scale=170:170,"+

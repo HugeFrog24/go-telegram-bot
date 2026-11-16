@@ -51,12 +51,16 @@ const (
 // the chosen video stream, so it never needs an audio or subtitle decoder.
 // libaom-av1 is left off: like libvpx it checks a frame's size only after
 // decoding it, so AV1 decodes through libdav1d, which -max_pixels bounds, or
-// not at all (Ruling 12 item 3).
-const renderCodecs = "h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,gif"
+// not at all (Ruling 12 item 3). libvpx and libvpx-vp9 are not on it either:
+// renderArgs adds the one a sticker's alpha plan forces, and nothing else may
+// open them, so a build without the native vp8/vp9 decoders cannot fall back
+// to libvpx for an ordinary file (Ruling 16 item 5).
+const renderCodecs = "h264,hevc,vp8,vp9,libdav1d,gif"
 
 // probeCodecs is the research's §6.1 probe list without mjpeg and png, so
-// files with cover art are refused (item 4, "Cover art"). ffprobe opens a
-// decoder for every stream and exits non-zero when one is not on this list.
+// files with cover art are refused (item 4, "Cover art"), and without libvpx,
+// since probing decodes a few frames too. ffprobe opens a decoder for every
+// stream and exits non-zero when one is not on this list.
 const probeCodecs = renderCodecs + "," +
 	"aac,aac_fixed,mp3,mp3float,mp2,mp2float,opus,libopus,vorbis,libvorbis,flac,alac,ac3,eac3," +
 	"amrnb,amrwb,libopencore_amrnb,libopencore_amrwb,adpcm_ima_qt," +
@@ -623,13 +627,18 @@ func finiteIn(v, lo, hi float64) bool {
 // The encoder gets encoderThreads: by default it starts a thread per CPU (up
 // to 16), and with glibc each thread reserves a malloc arena and a stack, so
 // on a 32-CPU host they alone took ~0.5 GiB of the address space that
-// toolMemoryLimit caps.
+// toolMemoryLimit caps. The decoder a sticker's alpha forces is the only
+// libvpx the whitelist ever holds (Ruling 16 item 5).
 func renderArgs(input string, p sheetPlan, font string, timeLimit int) []string {
+	codecs := renderCodecs
+	if p.decoder != "" {
+		codecs += "," + p.decoder
+	}
 	return toolArgs(toolRun{
 		tool:      "ffmpeg",
 		formats:   p.demuxer,
 		demuxer:   p.demuxer,
-		codecs:    renderCodecs,
+		codecs:    codecs,
 		decoder:   p.decoder,
 		timeLimit: timeLimit,
 		seek:      p.inputSeek,
