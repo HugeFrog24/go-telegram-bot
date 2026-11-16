@@ -207,10 +207,11 @@ func hasDemuxer(t *testing.T, name string) bool {
 	return false
 }
 
-// The format whitelist (not file extensions, and not the demuxers' own
-// checks) must refuse playlist and concat inputs that would make ffmpeg open
-// other files. The fixtures are extensionless like downloads, and point at a
-// harmless clip of our own.
+// Playlist and concat inputs, which would make ffmpeg open other files, are
+// refused: by their first bytes, before any tool runs (Ruling 20 item 2),
+// and, should a run ever see one, by the format whitelist (not file
+// extensions, and not the demuxers' own checks), which stays. The fixtures
+// are extensionless like downloads, and point at a harmless clip of our own.
 func TestProbeMedia_RejectsPlaylistsAndConcat(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	requireFFmpeg(t)
 	target := ffmpegFixture(t, mp4Args...)
@@ -225,12 +226,18 @@ func TestProbeMedia_RejectsPlaylistsAndConcat(t *testing.T) { //NOSONAR go:S100 
 		t.Run(tc.demuxer, func(t *testing.T) {
 			path := textFixture(t, "media", tc.content)
 			for _, kind := range []string{"video", "document"} {
-				_, err := probeMedia(context.Background(), path, kind)
-				require.ErrorIs(t, err, errToolFailed)
+				err := withoutToolRuns(t, func(ctx context.Context) error {
+					_, err := probeMedia(ctx, path, kind)
+					return err
+				})
+				require.ErrorIs(t, err, errUnsupportedMedia, "refused by its first bytes")
+
+				// The whitelist itself, run without -f, as ffprobe did before.
+				_, err = runTool(context.Background(), "ffprobe", filepath.Dir(path), "", probeArgs(path, kindFormats[kind], ""))
 				var te *toolError
-				assert.ErrorAs(t, err, &te, "rejected by a non-zero exit")
+				require.ErrorAs(t, err, &te, "rejected by a non-zero exit")
 				if hasDemuxer(t, tc.demuxer) {
-					assert.Contains(t, toolStderr(err), "Format not on whitelist")
+					assert.Contains(t, te.Stderr(), "Format not on whitelist")
 				}
 			}
 		})
@@ -256,14 +263,143 @@ func TestProbeMedia_KindPicksFormatWhitelist(t *testing.T) { //NOSONAR go:S100 -
 		{"document", mp4, true}, {"document", webm, true}, {"document", gif, true},
 		{"sticker", webm, true}, {"sticker", mp4, false}, {"sticker", gif, false},
 	} {
-		_, err := probeMedia(context.Background(), tc.path, tc.kind)
 		if tc.ok {
+			_, err := probeMedia(context.Background(), tc.path, tc.kind)
 			assert.NoError(t, err, "%s %s", tc.kind, tc.path)
 			continue
 		}
-		assert.ErrorIs(t, err, errToolFailed, "%s %s", tc.kind, tc.path)
-		assert.Contains(t, toolStderr(err), "Format not on whitelist", "%s %s", tc.kind, tc.path)
+		// A magic the kind does not accept: refused before any run (Ruling
+		// 20 item 2), and by the whitelist, which stays, with -f pinned.
+		err := withoutToolRuns(t, func(ctx context.Context) error {
+			_, err := probeMedia(ctx, tc.path, tc.kind)
+			return err
+		})
+		assert.ErrorIs(t, err, errUnsupportedMedia, "%s %s", tc.kind, tc.path)
+		demuxer := magicDemuxer(fileHead(t, tc.path))
+		require.NotEmpty(t, demuxer, "%s", tc.path)
+		_, err = runTool(context.Background(), "ffprobe", filepath.Dir(tc.path), "", probeArgs(tc.path, kindFormats[tc.kind], demuxer))
+		var te *toolError
+		require.ErrorAs(t, err, &te, "%s %s", tc.kind, tc.path)
+		assert.Contains(t, te.Stderr(), "Format not on whitelist", "%s %s", tc.kind, tc.path)
 	}
+}
+
+// The demuxer comes from the file's first 12 bytes (Ruling 20 item 2): an
+// atom type at offset 4 for mov, the EBML magic for Matroska, the GIF
+// signature; anything else, or less, names none.
+func TestMagicDemuxer(t *testing.T) {
+	pad := func(s string) []byte { return append([]byte(s), make([]byte, probeMagicLen)...)[:probeMagicLen] }
+	atom := func(name string) []byte { return pad("\x00\x00\x00\x20" + name + "isom") }
+	for _, name := range []string{"ftyp", "moov", "mdat", "free", "skip", "wide"} {
+		assert.Equal(t, "mov", magicDemuxer(atom(name)), name)
+	}
+	for name, head := range map[string][]byte{
+		"matroska": pad("\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01"),
+		"GIF87a":   pad("GIF87a\x10\x00\x10\x00"),
+		"GIF89a":   pad("GIF89a\x10\x00\x10\x00"),
+	} {
+		want := "gif"
+		if name == "matroska" {
+			want = "matroska"
+		}
+		assert.Equal(t, want, magicDemuxer(head), name)
+	}
+	for name, head := range map[string][]byte{
+		"wav":                pad("RIFF\x24\x00\x00\x00WAVE"),
+		"avi":                pad("RIFF\x24\x00\x00\x00AVI "),
+		"mpegts":             pad("\x47\x40\x00\x10\x00"),
+		"an atom at 0":       pad("ftypisom\x00\x00\x02\x00"),
+		"another atom":       atom("uuid"),
+		"a GIF of another":   pad("GIF90a"),
+		"EBML one byte off":  pad("\x1a\x45\xdf\xa2"),
+		"11 bytes":           atom("ftyp")[:probeMagicLen-1],
+		"nothing":            nil,
+		"a playlist":         pad("#EXTM3U\n#EXT-X"),
+		"an ftyp too far on": pad("\x00\x00\x00\x00\x00ftyp"),
+	} {
+		assert.Empty(t, magicDemuxer(head), name)
+	}
+}
+
+// What the first bytes do not name as a container the kind accepts is
+// refused in Go, and ffprobe never starts (Ruling 20 item 2): self-made
+// wav, avi and MPEG-TS files, a file shorter than 12 bytes, an empty one, a
+// directory, a missing file, and each kind given a container it does not
+// take.
+func TestProbeMedia_RefusedByMagicWithoutARun(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	clip := []string{"-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10:duration=1"}
+	mp4, webm, gif := ffmpegFixture(t, mp4Args...), ffmpegFixture(t, webmArgs...), ffmpegFixture(t, gifArgs...)
+	head := fileHead(t, mp4)
+	for _, tc := range []struct{ name, kind, path string }{
+		{"wav", "document", ffmpegFixture(t, "-f", "lavfi", "-i", "sine=duration=1", "-f", "wav")},
+		{"avi", "document", ffmpegFixture(t, append(clip, "-c:v", "mjpeg", "-f", "avi")...)},
+		{"mpegts", "video", ffmpegFixture(t, append(clip, "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-f", "mpegts")...)},
+		{"11 bytes of an mp4", "document", textFixture(t, "media", string(head[:probeMagicLen-1]))},
+		{"empty", "document", textFixture(t, "media", "")},
+		{"a directory", "document", t.TempDir()},
+		{"missing", "document", filepath.Join(t.TempDir(), "media")},
+		{"gif as sticker", "sticker", gif},
+		{"mp4 as sticker", "sticker", mp4},
+		{"gif as video", "video", gif},
+		{"gif as video_note", "video_note", gif},
+		{"webm as animation", "animation", webm},
+	} {
+		err := withoutToolRuns(t, func(ctx context.Context) error {
+			_, err := probeMedia(ctx, tc.path, tc.kind)
+			return err
+		})
+		assert.ErrorIs(t, err, errUnsupportedMedia, tc.name)
+		assert.NotErrorIs(t, err, errToolFailed, tc.name)
+	}
+}
+
+// The probe's own run pins -f to the demuxer the magic named. A stand-in
+// ffprobe prints the arguments it was given and fails.
+func TestProbeMedia_PinsTheDemuxer(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	mp4, webm, gif := ffmpegFixture(t, mp4Args...), ffmpegFixture(t, webmArgs...), ffmpegFixture(t, gifArgs...)
+	fakeTool(t, "ffprobe", `echo "$*" >&2; exit 1`)
+	for _, tc := range []struct{ kind, path, want string }{
+		{"video", mp4, " -format_whitelist mov,matroska -f mov -codec_whitelist "},
+		{"sticker", webm, " -format_whitelist matroska -f matroska -codec_whitelist "},
+		{"animation", gif, " -format_whitelist mov,gif -f gif -codec_whitelist "},
+	} {
+		_, err := probeMedia(context.Background(), tc.path, tc.kind)
+		require.ErrorIs(t, err, errToolFailed, tc.kind)
+		assert.Contains(t, toolStderr(err), tc.want, tc.kind)
+	}
+}
+
+// fileHead is the first probeMagicLen bytes of the file at path.
+func fileHead(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path) // #nosec G304 -- a fixture of the test's own
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(data), probeMagicLen)
+	return data[:probeMagicLen]
+}
+
+// withoutToolRuns calls f while the test holds every toolSlots slot, so no
+// ffprobe or ffmpeg can start: every run takes a slot before its process
+// starts, and one that would run waits until f's context ends. It fails the
+// test if f waited, and returns f's error. Production keeps no hook for
+// this: the slots are its own.
+func withoutToolRuns(t *testing.T, f func(ctx context.Context) error) error {
+	t.Helper()
+	for range cap(toolSlots) {
+		toolSlots <- struct{}{}
+	}
+	defer func() {
+		for range cap(toolSlots) {
+			<-toolSlots
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := f(ctx)
+	require.NotErrorIs(t, err, context.DeadlineExceeded, "it waited for a slot, so it would have run a tool")
+	return err
 }
 
 func TestProbeMedia_DecoderAllowlist(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
@@ -346,7 +482,9 @@ func ffprobeRun(t *testing.T, path, drop string) (probed struct {
 	Streams []probeStream `json:"streams"`
 }, err error) {
 	t.Helper()
-	args := probeArgs(path, kindFormats["document"])
+	demuxer, err := probeDemuxer(path, kindFormats["document"])
+	require.NoError(t, err)
+	args := probeArgs(path, kindFormats["document"], demuxer)
 	if i := slices.Index(args, drop); drop != "" {
 		require.GreaterOrEqual(t, i, 0, "probeMedia passes %s", drop)
 		args = slices.Delete(args, i, i+2)
@@ -556,10 +694,10 @@ func TestParseProbe(t *testing.T) {
 
 func TestToolArgs_Probe(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	in := filepath.Join(t.TempDir(), "media")
-	got := toolArgs(toolRun{tool: "ffprobe", formats: "mov,matroska", codecs: probeCodecs, input: in, output: probeOutput})
+	got := probeArgs(in, []string{"mov", "matroska"}, "mov")
 	assert.Equal(t, []string{
 		"-hide_banner", "-loglevel", "error", "-max_alloc", "134217728",
-		"-protocol_whitelist", "file", "-format_whitelist", "mov,matroska",
+		"-protocol_whitelist", "file", "-format_whitelist", "mov,matroska", "-f", "mov",
 		"-codec_whitelist", probeCodecs, "-max_pixels", "16777216", "-max_streams", "32", "-threads", "1",
 		"-i", "file:" + in,
 		"-show_entries", "format=format_name,duration,start_time:stream=codec_type,codec_name,width,height,duration,start_time:stream_disposition=attached_pic:stream_tags=alpha_mode,DURATION:stream_side_data=rotation",
@@ -584,7 +722,7 @@ func TestToolArgs_MaxAlloc(t *testing.T) { //NOSONAR go:S100 -- underscore separ
 		font string
 		args []string
 	}{
-		"ffprobe": {"", probeArgs(path, kindFormats["video"])},
+		"ffprobe": {"", probeArgs(path, kindFormats["video"], "mov")},
 		"ffmpeg":  {font, renderArgs(path, plan, font, 120)},
 	} {
 		t.Run(tool, func(t *testing.T) {

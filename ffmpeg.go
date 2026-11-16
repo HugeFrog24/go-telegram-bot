@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
@@ -163,10 +164,12 @@ func extForFormat(format string) string {
 }
 
 // probeMedia runs ffprobe on path under the allowlists for kind (a watchable
-// kind: "video", "animation", "video_note", "document" or "sticker"), then
-// checks the result in Go. Anything the checks refuse is errUnsupportedMedia,
-// an ffprobe failure (a whitelist refusal among them) errToolFailed; a
-// timeout or cancellation is the context's error.
+// kind: "video", "animation", "video_note", "document" or "sticker"), with
+// -f pinned to the demuxer the file's first bytes name (probeDemuxer), then
+// checks the result in Go. Anything the checks refuse, the first bytes
+// included, is errUnsupportedMedia, an ffprobe failure (a whitelist refusal
+// among them) errToolFailed; a timeout or cancellation is the context's
+// error.
 func probeMedia(ctx context.Context, path, kind string) (mediaProbe, error) {
 	formats, ok := kindFormats[kind]
 	if !ok {
@@ -176,24 +179,82 @@ func probeMedia(ctx context.Context, path, kind string) (mediaProbe, error) {
 	if err != nil {
 		return mediaProbe{}, err
 	}
+	demuxer, err := probeDemuxer(abs, formats)
+	if err != nil {
+		return mediaProbe{}, err
+	}
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	out, err := runTool(ctx, "ffprobe", filepath.Dir(abs), "", probeArgs(abs, formats))
+	out, err := runTool(ctx, "ffprobe", filepath.Dir(abs), "", probeArgs(abs, formats, demuxer))
 	if err != nil {
 		return mediaProbe{}, toolFailure(err)
 	}
 	return parseProbe(out, kind)
 }
 
-// probeArgs is the ffprobe argument vector for an absolute input path.
-func probeArgs(input string, formats []string) []string {
+// probeArgs is the ffprobe argument vector for an absolute input path, with
+// -f demuxer (probeDemuxer's) unless demuxer is "".
+func probeArgs(input string, formats []string, demuxer string) []string {
 	return toolArgs(toolRun{
 		tool:    "ffprobe",
 		formats: strings.Join(formats, ","),
+		demuxer: demuxer,
 		codecs:  probeCodecs,
 		input:   input,
 		output:  probeOutput,
 	})
+}
+
+// probeMagicLen is how much of a file magicDemuxer looks at, and all that
+// probeDemuxer reads.
+const probeMagicLen = 12
+
+// magicDemuxer is the demuxer the first probeMagicLen bytes of a file name
+// (Ruling 20 item 2), or "" for none or a shorter head: an ISO BMFF or
+// QuickTime atom type at offset 4 (ftyp, moov, mdat, free, skip or wide) is
+// mov, the EBML magic 1A 45 DF A3 matroska, and GIF87a or GIF89a gif.
+func magicDemuxer(head []byte) string {
+	if len(head) < probeMagicLen {
+		return ""
+	}
+	switch {
+	case bytes.HasPrefix(head, []byte{0x1A, 0x45, 0xDF, 0xA3}):
+		return "matroska"
+	case bytes.HasPrefix(head, []byte("GIF87a")), bytes.HasPrefix(head, []byte("GIF89a")):
+		return "gif"
+	}
+	switch string(head[4:8]) {
+	case "ftyp", "moov", "mdat", "free", "skip", "wide":
+		return "mov"
+	}
+	return ""
+}
+
+// probeDemuxer is the demuxer ffprobe is pinned to with -f for the file at
+// abs, the path probeMedia gives ffprobe: the one its first probeMagicLen
+// bytes name (magicDemuxer), which must be on formats, the kind's
+// whitelist. Without -f, ffprobe would run every compiled-in demuxer's
+// read_probe on the untrusted bytes before the whitelist applies (Ruling 20
+// item 2). A file it cannot read that far, or whose bytes name no demuxer
+// the kind accepts, is errUnsupportedMedia, and no tool runs.
+func probeDemuxer(abs string, formats []string) (string, error) {
+	f, err := os.Open(abs) // #nosec G304 -- the bot's own download, the path ffprobe would get
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", errUnsupportedMedia, err)
+	}
+	defer func() { _ = f.Close() }()
+	head := make([]byte, probeMagicLen)
+	if _, err := io.ReadFull(f, head); err != nil {
+		return "", fmt.Errorf("%w: reading its first %d bytes: %w", errUnsupportedMedia, probeMagicLen, err)
+	}
+	demuxer := magicDemuxer(head)
+	switch {
+	case demuxer == "":
+		return "", fmt.Errorf("%w: its first bytes name no container the bot watches", errUnsupportedMedia)
+	case !slices.Contains(formats, demuxer):
+		return "", fmt.Errorf("%w: %s is not a container for this kind", errUnsupportedMedia, demuxer)
+	}
+	return demuxer, nil
 }
 
 // probeStream is one stream of ffprobe's JSON output.
@@ -377,7 +438,7 @@ func toolFailure(err error) error {
 type toolRun struct {
 	tool      string   // "ffprobe" or "ffmpeg"
 	formats   string   // -format_whitelist
-	demuxer   string   // -f, pinned from the probe (render only)
+	demuxer   string   // -f: from the first bytes (probe) or the probed format (render)
 	codecs    string   // -codec_whitelist
 	decoder   string   // input -c:v (alpha inputs only)
 	timeLimit int      // -timelimit CPU seconds (ffmpeg only, and only where toolTimeLimitFlag)
