@@ -44,6 +44,12 @@ const sandboxExe = "/proc/self/exe"
 // toolOpenFiles is RLIMIT_NOFILE inside the sandbox.
 const toolOpenFiles = 64
 
+// toolThreadHeadroom is how many tasks a tool may add to its user's count
+// (RLIMIT_NPROC, Ruling 18 item 2): ffmpeg's decoder, filter and encoder
+// threads with room to spare, but no thread bomb. With compose's pids_limit
+// of 256, four runs and the bot fit.
+const toolThreadHeadroom = 32
+
 // A spec's memory limit and CPU seconds must be within these bounds.
 const (
 	minSandboxMemory = 64 << 20
@@ -394,25 +400,36 @@ func sandboxABI(kernel int, err error, allowUnsandboxed bool) (int, error) {
 	return kernel, nil
 }
 
-// setToolLimits sets core and file size to 0, open files to toolOpenFiles
-// and CPU time to cpu seconds (Ruling 16 item 2: ffprobe has no -timelimit),
-// and checks that the address-space limit can be set to memory: a hard limit
-// already below it is an error, never clamped (Ruling 14 note 3).
-// underMemoryLimit sets that one. A lower inherited open-files or CPU hard
-// limit is kept: it is only stricter.
+// setToolLimits sets core and file size to 0, open files to toolOpenFiles,
+// CPU time to cpu seconds (Ruling 16 item 2: ffprobe has no -timelimit) and
+// the uid's tasks to its count now plus toolThreadHeadroom (Ruling 18 item
+// 2), and checks that the address-space limit can be set to memory: a hard
+// limit already below it is an error, never clamped (Ruling 14 note 3).
+// underMemoryLimit sets that one. A lower inherited open-files, CPU or task
+// hard limit is kept: it is only stricter.
 func setToolLimits(memory, cpu uint64) error {
-	var as, files, cpuTime syscall.Rlimit
+	var as, files, cpuTime, tasks syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_AS, &as); err != nil {
 		return fmt.Errorf("getrlimit RLIMIT_AS: %w", err)
 	}
 	if as.Max < memory {
 		return fmt.Errorf("the hard address-space limit %d is below the %d ffmpeg runs under", as.Max, memory)
 	}
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &files); err != nil {
-		return fmt.Errorf("getrlimit RLIMIT_NOFILE: %w", err)
+	for _, l := range []struct {
+		resource int
+		limit    *syscall.Rlimit
+	}{{syscall.RLIMIT_NOFILE, &files}, {syscall.RLIMIT_CPU, &cpuTime}, {unix.RLIMIT_NPROC, &tasks}} {
+		if err := syscall.Getrlimit(l.resource, l.limit); err != nil {
+			return fmt.Errorf("getrlimit %d: %w", l.resource, err)
+		}
 	}
-	if err := syscall.Getrlimit(syscall.RLIMIT_CPU, &cpuTime); err != nil {
-		return fmt.Errorf("getrlimit RLIMIT_CPU: %w", err)
+	visible, err := uidTasks(os.Getuid())
+	if err != nil {
+		return fmt.Errorf("counting the user's tasks: %w", err)
+	}
+	running, err := kernelUIDTasks(visible, tasks.Max)
+	if err != nil {
+		return err
 	}
 	for _, l := range []struct {
 		name     string
@@ -423,6 +440,7 @@ func setToolLimits(memory, cpu uint64) error {
 		{"RLIMIT_FSIZE", syscall.RLIMIT_FSIZE, 0},
 		{"RLIMIT_NOFILE", syscall.RLIMIT_NOFILE, min(toolOpenFiles, files.Max)},
 		{"RLIMIT_CPU", syscall.RLIMIT_CPU, min(cpu, cpuTime.Max)},
+		{"RLIMIT_NPROC", unix.RLIMIT_NPROC, min(uint64(running)+toolThreadHeadroom, tasks.Max)}, // #nosec G115 -- a count
 	} {
 		// syscall's Setrlimit, not unix's: for RLIMIT_NOFILE it also stops
 		// Go restoring the limit it saved at startup in a later exec.
@@ -431,6 +449,111 @@ func setToolLimits(memory, cpu uint64) error {
 		}
 	}
 	return nil
+}
+
+// uidTasks counts the tasks (threads) whose real uid is uid, which is what
+// RLIMIT_NPROC limits, from /proc. It runs before Landlock takes /proc away.
+// A process that ends while it is read is skipped.
+func uidTasks(uid int) (int, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, err
+	}
+	want := strconv.Itoa(uid)
+	count := 0
+	for _, e := range entries {
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue // not a process
+		}
+		status, err := os.ReadFile(filepath.Join("/proc", e.Name(), "status")) // #nosec G304 -- a procfs path
+		if err != nil {
+			continue
+		}
+		var realUID string
+		threads := 0
+		for line := range strings.SplitSeq(string(status), "\n") {
+			if v, ok := strings.CutPrefix(line, "Uid:"); ok {
+				if f := strings.Fields(v); len(f) > 0 {
+					realUID = f[0]
+				}
+			} else if v, ok := strings.CutPrefix(line, "Threads:"); ok {
+				threads, _ = strconv.Atoi(strings.TrimSpace(v))
+			}
+		}
+		if realUID == want {
+			count += threads
+		}
+	}
+	return count, nil
+}
+
+// taskProbe is a path no exec can find: a probe fork's child fails at once.
+const taskProbe = "/proc/self/media-sandbox-task-probe"
+
+// kernelUIDTasks is the kernel's own count of the user's tasks, which is
+// what RLIMIT_NPROC compares with. /proc shows only this PID namespace's
+// tasks (visible, a lower bound), while a container shares its uid with the
+// host and other containers: in Docker, uid 1000 with 1 visible task could
+// not fork under a limit of 40. So the count is found by trying: a fork
+// succeeds exactly while the count is below the soft limit. Each try is one
+// vfork whose child's exec fails and which ForkExec reaps. A limit that
+// never lets a fork through means the user is out of tasks already.
+func kernelUIDTasks(visible int, hard uint64) (int, error) {
+	lo, hi, err := taskBracket(uint64(visible), hard) // #nosec G115 -- a count
+	if err != nil {
+		return 0, err
+	}
+	if ok, err := forksUnder(lo, hard); err != nil || ok {
+		return visible, err // the limit is not enforced (a privileged user): the count is moot
+	}
+	for hi-lo > 1 {
+		mid := lo + (hi-lo)/2
+		ok, err := forksUnder(mid, hard)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	return int(lo), nil // #nosec G115 -- a count: the smallest limit that forks is the count plus one
+}
+
+// taskBracket finds limits lo, which does not let a fork through (the count
+// is at least visible), and hi, which does, by doubling.
+func taskBracket(visible, hard uint64) (lo, hi uint64, err error) {
+	lo, hi = visible, visible+2*toolThreadHeadroom
+	for {
+		hi = min(hi, hard)
+		ok, err := forksUnder(hi, hard)
+		switch {
+		case err != nil:
+			return 0, 0, err
+		case ok:
+			return lo, hi, nil
+		case hi == hard:
+			return 0, 0, fmt.Errorf("the user has reached its task limit (%d)", hard)
+		}
+		lo, hi = hi, 2*hi
+	}
+}
+
+// forksUnder reports whether a fork succeeds with RLIMIT_NPROC's soft limit
+// at limit: whether the user has fewer tasks than that.
+func forksUnder(limit, hard uint64) (bool, error) {
+	if err := syscall.Setrlimit(unix.RLIMIT_NPROC, &syscall.Rlimit{Cur: limit, Max: hard}); err != nil {
+		return false, fmt.Errorf("setrlimit RLIMIT_NPROC: %w", err)
+	}
+	_, err := syscall.ForkExec(taskProbe, []string{taskProbe}, &syscall.ProcAttr{})
+	switch {
+	case errors.Is(err, syscall.ENOENT):
+		return true, nil // forked; the exec failed, as meant
+	case errors.Is(err, syscall.EAGAIN):
+		return false, nil
+	}
+	return false, fmt.Errorf("a task-count probe: %w", err)
 }
 
 // underMemoryLimit sets RLIMIT_AS, soft and hard, to memory and then makes

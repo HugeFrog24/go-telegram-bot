@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -52,7 +53,9 @@ func init() {
 	// toolMemoryLimit, so it gets room. Real tools keep the cap.
 	// "noseccomp-" in front of a stand-in's name runs it without the seccomp
 	// filter, for tests whose stand-ins must fork; "abi4-" holds Landlock to
-	// ABI 4, before it scoped signals.
+	// ABI 4, before it scoped signals; "bigmem-" gives 32 GiB, so that a
+	// thread bomb meets RLIMIT_NPROC before glibc's per-thread stacks and
+	// malloc arenas meet RLIMIT_AS.
 	sandboxTestVariant = func(tool string) sandboxVariant {
 		var v sandboxVariant
 		name := filepath.Base(tool)
@@ -65,6 +68,8 @@ func init() {
 				v.noSeccomp, name = true, strings.TrimPrefix(name, "noseccomp-")
 			case strings.HasPrefix(name, "abi4-"):
 				v.maxABI, name = 4, strings.TrimPrefix(name, "abi4-")
+			case strings.HasPrefix(name, "bigmem-"):
+				v.memory, name = 32<<30, strings.TrimPrefix(name, "bigmem-")
 			default:
 				return v
 			}
@@ -77,6 +82,7 @@ func init() {
 	testStandIns["noseccomp-tcp-dial"] = tcpDialStandIn
 	testStandIns["sandbox-parent"] = sandboxParentStandIn
 	testStandIns["truncate-path"] = truncatePathStandIn
+	testStandIns["bigmem-sandbox-probe"] = sandboxProbeStandIn
 	// The probe also answers to its variants' names: "noseccomp-" runs it
 	// without the seccomp filter, "abi4-" with Landlock held to ABI 4.
 	for _, variant := range []string{"", "noseccomp-", "abi4-", "noseccomp-abi4-"} {
@@ -196,6 +202,33 @@ var probeActions = map[string]func(args []string) error{
 			return err
 		}
 		return syscall.PtraceDetach(pid)
+	},
+	// threads <n>: start n OS threads at once, a thread bomb.
+	"threads": func(args []string) error {
+		n, err := strconv.Atoi(args[0])
+		if err != nil {
+			return err
+		}
+		// A failed thread start then prints its error and dies, without a
+		// dump of every goroutine that would push the error out of the
+		// stderr tail: debug.SetTraceback quiets the runtime's own
+		// newosproc throw, and catching SIGABRT stops the dump on a cgo
+		// build, whose pthread_create failure calls abort, which then
+		// re-raises SIGABRT at its default action.
+		debug.SetTraceback("none")
+		signal.Notify(make(chan os.Signal, 1), syscall.SIGABRT)
+		ready, block := make(chan struct{}), make(chan struct{})
+		for range n {
+			go func() {
+				runtime.LockOSThread()
+				ready <- struct{}{}
+				<-block
+			}()
+		}
+		for range n {
+			<-ready
+		}
+		return nil
 	},
 	// raise: abort the way C code does, raise(SIGABRT) with tgkill on this
 	// thread and the default action. It must die of it.
@@ -485,6 +518,29 @@ func TestMediaSandbox_Seccomp(t *testing.T) { //NOSONAR go:S100 -- underscore se
 	assert.True(t, ws.Signaled() && ws.Signal() == syscall.SIGABRT, "died of SIGABRT: %v, %q", exitErr, toolStderr(err))
 }
 
+// A tool cannot exhaust the uid's tasks: RLIMIT_NPROC holds it to the
+// uid's task count at its start plus toolThreadHeadroom (Ruling 18 item 2).
+// A stand-in that starts 64 threads, well within its 32 GiB of address
+// space, dies of a failed thread creation, and the bot can still start
+// threads.
+func TestMediaSandbox_ThreadCap(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	allowUnsandboxedWhereNeeded(t)
+	standInTool(t, "bigmem-sandbox-probe")
+	_, err := runTool(context.Background(), "bigmem-sandbox-probe", inputDir(t), "", []string{"threads", "64"})
+	var te *toolError
+	require.ErrorAs(t, err, &te, "64 threads are over the cap")
+	assert.Regexp(t, `pthread_create failed|failed to create new OS thread`, te.Stderr())
+
+	_, err = runTool(context.Background(), "bigmem-sandbox-probe", inputDir(t), "", []string{"threads", "8"})
+	assert.NoError(t, err, "a tool's own handful of threads fits: %q", toolStderr(err))
+	done := make(chan struct{})
+	go func() {
+		runtime.LockOSThread()
+		close(done)
+	}()
+	<-done // the bot's own thread creation is untouched
+}
+
 // A tool may execute only itself and its ELF interpreter, and read only the
 // library, font and fontconfig directories and the loader files: no longer
 // the rest of /usr, such as another program (Ruling 16 item 6).
@@ -640,6 +696,12 @@ func TestMediaSandbox_Limits(t *testing.T) { //NOSONAR go:S100 -- underscore sep
 	assert.Equal(t, []string{"64", "64", "files"}, limitFields(t, limits, "Max open files"), "Go's exec must not restore its saved limit")
 	cpu := strconv.Itoa(cpuTimeLimit(context.Background())) // twice the call's timeout (Ruling 16 item 2)
 	assert.Equal(t, []string{cpu, cpu, "seconds"}, limitFields(t, limits, "Max cpu time"), "ffprobe has no -timelimit: RLIMIT_CPU covers both tools")
+	tasks := limitFields(t, limits, "Max processes") // RLIMIT_NPROC: the user's tasks at the start plus toolThreadHeadroom (Ruling 18 item 2)
+	require.Len(t, tasks, 3)
+	assert.Equal(t, tasks[0], tasks[1], "soft and hard")
+	n, err := strconv.Atoi(tasks[0])
+	require.NoError(t, err, "a number, not unlimited")
+	assert.Greater(t, n, toolThreadHeadroom)
 
 	assert.Equal(t, "1000", strings.TrimSpace(procFile(t, pid, "oom_score_adj")), "the OOM killer's first choice")
 	assert.Contains(t, procFile(t, pid, "status"), "NoNewPrivs:\t1")
