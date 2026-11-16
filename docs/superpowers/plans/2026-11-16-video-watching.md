@@ -226,7 +226,7 @@ func TestNewBot_VideoGate(t *testing.T) //NOSONAR ...
 
 ### Task 2: ffmpeg layer: probe, sizing and timestamped sheets
 
-**Files:** Create `ffmpeg.go`, `ffmpeg_test.go`.
+**Files:** Create `ffmpeg.go`, `ffmpeg_test.go`, and the build-tagged pair `ffmpeg_linux.go` / `ffmpeg_other.go` (Pdeathsig, Ruling 8).
 
 **Interfaces:**
 - Consumes: `VideoConfig` (Task 1).
@@ -242,13 +242,17 @@ const (
 	lookupTimeout      = 20 * time.Second
 )
 type mediaProbe struct {
-	Format   string  // ffprobe format_name
+	Format   string  // ffprobe format_name; render calls pin -f (and -format_whitelist) to its first name
+	Codec    string  // codec_name of the chosen stream (first video stream with attached_pic=0)
 	Duration float64 // seconds; 0 when unknown
 	Width, Height int
 	HasAlpha bool    // VP9/WebM with alpha (video stickers)
 }
 var errUnsupportedMedia = errors.New("unsupported media")
-func probeMedia(ctx context.Context, path string) (mediaProbe, error)       // allowlist + ≥1 video stream, else errUnsupportedMedia
+// kind is watchable.Kind ("video" | "animation" | "video_note" | "document" | "sticker") and picks the
+// per-kind -format_whitelist from the security decisions doc; an unknown kind → errUnsupportedMedia (Ruling 8)
+func probeMedia(ctx context.Context, path, kind string) (mediaProbe, error) // allowlists + chosen stream rules, else errUnsupportedMedia
+func extForFormat(format string) string // "mov,…" → "mp4", "matroska,webm" → "webm", "gif" → "gif", else ""
 func fitImageSize(w, h, maxEdge int) (int, int)                              // largest same-aspect size ≤ maxEdge and ≤ maxImageTokens; never above (w,h)
 func gridFor(n int) (cols, rows int)
 type sheetSpec struct {
@@ -284,10 +288,10 @@ func TestRenderSheet_Timeout(t *testing.T)              //NOSONAR ... // already
 ```
 
 - [ ] **Step 2: Run them:** `go test -run 'TestFitImageSize|TestGridFor|TestProbeMedia|TestRenderSheet' ./...`. Expected: compile failure.
-- [ ] **Step 3: Implement `ffmpeg.go`** per the interfaces, the hardening line in Global Constraints, and every Task 0 recommendation the controller adopted for Task 2. Add a test for each adopted flag or limit that can be observed (for example a rejected format, or a capped resource). Decode JPEG dimensions with `image.DecodeConfig`; that's stdlib, so no new dependency.
+- [ ] **Step 3: Implement `ffmpeg.go`** per the interfaces and the **binding** Task 2 section of `docs/superpowers/research/2026-11-16-untrusted-video-parsing-decisions.md` (it supersedes the hardening line in Global Constraints; items 1–13). Add a test for each adopted flag or limit that can be observed (for example a rejected format, or a capped resource). Decode JPEG dimensions with `image.DecodeConfig`; that's stdlib, so no new dependency.
 - [ ] **Step 4: Run them with the race detector:** `go test -race -count=3 -run '…same…' ./...`. Expected: PASS.
 - [ ] **Step 5: Run the full suite, then the duplication check.**
-- [ ] **Step 6: Commit:** `git add ffmpeg.go ffmpeg_test.go`, then commit `feat: ffmpeg probe, sizing rule and timestamped sheets`.
+- [ ] **Step 6: Commit:** `git add ffmpeg.go ffmpeg_test.go ffmpeg_linux.go ffmpeg_other.go`, then commit `feat: ffmpeg probe, sizing rule and timestamped sheets`.
 
 ---
 
@@ -397,8 +401,9 @@ type watchable struct {
 	FileID    string
 	FileSize  int64  // 0 when unknown
 	Duration  int    // Telegram seconds; 0 when unknown
-	Ext       string // "mp4", "webm", "gif" (from mime/kind)
 }
+// No Ext field (Ruling 8): downloads are saved extensionless and the stored extension is
+// extForFormat(probe.Format), never Telegram's file_path or the user's file_name.
 func watchableMedia(msg *models.Message) (watchable, bool)
 // video, animation, video_note, document with video/* or image/gif mime, sticker with IsVideo (Kind "sticker")
 type preparedMedia struct {
