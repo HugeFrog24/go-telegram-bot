@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -251,32 +252,62 @@ func TestProbeMedia_Caps(t *testing.T) { //NOSONAR go:S100 -- underscore separat
 	for range 33 {
 		maps = append(maps, "-map", "0:v")
 	}
-	// How each cap shows depends on the ffmpeg version: ffprobe may exit
-	// non-zero, or report what the cap left (0×0 under -max_pixels on 8.x and
-	// 9.x; 32 streams under -max_streams). Any of these is a refusal.
-	for _, tc := range []struct {
-		name  string
-		wants []string
-		args  []string
-	}{
-		{"over -max_pixels (4100×4100)", []string{"0x0 is not a usable size", "4100x4100 is not a usable size"},
-			[]string{"-f", "lavfi", "-i", "testsrc2=size=4100x4100:rate=1", "-frames:v", "1", "-f", "gif"}},
-		{"side over 8192 (8200×16)", []string{"8200x16 is not a usable size"},
-			[]string{"-f", "lavfi", "-i", "testsrc2=size=8200x16:rate=1", "-frames:v", "1", "-f", "gif"}},
-		{"33 streams (-max_streams 32)", []string{"32 streams", "33 streams"},
-			append(maps, "-c:v", "libx264", "-preset", "ultrafast", "-f", "matroska")},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := probeMedia(context.Background(), ffmpegFixture(t, tc.args...), "document")
-			require.ErrorIs(t, err, errUnsupportedMedia)
-			var te *toolError
-			matched := errors.As(err, &te)
-			for _, want := range tc.wants {
-				matched = matched || strings.Contains(err.Error(), want)
-			}
-			assert.True(t, matched, "refused by ffprobe's exit or by the Go check, got: %v", err)
-		})
+	big := ffmpegFixture(t, "-f", "lavfi", "-i", "testsrc2=size=4100x4100:rate=1", "-frames:v", "1", "-f", "gif")
+	wide := ffmpegFixture(t, "-f", "lavfi", "-i", "testsrc2=size=8200x16:rate=1", "-frames:v", "1", "-f", "gif")
+	many := ffmpegFixture(t, append(maps, "-c:v", "libx264", "-preset", "ultrafast", "-f", "matroska")...)
+
+	t.Run("refused", func(t *testing.T) {
+		for _, path := range []string{big, wide, many} {
+			_, err := probeMedia(context.Background(), path, "document")
+			assert.ErrorIs(t, err, errUnsupportedMedia)
+		}
+	})
+
+	// The flags themselves: the same file through probeMedia's own arguments,
+	// with and without the flag, must come out differently. How each cap
+	// shows depends on the version (a failed run, a 0×0 stream, a shorter
+	// stream list), so the test skips only when this ffprobe shows the file
+	// the same way with and without the flag.
+	t.Run("-max_pixels", func(t *testing.T) {
+		without, err := ffprobeRun(t, big, "-max_pixels")
+		require.NoError(t, err)
+		require.NotEmpty(t, without.Streams)
+		if without.Streams[0].Width != 4100 {
+			t.Skipf("this ffprobe reports %dx%d without the cap", without.Streams[0].Width, without.Streams[0].Height)
+		}
+		with, err := ffprobeRun(t, big, "")
+		assert.True(t, err != nil || len(with.Streams) == 0 || with.Streams[0].Width != 4100,
+			"-max_pixels stops the 4100x4100 frame: a failed run or a size other than 4100x4100, got %+v, %v", with, err)
+	})
+
+	t.Run("-max_streams", func(t *testing.T) {
+		without, err := ffprobeRun(t, many, "-max_streams")
+		require.NoError(t, err)
+		if len(without.Streams) != 33 {
+			t.Skipf("this ffprobe lists %d streams without the cap", len(without.Streams))
+		}
+		with, err := ffprobeRun(t, many, "")
+		assert.True(t, err != nil || len(with.Streams) < len(without.Streams),
+			"-max_streams stops at 32 streams: a failed run or fewer than 33 listed, got %d, %v", len(with.Streams), err)
+	})
+}
+
+// ffprobeRun runs ffprobe on path with probeMedia's arguments, less the
+// option drop (and its value) when drop is not "", and parses the streams.
+func ffprobeRun(t *testing.T, path, drop string) (probed struct {
+	Streams []probeStream `json:"streams"`
+}, err error) {
+	t.Helper()
+	args := probeArgs(path, kindFormats["document"])
+	if i := slices.Index(args, drop); drop != "" {
+		require.GreaterOrEqual(t, i, 0, "probeMedia passes %s", drop)
+		args = slices.Delete(args, i, i+2)
 	}
+	out, err := runTool(context.Background(), "ffprobe", filepath.Dir(path), args)
+	if err == nil {
+		err = json.Unmarshal(out, &probed)
+	}
+	return probed, err
 }
 
 func TestProbeMedia_VideoShorterThanAudio(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names

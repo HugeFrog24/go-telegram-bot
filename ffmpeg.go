@@ -148,17 +148,22 @@ func probeMedia(ctx context.Context, path, kind string) (mediaProbe, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	out, err := runTool(ctx, "ffprobe", filepath.Dir(abs), toolArgs(toolRun{
-		tool:    "ffprobe",
-		formats: strings.Join(formats, ","),
-		codecs:  probeCodecs,
-		input:   abs,
-		output:  probeOutput,
-	}))
+	out, err := runTool(ctx, "ffprobe", filepath.Dir(abs), probeArgs(abs, formats))
 	if err != nil {
 		return mediaProbe{}, decodeFailure(err)
 	}
 	return parseProbe(out, formats)
+}
+
+// probeArgs is the ffprobe argument vector for an absolute input path.
+func probeArgs(input string, formats []string) []string {
+	return toolArgs(toolRun{
+		tool:    "ffprobe",
+		formats: strings.Join(formats, ","),
+		codecs:  probeCodecs,
+		input:   input,
+		output:  probeOutput,
+	})
 }
 
 // probeStream is one stream of ffprobe's JSON output.
