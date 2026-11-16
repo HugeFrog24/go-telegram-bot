@@ -1070,7 +1070,11 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	return b.buf.Write(p)
 }
 
-// tailBuffer keeps the last max bytes written to it.
+// tailBuffer keeps the last max bytes written to it. A write appends, and
+// only once the buffer holds twice max does it drop all but the last max,
+// so each byte is copied a bounded number of times however small the writes
+// (Ruling 21 item 3): trimming on every write moved the whole tail each
+// time, and a tool writing stderr a byte at a time cost the bot a core.
 type tailBuffer struct {
 	buf []byte
 	max int
@@ -1083,13 +1087,14 @@ func (t *tailBuffer) Write(p []byte) (int, error) {
 		return n, nil
 	}
 	t.buf = append(t.buf, p...)
-	if over := len(t.buf) - t.max; over > 0 {
-		t.buf = t.buf[:copy(t.buf, t.buf[over:])]
+	if len(t.buf) >= 2*t.max {
+		t.buf = t.buf[:copy(t.buf, t.buf[len(t.buf)-t.max:])]
 	}
 	return n, nil
 }
 
-func (t *tailBuffer) String() string { return string(t.buf) }
+// String is the kept tail: the last max bytes written.
+func (t *tailBuffer) String() string { return string(t.buf[max(0, len(t.buf)-t.max):]) }
 
 // fitImageSize returns the largest size with the aspect of w×h whose long edge
 // is at most maxEdge and whose ⌈w/28⌉ × ⌈h/28⌉ is at most maxImageTokens. It

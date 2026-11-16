@@ -10,6 +10,7 @@ import (
 	"image/jpeg"
 	"log"
 	"math"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1121,6 +1122,71 @@ func TestTailBuffer(t *testing.T) {
 	}
 	assert.Equal(t, "tuvwxyz1", tb.String())
 	assert.Equal(t, 64<<10, toolStderrTail)
+}
+
+// The kept tail is the last toolStderrTail bytes of everything written,
+// whatever the write sizes: single bytes, short runs, runs that cross the
+// trim point, and runs longer than the tail itself (Ruling 21 item 3).
+func TestTailBuffer_KeepsTheLastBytes(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	rng := rand.New(rand.NewPCG(1, 2)) // #nosec G404 -- test data
+	tb := tailBuffer{max: toolStderrTail}
+	var all []byte
+	for i := 0; len(all) < 6*toolStderrTail; i++ {
+		var n int
+		switch i % 5 {
+		case 0, 1:
+			n = 1
+		case 2:
+			n = rng.IntN(300)
+		case 3:
+			n = rng.IntN(3 * toolStderrTail / 2)
+		default:
+			n = toolStderrTail + rng.IntN(toolStderrTail)
+		}
+		p := make([]byte, n)
+		for j := range p {
+			p[j] = byte(rng.Uint32())
+		}
+		written, err := tb.Write(p)
+		require.NoError(t, err)
+		require.Equal(t, n, written)
+		all = append(all, p...)
+		want := all[max(0, len(all)-toolStderrTail):]
+		require.Equal(t, string(want), tb.String(), "after %d bytes", len(all))
+		require.LessOrEqual(t, cap(tb.buf), 4*toolStderrTail, "the buffer stays bounded")
+	}
+}
+
+// One-byte writes into a full tail cost O(1) each, amortized: the tail is
+// trimmed once it holds twice what it keeps, not on every write. Before,
+// each write moved the whole 64 KiB, so a tool writing stderr a byte at a
+// time cost the bot about a core per run (Ruling 21 item 3). Four megabytes of
+// such writes must finish well inside the budget; the old way it was 256 GiB
+// of copying.
+func TestTailBuffer_OneByteWritesAreCheap(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	tb := tailBuffer{max: toolStderrTail}
+	_, _ = tb.Write(bytes.Repeat([]byte("x"), toolStderrTail))
+	const writes, budget = 4 << 20, 2 * time.Second
+	b := []byte{'y'}
+	start := time.Now()
+	for i := range writes {
+		_, _ = tb.Write(b)
+		if i%4096 == 0 && time.Since(start) > budget {
+			t.Fatalf("%d one-byte writes took over %v: each write copies the tail", i, budget)
+		}
+	}
+	t.Logf("%d one-byte writes in %v", writes, time.Since(start))
+	assert.Equal(t, strings.Repeat("y", toolStderrTail), tb.String())
+}
+
+func BenchmarkTailBuffer_OneByteWrites(b *testing.B) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	tb := tailBuffer{max: toolStderrTail}
+	_, _ = tb.Write(bytes.Repeat([]byte("x"), toolStderrTail))
+	p := []byte{'y'}
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = tb.Write(p)
+	}
 }
 
 func TestBoundedBuffer(t *testing.T) {
