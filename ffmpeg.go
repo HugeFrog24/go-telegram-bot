@@ -375,6 +375,12 @@ type toolRun struct {
 // toolArgs is the one argument builder for every probe, sheet and lookup
 // (item 12). Every input option comes before -i (item 1). ffprobe takes
 // neither -nostdin nor -timelimit, so only ffmpeg gets them.
+//
+// There is no -fflags +noparse+nofillin, which would stop the codec parsers
+// running on streams the decoder lists then refuse. It was tried (Ruling 12
+// item 4) and broke ffmpeg 6.1.1, 8.1.3 and 9.0.2 alike: every GIF render
+// failed (exit -22; +noparse alone does that, seen on 9.0.2), and Matroska
+// stream durations and start times were lost.
 func toolArgs(r toolRun) []string {
 	ffmpeg := r.tool == "ffmpeg"
 	args := []string{"-hide_banner"}
