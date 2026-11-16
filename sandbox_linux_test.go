@@ -524,8 +524,9 @@ func TestMediaSandbox_BadSpecNoExec(t *testing.T) { //NOSONAR go:S100 -- undersc
 	assert.Equal(t, "ran\n", string(out))
 }
 
-// The access rights handled at each ABI: everything the kernel knows, so
-// whatever no rule grants is denied.
+// The access rights handled at each ABI: every right this code knows, up to
+// ABI 10, so whatever no rule grants is denied. ABI 11 and 12 add nothing
+// here yet (later work), so they get the ABI 10 set.
 func TestLandlockAccess(t *testing.T) {
 	base := uint64(unix.LANDLOCK_ACCESS_FS_EXECUTE | unix.LANDLOCK_ACCESS_FS_WRITE_FILE | unix.LANDLOCK_ACCESS_FS_READ_FILE |
 		unix.LANDLOCK_ACCESS_FS_READ_DIR | unix.LANDLOCK_ACCESS_FS_REMOVE_DIR | unix.LANDLOCK_ACCESS_FS_REMOVE_FILE |
@@ -553,7 +554,8 @@ func TestLandlockAccess(t *testing.T) {
 		{8, abi5, tcp, scopes},
 		{9, abi9, tcp, scopes},
 		{10, abi9, udp, scopes},
-		{42, abi9, udp, scopes},
+		{11, abi9, udp, scopes},
+		{12, abi9, udp, scopes},
 	} {
 		got := landlockAccess(tc.abi)
 		assert.Equal(t, unix.LandlockRulesetAttr{Access_fs: tc.fs, Access_net: tc.network, Scoped: tc.scoped}, got, "ABI %d", tc.abi)

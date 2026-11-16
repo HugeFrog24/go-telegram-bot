@@ -40,9 +40,11 @@ const (
 	landlockAccessNetConnectSendUDP = 1 << 3  // ABI 10
 )
 
-// landlockAccess is every right the kernel's ABI knows, so that whatever no
-// rule grants is denied: each ABI only adds rights (kernel docs, "Backward
-// and forward compatibility").
+// landlockAccess is every right this code knows, up to ABI 10, that the
+// kernel's ABI has, so that whatever no rule grants is denied: each ABI only
+// adds rights (kernel docs, "Backward and forward compatibility"). ABI 11 (a
+// restrict_self flag) and ABI 12 (handled permissions for capability and
+// namespace use) are later work, so a kernel past ABI 10 gets the ABI 10 set.
 func landlockAccess(abi int) unix.LandlockRulesetAttr {
 	attr := unix.LandlockRulesetAttr{Access_fs: unix.LANDLOCK_ACCESS_FS_EXECUTE | unix.LANDLOCK_ACCESS_FS_WRITE_FILE |
 		unix.LANDLOCK_ACCESS_FS_READ_FILE | unix.LANDLOCK_ACCESS_FS_READ_DIR | unix.LANDLOCK_ACCESS_FS_REMOVE_DIR |
