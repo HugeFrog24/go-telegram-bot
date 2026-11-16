@@ -6,10 +6,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
 	"github.com/anthropics/anthropic-sdk-go/v2/option"
@@ -32,6 +36,14 @@ var anthropicCredentialVars = []string{
 // blockedRequests counts requests the test transport refused because they
 // were bound for another machine. TestMain fails the run when any were.
 var blockedRequests atomic.Int64
+
+// blockedLookups counts DNS queries refused by the pinned resolver; each is
+// also counted in blockedRequests.
+var blockedLookups atomic.Int64
+
+// loopbackDialer is the dialer isolateFromRealAPIs puts under the default
+// transport; nil until then.
+var loopbackDialer func(ctx context.Context, network, addr string) (net.Conn, error)
 
 // loopbackOnly is the test binary's http.DefaultTransport: it passes
 // requests for this machine (the httptest stand-ins) to the real transport
@@ -73,8 +85,46 @@ func isolateFromRealAPIs() (func(), error) {
 		}
 	}
 	elevenLabsSTTURL, elevenLabsTTSURL = "http://127.0.0.1:1/stt", "http://127.0.0.1:1/tts/"
-	http.DefaultTransport = loopbackOnly{next: http.DefaultTransport}
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("test isolation: default transport is %T, not *http.Transport", http.DefaultTransport)
+	}
+	guarded := base.Clone()
+	loopbackDialer = refuseOtherAddresses((&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext)
+	guarded.DialContext = loopbackDialer
+	http.DefaultTransport = loopbackOnly{next: guarded}
+	// Any other dialer resolves names through net.DefaultResolver: pin it to
+	// the Go resolver (its hosts file still maps localhost) with no DNS
+	// server it can reach.
+	net.DefaultResolver.PreferGo = true
+	net.DefaultResolver.Dial = func(_ context.Context, _, address string) (net.Conn, error) {
+		blockedRequests.Add(1)
+		blockedLookups.Add(1)
+		fmt.Fprintln(os.Stderr, "test isolation: refused a DNS query to", address)
+		return nil, fmt.Errorf("test isolation: DNS query to %q refused", address)
+	}
 	return func() { _ = os.RemoveAll(configDir) }, nil
+}
+
+// refuseOtherAddresses wraps dial so it connects only to loopback IPs. A host
+// name is never looked up: "localhost" maps to 127.0.0.1 here, and any other
+// name is refused, so the check holds after resolution as well as before.
+func refuseOtherAddresses(dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		if host == "localhost" {
+			host = "127.0.0.1"
+		}
+		if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+			blockedRequests.Add(1)
+			fmt.Fprintln(os.Stderr, "test isolation: refused a dial to", addr)
+			return nil, fmt.Errorf("test isolation: dial to %q refused", addr)
+		}
+		return dial(ctx, network, net.JoinHostPort(host, port))
+	}
 }
 
 // isLoopbackHost reports whether host (no port) names this machine.
@@ -165,7 +215,7 @@ func TestIsolation_DefaultAnthropicClientStaysOnThisMachine(t *testing.T) { //NO
 // ElevenLabs and Telegram downloads do, must stay on this machine.
 func TestIsolation_TransportRefusesOtherHosts(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	before := blockedRequests.Load()
-	t.Cleanup(func() { blockedRequests.Store(before) }) // this test's own block is expected
+	t.Cleanup(func() { blockedRequests.Add(-1) }) // this test's own block is expected; others stay counted
 
 	req, err := http.NewRequest(http.MethodGet, "https://api.anthropic.com/v1/models", nil)
 	require.NoError(t, err)
@@ -177,4 +227,76 @@ func TestIsolation_TransportRefusesOtherHosts(t *testing.T) { //NOSONAR go:S100 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "test isolation")
 	assert.Equal(t, before+1, blockedRequests.Load())
+}
+
+// guardedDial is the dialer under the test binary's default transport. It
+// fails the test, before anything is dialled, unless that dialer is the
+// loopback-only one.
+func guardedDial(t *testing.T) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	t.Helper()
+	guard, ok := http.DefaultTransport.(loopbackOnly)
+	require.True(t, ok, "the default transport is the isolation guard")
+	inner, ok := guard.next.(*http.Transport)
+	require.True(t, ok)
+	require.NotNil(t, loopbackDialer, "the loopback-only dialer is installed (checked before dialling)")
+	require.Equal(t, reflect.ValueOf(loopbackDialer).Pointer(), reflect.ValueOf(inner.DialContext).Pointer(),
+		"and the guard's transport dials through it (checked before dialling)")
+	return inner.DialContext
+}
+
+// Below the transport's host check, the dialer refuses any address that is not
+// a loopback IP, and never looks a name up: "localhost" maps to 127.0.0.1
+// locally, and any other name is refused before resolution.
+func TestIsolation_DialerRefusesOtherAddresses(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	dial := guardedDial(t)
+	local := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(local.Close)
+	blocked, lookups := blockedRequests.Load(), blockedLookups.Load()
+
+	for _, addr := range []string{"192.0.2.1:80", "[2001:db8::1]:443", "example.invalid:80"} {
+		conn, err := dial(context.Background(), "tcp", addr)
+		if conn != nil {
+			_ = conn.Close()
+		}
+		require.Error(t, err, addr)
+		assert.Contains(t, err.Error(), "test isolation", addr)
+	}
+	t.Cleanup(func() { blockedRequests.Add(-3) }) // this test's own refusals
+
+	assert.Equal(t, blocked+3, blockedRequests.Load(), "every refusal is counted")
+	assert.Equal(t, lookups, blockedLookups.Load(), "a name is refused before any lookup")
+	for _, addr := range []string{local.Listener.Addr().String(), "localhost:" + portOf(t, local.URL)} {
+		conn, err := dial(context.Background(), "tcp", addr)
+		require.NoError(t, err, addr)
+		_ = conn.Close()
+	}
+}
+
+// Name resolution is pinned to the Go resolver with a dialer that refuses
+// every DNS server, so even a transport built apart from the guarded one
+// (&http.Transport{}) cannot look a name up outside this machine.
+func TestIsolation_ResolverIsPinnedToNoServer(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	require.True(t, net.DefaultResolver.PreferGo, "the Go resolver is pinned (checked before any lookup)")
+	require.NotNil(t, net.DefaultResolver.Dial, "and it reaches no DNS server (checked before any lookup)")
+	blocked := blockedRequests.Load()
+
+	_, lookupErr := net.DefaultResolver.LookupHost(context.Background(), "example.invalid")
+	client := &http.Client{Transport: &http.Transport{}}
+	resp, getErr := client.Get("http://example.invalid/")
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	extra := blockedRequests.Load() - blocked
+	t.Cleanup(func() { blockedRequests.Add(-extra) }) // this test's own refusals
+
+	require.Error(t, lookupErr)
+	require.Error(t, getErr)
+	assert.Positive(t, extra, "the DNS queries were refused and counted")
+}
+
+func portOf(t *testing.T, rawURL string) string {
+	t.Helper()
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(rawURL, "http://"))
+	require.NoError(t, err)
+	return port
 }
