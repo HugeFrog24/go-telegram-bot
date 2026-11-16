@@ -344,3 +344,57 @@ A deny-list keeps missing classes like these, and it automatically allows every 
    - It never claims "signals" or "metadata" are covered when they aren't.
 5. **Check Alpine's libvpx 1.15.2-r1 for CVE-2026-1861**, using the Alpine secdb or the package changelog. Report the result. If it is unfixed, libvpx (the sticker alpha path) is refused until it is fixed.
 6. **Nit:** the `sandboxSparesBot` comment names the current grants.
+
+## Sandbox residuals after the allowlist (Ruling 19)
+
+A scoped re-review and a blind re-check of the Ruling 18 round both found the allowlist correct and tight. The blind verdict was "no blocking issues". What remains is Minor, but two of the claims the sandbox logs are false, and a few cheap controls are missing. These items are binding for one more Task 2b fix round.
+
+1. **Parent-death signal: accept the residual and correct the claims.**
+   - A tool can still drop its parent-death signal. It starts a thread with `clone(CLONE_THREAD)` and calls `execve` of itself from that thread: `pdeath_signal` is per task and 0 for new threads, and `de_thread` keeps the PID. Both reviews reproduced this.
+   - The resulting orphan keeps Landlock, the filter, the rlimits, its PID and its group. The group kill still reaches it while the bot lives. It outlives only a bot that dies, and only outside a supervisor: Docker's PID namespace and systemd's default `KillMode=control-group` both kill it.
+   - Declined: a trusted per-run supervisor process. It would change the exec-in-place design of Ruling 14 for a Minor whose worst case is a sandboxed, sleeping process.
+   - Fix the claims: the gap list entry "clearing the parent-death signal" (`sandbox.go`), the "no orphaned decoder" comment (`ffmpeg_linux.go`), and any similar comment. The gaps line names this residual and the supervisor kill as its backstop.
+2. **The thread cap is a per-user pool; size it, and accept starvation by a compromised tool.**
+   - `RLIMIT_NPROC` counts every task of the uid, so concurrent runs share their headroom. Legitimate 4-way concurrency measured a peak of 7 threads per tool, which leaves about 4 of 32 spare.
+   - Measure the worst legitimate per-run peak on the production path, on both distros, for probe and render:
+     - a self-made file with `toolMaxStreams` video streams;
+     - 4K HEVC 10-bit;
+     - AV1.
+     The test must use the production arguments, with no `-threads` override.
+   - `perRunBudget` = that peak + 4, and at least 12. If the peak is above 16, lower `toolMaxStreams` (not below 8) or give ffprobe `-threads 1` instead of raising the budget.
+   - `toolThreadHeadroom` = 4 (the maximum `toolConcurrency`) × `perRunBudget` + 8 for the bot's own new threads.
+   - Task 8 sets compose `pids_limit` and systemd `TasksMax` to 64 + 4 × `toolThreadHeadroom` + 64, rounded up to a multiple of 64, replacing the 256 planned in Ruling 12. A comment states the formula.
+   - Residual accepted: a compromised tool can make other chats' concurrent renders fail for the rest of its run. Isolating runs needs a per-run cgroup, and Docker doesn't delegate one. The gaps line names it.
+   - A tool's non-zero exit becomes a new `errToolFailed`, no longer `errUnsupportedMedia`, because it can be transient. The bot's own refusals (format, codec, streams, size, duration, kind) stay `errUnsupportedMedia`. Failure is still decided by exit status only; no stderr parsing.
+   - Fix the comment that claims compose sets a `pids_limit`; compose doesn't yet.
+3. **`RLIMIT_MEMLOCK`.** Set soft and hard to min(inherited hard, 64 KiB). Verify that the Ubuntu libgcrypt/gnutls path (a 16 KiB `mlock`) still works.
+4. **Capabilities and root.**
+   - The helper drops every capability before the task probe: `capset` with empty effective, permitted and inheritable sets, and `PR_CAP_AMBIENT_CLEAR_ALL`. `no_new_privs` then keeps `execve` from granting any back, root included. This closes raising hard limits through `prlimit64(0)` and `madvise(MADV_HWPOISON/MADV_SOFT_OFFLINE)`.
+   - Order: capabilities → task probe → Landlock → filter → last limits → exec.
+   - The check mode reports empty capability sets after the drop.
+   - If the task cap is still not enforced after the drop (uid 0 in the initial user namespace is exempt), the sandbox counts as incomplete. Video is then off unless `video.allow_unsandboxed`. The log says to run the bot as a non-root user. Detect this empirically with the existing probe, not by comparing the uid with 0, so that root inside a user namespace still passes.
+5. **Task probe termination.**
+   - Clamp the bracket to the hard limit, guard against overflow, and cap the iterations. A probe that can't decide fails closed, as an error.
+   - Red first: a unit test with a fake fork that fails above k, under a hard limit of `RLIM_INFINITY`.
+6. **Futex: refuse the PI operations**, as Chromium's `RestrictFutex` does.
+   - Allowed after masking `FUTEX_PRIVATE_FLAG` and `FUTEX_CLOCK_REALTIME`: `FUTEX_WAIT`, `WAKE`, `REQUEUE`, `CMP_REQUEUE`, `WAKE_OP`, `WAIT_BITSET`, `WAKE_BITSET`.
+   - Everything else gets EPERM, including `LOCK_PI`, `LOCK_PI2`, `UNLOCK_PI`, `TRYLOCK_PI`, `WAIT_REQUEUE_PI` and `CMP_REQUEUE_PI`.
+   - Re-run the trace matrix on both distros, plus the Go runtime in check mode.
+7. **`-timelimit`.**
+   - Today ffmpeg's `setrlimit(RLIMIT_CPU, {lim, lim+1})` fails with EPERM on every run, because the helper already set the hard limit to `lim`.
+   - On Linux the helper's `RLIMIT_CPU` replaces `-timelimit`; keep `-timelimit` where no helper runs.
+   - Test that render stderr has no "setrlimit".
+8. **Logs are accurate in every mode that runs video.**
+   - Full sandbox: the gaps line names everything uncovered:
+     - stat metadata, including sizes, mtimes, path existence and process existence through `/proc/<pid>`;
+     - `readlink` targets and `statfs`;
+     - item 1's residual;
+     - item 2's shared thread pool.
+   - Under `allow_unsandboxed`, a gaps line for whatever layers are present.
+     - Without Landlock it says the tool can read, write and run any file the bot's user can, including `/proc/<bot>/environ` (tokens) and `/proc/<bot>/mem` where Yama's `ptrace_scope` is 0.
+     - Without the filter, it lists what only the filter closes.
+   - The opt-out warning names reading, writing and running files, not just reading.
+9. **Research, run by a separate agent in parallel with the fix round, without a code change.** List the ffmpeg CVEs fixed in 9.0 but not in 8.1.3, using ffmpeg.org/security.html and NVD; the blind re-check named CVE-2026-70628 (DVB subtitle parser) and CVE-2026-70632 (CFHD) as examples.
+   - Judge each one's reachability through the per-kind `-format_whitelist`/`-codec_whitelist`, including the parsers `avformat_find_stream_info` initializes for every stream whatever the codec whitelist.
+   - Where possible, confirm with harmless self-made files only.
+   - The controller rules on any mitigation, such as refusing non-audio/video streams before the decode or requiring ffmpeg 9.0 in the image.
