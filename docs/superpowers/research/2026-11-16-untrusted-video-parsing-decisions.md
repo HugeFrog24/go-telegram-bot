@@ -440,3 +440,28 @@ These items are binding.
    - **A custom minimal ffmpeg build.** It would shrink parsers and bitstream filters to the needed few, but we would then own its builds and security updates.
    - **Moving to 9.0 or edge.** It fixes nothing reachable and adds new reachable code. Several of those additions already needed post-release fixes.
 5. **CVE-2026-107678 is accepted** as a contained denial of service. Watch 8.1.4 and 9.0.3 for the master fixes (71403a21b, 954606d99, 4a942afe8, 9fc8c785e).
+
+## Last sandbox round (Ruling 21)
+
+The scoped re-review and the blind re-check of the Ruling 19 and 20 round agree. Every finding is addressed, and there are no new Critical or Important problems. The blind verdict is "no blocking issues". What remains is Minor, and these items are binding for Task 2b's fifth and final fix round. Anything still open afterwards is deferred, with the user told, and does not start a sixth round.
+
+1. **`RLIMIT_SIGPENDING`.** A compromised tool can fill the user's pending-signal quota. The blind re-check queued 127,717 real-time signals to itself, after which `timer_create` and `sigqueue` failed in another process of the same user. The quota is per kernel uid, shared with the host, and is root's quota under the root opt-out.
+   - Set soft and hard to min(inherited hard, 64).
+   - Drop `rt_sigqueueinfo` and `rt_tgsigqueueinfo` from the allowlist unless the trace matrix shows them.
+   - Re-run the matrix on both distros, plus check mode.
+   - The gaps line names the shared pool as capped.
+2. **Logs in the opt-out modes.**
+   - (a) Without the filter, the gaps line says that a forked process can leave the tool's group and outlive the run even while the bot lives. It gets a fresh CPU budget, and below Landlock ABI 10 it can send UDP. The line that is always printed no longer claims that the group kill covers this.
+   - (b) The opt-out warning is built from the self-test report and names every missing layer, including root's unbound task cap, not only the first error that `sandboxAvailable` returns.
+   - Add test cases for "neither layer" and for "root plus a missing layer".
+3. **Stderr tail.** `tailBuffer.Write` copied the whole 64 KiB tail on every write once full. One-byte writes cost the bot about one core per run. Make it amortized O(1): append, and trim to the last 64 KiB only when the buffer reaches twice that. The kept tail must be unchanged. Test the content, and add a benchmark.
+4. **Magic bytes.** Add `uuid`, `junk`, `pnot`, `PICT`, `moof`, `styp` and `sidx` as leading MP4/MOV boxes. All still pin `-f mov`, so no new demuxer is reachable. Test with well-formed self-made files: a valid MP4 prefixed with a `uuid` or `junk` box, and a fragmented MP4 that starts with `styp`/`moof` where ffmpeg can produce one.
+5. **Error classes.**
+   - The probe's own failures to stat, open or read its input (missing file, `EMFILE`, `EIO`) are a wrapped I/O error, not `errUnsupportedMedia`.
+   - Only a file too short for the magic, or a magic no listed format matches, is `errUnsupportedMedia`.
+   - Refuse a path that is not a regular file before opening it (`Lstat`), so a FIFO cannot hang the open.
+   - The helper's own refusals (exit status 125) become their own sentinel, `errSandboxRefused`, not `errToolFailed`. It means a bot-side condition, never the media.
+   - Confirm from the ffmpeg and ffprobe sources that neither exits with 125 itself.
+   - Document for callers: never cache `errToolFailed` as "unsupported", and never retry it unboundedly.
+6. **`madvise` advice.** Allow only the advice values the trace matrix and the Go runtime in check mode use. Everything else gets EPERM, including `MADV_MERGEABLE`, `MADV_HWPOISON` and `MADV_SOFT_OFFLINE`. Cover it with BPF-evaluator tests on both arches, and with a stand-in calling `MADV_MERGEABLE`.
+7. **Nit.** Correct the fork-count comment in the task probe.
