@@ -28,12 +28,16 @@ func TestHandledCommand_OutOfRangeEntities(t *testing.T) { //NOSONAR go:S100 -- 
 		"zero length":             {Offset: 0, Length: 0},
 		"runs past the end":       {Offset: 1, Length: 6},
 		"starts at the end":       {Offset: 6, Length: 1},
-		"splits a surrogate pair": {Offset: 1, Length: 7},
+		"starts inside a surrogate pair": {Offset: 1, Length: 7},
+		"ends inside a surrogate pair":   {Offset: 0, Length: 7},
 	} {
 		t.Run(name, func(t *testing.T) {
-			text := "/clear"
-			if name == "splits a surrogate pair" {
-				text = "😀/clear"
+			text := map[string]string{
+				"starts inside a surrogate pair": "😀/clear",
+				"ends inside a surrogate pair":   "/clear😀",
+			}[name]
+			if text == "" {
+				text = "/clear"
 			}
 			assert.NotPanics(t, func() {
 				assert.Empty(t, handledCommand(commandMessage(text, entity)))
