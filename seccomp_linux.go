@@ -44,8 +44,8 @@ var seccompAllowed = [][]string{
 		"fstat", "newfstatat", "statx", "faccessat", "faccessat2", "readlinkat", "getdents64", "getcwd",
 		"statfs", "fstatfs"},
 	// Memory: the tool's own address space, which RLIMIT_AS caps; mlock is
-	// capped by RLIMIT_MEMLOCK.
-	{"brk", "mmap", "munmap", "mprotect", "mremap", "madvise", "mlock", "membarrier"},
+	// capped by RLIMIT_MEMLOCK. madvise's advice is checked below.
+	{"brk", "mmap", "munmap", "mprotect", "mremap", "mlock", "membarrier"},
 	// Threads, which clone (checked below) starts and RLIMIT_NPROC counts:
 	// libc's thread setup, yielding and ending a thread. Futexes are checked
 	// below.
@@ -120,6 +120,18 @@ var seccompFutexOps = []uint32{
 // than how it waits: FUTEX_PRIVATE_FLAG and FUTEX_CLOCK_REALTIME.
 const seccompFutexFlags = 128 | 256
 
+// seccompMadviseAdvice are the madvise(2) advice values allowed (Ruling 21
+// item 6): those the trace matrix saw, MADV_DONTNEED (glibc returning thread
+// stacks on Ubuntu, and the Go stand-ins) and MADV_NOHUGEPAGE (the Go
+// runtime), with the rest the Go runtime of go1.27.4 can give, MADV_FREE
+// (which falls back to MADV_DONTNEED on any error) and MADV_HUGEPAGE. musl
+// on Alpine gave none, nor did the helper's check run. Every other advice
+// gets EPERM: MADV_MERGEABLE, which would put the tool's pages up for KSM's
+// merging and its timing side channels, MADV_HWPOISON and MADV_SOFT_OFFLINE
+// (already refused without capabilities), and the runtime's unused
+// MADV_COLLAPSE among them.
+var seccompMadviseAdvice = []uint32{unix.MADV_DONTNEED, unix.MADV_FREE, unix.MADV_HUGEPAGE, unix.MADV_NOHUGEPAGE}
+
 // seccompIoctlRequests are the only ioctl(2) requests allowed: isatty(3) on
 // the tool's stderr (TCGETS for glibc, TIOCGWINSZ for musl). TIOCSTI and
 // TIOCLINUX are refused with every other request, a device's among them.
@@ -169,13 +181,14 @@ func (a seccompArch) nr(name string) (uint32, error) {
 // The parts of struct seccomp_data the filter reads (linux/seccomp.h). Both
 // supported architectures are little-endian, so an argument's low 32 bits
 // come first. The kernel itself reads only those of every argument checked
-// here: PIDs, clone(2)'s legacy flags, futex(2) operations, and fcntl(2),
-// prctl(2) and ioctl(2) commands are 32 bits wide.
+// here: PIDs, clone(2)'s legacy flags, futex(2) operations, fcntl(2),
+// prctl(2) and ioctl(2) commands, and madvise(2) advice are 32 bits wide.
 const (
 	seccompNr       = 0
 	seccompArchWord = 4
 	seccompArg0Low  = 16
 	seccompArg1Low  = 24
+	seccompArg2Low  = 32
 )
 
 // Classic BPF instructions the filter is made of.
@@ -283,7 +296,7 @@ func seccompProgram(arch seccompArch, pid uint32) ([]unix.SockFilter, error) {
 	}{
 		{"self", seccompSelfTargets}, {"self-or-zero", seccompSelfOrZero},
 		{"clone", []string{"clone"}}, {"futex", []string{"futex"}}, {"fcntl", []string{"fcntl"}},
-		{"prctl", []string{"prctl"}}, {"ioctl", []string{"ioctl"}},
+		{"prctl", []string{"prctl"}}, {"ioctl", []string{"ioctl"}}, {"madvise", []string{"madvise"}},
 	} {
 		if err := to(c.label, c.names...); err != nil {
 			return nil, err
@@ -325,6 +338,7 @@ func seccompProgram(arch seccompArch, pid uint32) ([]unix.SockFilter, error) {
 		{"fcntl", seccompArg1Low, seccompFcntlCommands},
 		{"prctl", seccompArg0Low, seccompPrctlOptions},
 		{"ioctl", seccompArg1Low, seccompIoctlRequests},
+		{"madvise", seccompArg2Low, seccompMadviseAdvice},
 	} {
 		a.label(c.label)
 		a.stmt(bpfLoad, c.arg)

@@ -356,6 +356,19 @@ var probeActions = map[string]func(args []string) error{
 	},
 	// pdeathsig: clear the parent-death signal, to outlive the bot.
 	"pdeathsig": func([]string) error { return unix.Prctl(unix.PR_SET_PDEATHSIG, 0, 0, 0, 0) },
+	// madvise <advice>: give one page of its own the advice; MADV_MERGEABLE
+	// (12) asks for KSM, whose merging leaks other processes' pages by timing.
+	"madvise": func(args []string) error {
+		advice, err := strconv.Atoi(args[0])
+		if err != nil {
+			return err
+		}
+		page, err := unix.Mmap(-1, 0, os.Getpagesize(), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANONYMOUS)
+		if err != nil {
+			return err
+		}
+		return unix.Madvise(page, advice)
+	},
 	// rt-queue <seconds>: queue SIGRTMIN+8 to its own thread, which blocks
 	// it, until the kernel refuses; print how many it queued, then hold them
 	// pending for the given seconds. tgkill to itself is all it needs.
@@ -788,6 +801,15 @@ func TestMediaSandbox_AllowlistRefusals(t *testing.T) { //NOSONAR go:S100 -- und
 		works(action, "noseccomp-sandbox-probe", action)
 	}
 	refused(enosys, "fanotify_init", "sandbox-probe", "fanotify")
+
+	// madvise takes only the advice the tools and the Go runtime use
+	// (Ruling 21 item 6): MADV_MERGEABLE is refused, and without the filter
+	// it is the kernel's to answer (EINVAL where there is no KSM).
+	refused(eperm, "MADV_MERGEABLE", "sandbox-probe", "madvise", strconv.Itoa(unix.MADV_MERGEABLE))
+	_, err := runTool(ctx, "noseccomp-sandbox-probe", inputDir(t), "", []string{"madvise", strconv.Itoa(unix.MADV_MERGEABLE)})
+	assert.NotContains(t, strings.ToLower(toolStderr(err)), eperm, "MADV_MERGEABLE without the filter")
+	_, err = runTool(ctx, "sandbox-probe", inputDir(t), "", []string{"madvise", strconv.Itoa(unix.MADV_DONTNEED)})
+	assert.NoError(t, err, "MADV_DONTNEED, which glibc and the Go runtime use: %q", toolStderr(err))
 
 	// A file outside the input directory, which Landlock lets no tool read.
 	outside := writeFake(t, t.TempDir(), "bot.db", "fake chat history")

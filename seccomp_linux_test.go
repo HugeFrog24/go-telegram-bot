@@ -59,12 +59,12 @@ var (
 		"brk", "clock_getres", "clock_gettime", "clock_nanosleep", "close", "dup", "dup3", "epoll_create1", "epoll_ctl",
 		"epoll_pwait", "eventfd2", "execve", "exit", "exit_group", "faccessat", "faccessat2", "fstat", "fstatfs",
 		"getcwd", "getdents64", "getegid", "geteuid", "getgid", "getpid", "getppid", "getrandom", "getrusage", "gettid",
-		"gettimeofday", "getuid", "lseek", "madvise", "membarrier", "mlock", "mmap", "mprotect", "mremap", "munmap",
+		"gettimeofday", "getuid", "lseek", "membarrier", "mlock", "mmap", "mprotect", "mremap", "munmap",
 		"nanosleep", "newfstatat", "openat", "pread64", "read", "readlinkat", "readv", "restart_syscall", "rseq",
 		"rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "sched_yield", "set_robust_list", "set_tid_address",
 		"sigaltstack", "statfs", "statx", "write", "writev",
 	}
-	wantSeccompChecked = []string{"clone", "fcntl", "futex", "ioctl", "kill", "prctl", "prlimit64",
+	wantSeccompChecked = []string{"clone", "fcntl", "futex", "ioctl", "kill", "madvise", "prctl", "prlimit64",
 		"sched_getaffinity", "tgkill", "tkill"}
 	wantSeccompAMD64Extra = []string{"access", "arch_prctl", "dup2", "lstat", "open", "readlink", "stat", "time"}
 )
@@ -76,7 +76,7 @@ func TestSeccompAllowlist(t *testing.T) {
 	}
 	slices.Sort(allowed)
 	assert.Equal(t, wantSeccompAllowed, allowed)
-	checked := append(append(slices.Clone(seccompSelfTargets), seccompSelfOrZero...), "clone", "fcntl", "futex", "prctl", "ioctl")
+	checked := append(append(slices.Clone(seccompSelfTargets), seccompSelfOrZero...), "clone", "fcntl", "futex", "prctl", "ioctl", "madvise")
 	slices.Sort(checked)
 	assert.Equal(t, wantSeccompChecked, checked)
 	extra := slices.Clone(seccompAMD64.extra)
@@ -166,6 +166,25 @@ func testSeccompFilter(t *testing.T, arch seccompArch) {
 		{"tgkill another process", "tgkill", []uint64{1}, seccompEPERM},
 		{"tkill its main thread", "tkill", []uint64{self}, seccompAllow},
 		{"tkill another thread", "tkill", []uint64{self + 3}, seccompEPERM},
+		// madvise's advice, its third argument, on its low 32 bits: what the
+		// trace matrix saw (DONTNEED, NOHUGEPAGE) and what the Go runtime
+		// gives (FREE, HUGEPAGE); everything else is EPERM (Ruling 21 item 6).
+		{"madvise DONTNEED", "madvise", []uint64{0, 4096, unix.MADV_DONTNEED}, seccompAllow},
+		{"madvise FREE", "madvise", []uint64{0, 4096, unix.MADV_FREE}, seccompAllow},
+		{"madvise HUGEPAGE", "madvise", []uint64{0, 4096, unix.MADV_HUGEPAGE}, seccompAllow},
+		{"madvise NOHUGEPAGE", "madvise", []uint64{0, 4096, unix.MADV_NOHUGEPAGE}, seccompAllow},
+		{"madvise DONTNEED, high bits set", "madvise", []uint64{0, 4096, unix.MADV_DONTNEED | 1<<40}, seccompAllow},
+		{"madvise MERGEABLE (KSM)", "madvise", []uint64{0, 4096, unix.MADV_MERGEABLE}, seccompEPERM},
+		{"madvise HWPOISON", "madvise", []uint64{0, 4096, unix.MADV_HWPOISON}, seccompEPERM},
+		{"madvise SOFT_OFFLINE", "madvise", []uint64{0, 4096, 101 /* MADV_SOFT_OFFLINE, not in x/sys */}, seccompEPERM},
+		{"madvise COLLAPSE", "madvise", []uint64{0, 4096, unix.MADV_COLLAPSE}, seccompEPERM},
+		{"madvise NORMAL", "madvise", []uint64{0, 4096, unix.MADV_NORMAL}, seccompEPERM},
+		{"madvise REMOVE", "madvise", []uint64{0, 4096, unix.MADV_REMOVE}, seccompEPERM},
+		{"madvise DONTFORK", "madvise", []uint64{0, 4096, unix.MADV_DONTFORK}, seccompEPERM},
+		{"madvise WIPEONFORK", "madvise", []uint64{0, 4096, unix.MADV_WIPEONFORK}, seccompEPERM},
+		{"madvise PAGEOUT", "madvise", []uint64{0, 4096, unix.MADV_PAGEOUT}, seccompEPERM},
+		{"madvise POPULATE_WRITE", "madvise", []uint64{0, 4096, unix.MADV_POPULATE_WRITE}, seccompEPERM},
+		{"madvise MERGEABLE, DONTNEED in the high bits", "madvise", []uint64{0, 4096, unix.MADV_MERGEABLE | unix.MADV_DONTNEED<<32}, seccompEPERM},
 		{"prlimit64 of itself as 0", "prlimit64", []uint64{0}, seccompAllow},
 		{"prlimit64 of itself by PID", "prlimit64", []uint64{self}, seccompAllow},
 		{"prlimit64 of the bot", "prlimit64", []uint64{self - 1}, seccompEPERM},
