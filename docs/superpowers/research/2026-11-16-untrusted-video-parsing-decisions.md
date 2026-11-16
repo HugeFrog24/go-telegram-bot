@@ -398,3 +398,45 @@ A scoped re-review and a blind re-check of the Ruling 18 round both found the al
    - Judge each one's reachability through the per-kind `-format_whitelist`/`-codec_whitelist`, including the parsers `avformat_find_stream_info` initializes for every stream whatever the codec whitelist.
    - Where possible, confirm with harmless self-made files only.
    - The controller rules on any mitigation, such as refusing non-audio/video streams before the decode or requiring ffmpeg 9.0 in the image.
+
+## ffmpeg version and probe-path exposure (Ruling 20)
+
+A research pass checked whether ffmpeg vulnerabilities fixed in 9.0 but not in 8.1.3 are reachable through the bot's options. It used fix ancestry for about 70 CVEs, a subject comparison of n8.1-dev..n9.0.2 against n8.1..n8.1.3, source diffs, and gdb on Alpine 3.24 (8.1.3-r0) and edge (9.0.2-r3) with well-formed self-made files.
+
+**Results:**
+- **No reachable fix is missing from 8.1.3.** 8.1.3 was tagged on 2026-09-20, after 9.0.2, and it carries every reachable 9.0.x fix.
+- **Scanners over-report.** CVE-2026-70628 (the dvbsub parser), 70629–70632 (rscc, screenpresso, tiff, cfhd), 66036, 66037, 96611 and others are listed as "before 9.0" or "through 8.1.2", but they are fixed in 8.1.3. Most are unreachable with the bot's options anyway.
+- **The fixes that exist only in 9.0** are in code new in 9.0 or in components the bot doesn't reach: libdav1d T.35, LCEVC, matroska SMPTE 2094-50, the mov iTunSMPB discard, the swscale ops backend that 8.1.3 runs only with `SWS_UNSTABLE`, among others.
+- **Unfixed in both versions:** CVE-2026-107678 (`pssh` recursion), which is a denial of service of the child only. It is reachable through mov in every kind except sticker. The probe and sheet timeouts, `RLIMIT_CPU` and the address-space cap contain it, and it surfaces as `errToolFailed`.
+- **Probe sweep.** ffprobe runs every compiled-in demuxer's `read_probe` on the untrusted bytes, because the probe has no `-f`. Detection happens before the format whitelist is checked. The render already pins `-f`.
+- **Parsers aren't covered by the codec whitelist.**
+  - `-codec_whitelist` gates decoders only.
+  - Matroska's `V_MS/VFW/FOURCC` and `A_MS/ACM` entries make nearly every audio and video parser in the build reachable.
+  - The `extract_extradata` bitstream filter runs during stream-info gathering for streams without extradata.
+  - Subtitle tracks are never parsed in mov or matroska.
+- **ID3v2 is never parsed** for the whitelisted formats.
+
+These items are binding.
+
+1. **Stay on Alpine 3.24's ffmpeg 8.1.3.**
+   - Task 8 pins the runtime stage to `alpine:3.24`, not `alpine:latest`, and not edge. A branch rollover must not silently change ffmpeg's major version.
+   - Move to 3.25 or 8.1.4 deliberately. The monthly rebuild in the README picks up 3.24 point releases.
+2. **The probe pins `-f`, chosen in Go from magic bytes.**
+   - Read the file's first 12 bytes:
+     - an atom type at offset 4 of `ftyp`, `moov`, `mdat`, `free`, `skip` or `wide` means `-f mov`;
+     - `1A 45 DF A3` means `-f matroska`;
+     - `GIF87a` or `GIF89a` means `-f gif`.
+   - The chosen format must also be on the kind's format whitelist, which still applies.
+   - No match means `errUnsupportedMedia`, and ffprobe never starts.
+   - Tests:
+     - every existing fixture still probes;
+     - self-made wav, avi and mpegts files, and a file with a wrong magic for its kind, are refused without a tool run;
+     - the probe's argv contains `-f`.
+3. **Pin two invariants with tests:**
+   - no decoder list contains the native `av1` decoder (libdav1d only);
+   - no argument list contains `sws_flags` or `unstable`. 8.1.3 lacks the 9.0 ops-backend fixes.
+4. **Declined, recorded as "Later":**
+   - **A Go pre-scan of Matroska CodecIDs and MP4 sample entries.** It would be a second untrusted-input parser to maintain, and the sandbox already contains parser bugs.
+   - **A custom minimal ffmpeg build.** It would shrink parsers and bitstream filters to the needed few, but we would then own its builds and security updates.
+   - **Moving to 9.0 or edge.** It fixes nothing reachable and adds new reachable code. Several of those additions already needed post-release fixes.
+5. **CVE-2026-107678 is accepted** as a contained denial of service. Watch 8.1.4 and 9.0.3 for the master fixes (71403a21b, 954606d99, 4a942afe8, 9fc8c785e).
