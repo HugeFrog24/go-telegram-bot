@@ -18,12 +18,12 @@ import (
 // is the text batch the note took over from the quiet window, or nil.
 func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, userMsg Message, pending *turnRequest, to replyTarget, userID int64, username, firstName, lastName string, isPremium bool, languageCode string, messageTime int) {
 	if b.config.ElevenLabsAPIKey == "" {
-		b.refuseVoice(ctx, &userMsg, pending, to, "I don't understand voice messages.")
+		b.refuseVoice(ctx, pending, to, "I don't understand voice messages.")
 		return
 	}
 
 	if !b.hasScope(userID, ScopeTTSUse) {
-		b.refuseVoice(ctx, &userMsg, pending, to, "You don't have permission to use voice features.")
+		b.refuseVoice(ctx, pending, to, "You don't have permission to use voice features.")
 		return
 	}
 
@@ -43,7 +43,7 @@ func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, u
 	}
 	if err != nil {
 		ErrorLogger.Printf("Error transcribing voice message from user %d: %v", userID, err)
-		b.refuseVoice(ctx, &userMsg, pending, to, "Sorry, I couldn't understand your voice message.")
+		b.refuseVoice(ctx, pending, to, "Sorry, I couldn't understand your voice message.")
 		return
 	}
 
@@ -109,10 +109,9 @@ func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, u
 	}
 }
 
-// refuseVoice sets a voice note that will not be transcribed aside, with the
-// notice that tells the user why, and answers the text batch it took over.
-func (b *Bot) refuseVoice(ctx context.Context, userMsg *Message, pending *turnRequest, to replyTarget, notice string) {
-	b.setAside(userMsg)
+// refuseVoice tells the user why a voice note will not be answered (its row
+// stays aside: it never joins), and answers the text batch it took over.
+func (b *Bot) refuseVoice(ctx context.Context, pending *turnRequest, to replyTarget, notice string) {
 	if err := b.sendResponse(ctx, to, notice); err != nil {
 		ErrorLogger.Printf("Error sending voice notice: %v", err)
 	}
@@ -172,6 +171,7 @@ func (b *Bot) handlePhotoMessage(
 		userMessage := b.createMessage(to.chatID, userID, username, "user", caption, true)
 		userMessage.ImageFileIDs = finalUploaded
 		userMessage.TelegramMessageID = items[0].ID
+		userMessage.Aside = true // until it joins, just below
 		if err := b.storeMessage(&userMessage); err != nil {
 			b.compensatingDelete(ctx, finalUploaded)
 			ErrorLogger.Printf("[%s] store photo message failed: %v", b.config.ID, err)
@@ -400,7 +400,6 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	}
 
 	if !b.checkRateLimits(userID) {
-		b.setAside(&userMsg)
 		b.sendRateLimitExceededMessage(ctx, to)
 		return
 	}
@@ -417,7 +416,7 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	}
 
 	if text == "" {
-		// Stored aside at intake (unreadMedia).
+		// Media the bot does not read yet never joins: its row stays aside.
 		InfoLogger.Printf("Received a non-text message from user %d in chat %d", userID, chatID)
 		return
 	}
@@ -572,12 +571,6 @@ func entityText(text string, byteAt []int, offset, length int) string {
 		return ""
 	}
 	return strings.TrimSpace(text[start:end])
-}
-
-// unreadMedia reports whether message is media the bot does not read yet,
-// which never joins the conversation. Photos never reach intake as one.
-func unreadMedia(message *models.Message) bool {
-	return message.Text == "" && message.Sticker == nil && message.Voice == nil
 }
 
 // runCommand answers a handled command. The command and every reply here are

@@ -489,22 +489,55 @@ func (b *Bot) stripDeadFileIDFromMemory(chatID int64, deadFileID string) {
 	}
 }
 
-// joinConversation appends a stored user message to its chat's memory, once
-// it joins the conversation, and returns the copy memory holds, which carries
-// its sequence. Until then no turn can read it, cover it, or mark it
-// answered. A memory reloaded since the message was stored may hold it
-// already; that copy then takes the message's current text.
+// joinConversation puts a stored user message into its chat's memory once it
+// joins the conversation, and returns the copy memory holds, which carries its
+// sequence. Until then its row is aside: no turn can read, cover or answer
+// it, and no reload can load it. In one step under the memory lock, the row
+// leaves aside and takes its join time as its timestamp, later than every
+// message already in memory, so a reload keeps memory's order. A copy
+// already in memory (a row stored before rows waited aside) moves to the end
+// with a fresh sequence.
 func (b *Bot) joinConversation(message Message) Message {
 	chatMemory := b.getOrCreateChatMemory(message.ChatID)
 	b.chatMemoriesMu.Lock()
 	defer b.chatMemoriesMu.Unlock()
-	for i := range chatMemory.Messages {
-		if held := &chatMemory.Messages[i]; message.ID != 0 && held.ID == message.ID {
-			held.Text = message.Text
-			return *held
+	if message.ID != 0 {
+		chatMemory.Messages = slices.DeleteFunc(chatMemory.Messages, func(held Message) bool {
+			return held.ID == message.ID
+		})
+	}
+	message.Aside = false
+	message.Timestamp = b.stampAfter(latestTimestamp(chatMemory.Messages))
+	if message.ID != 0 {
+		err := b.db.Model(&Message{}).Where("id = ?", message.ID).
+			Updates(map[string]any{"aside": false, "timestamp": message.Timestamp}).Error
+		if err != nil {
+			ErrorLogger.Printf("[%s] joining message %d to chat %d: %v", b.config.ID, message.ID, message.ChatID, err)
 		}
 	}
 	return b.insertLocked(chatMemory, message, len(chatMemory.Messages))
+}
+
+// latestTimestamp is the latest Timestamp among messages, or the zero time.
+func latestTimestamp(messages []Message) time.Time {
+	var latest time.Time
+	for _, m := range messages {
+		if m.Timestamp.After(latest) {
+			latest = m.Timestamp
+		}
+	}
+	return latest
+}
+
+// stampAfter is now, or a microsecond after latest when the clock has not
+// moved past it (one clock tick, or a clock set back), so stamps given in
+// memory order sort in that order.
+func (b *Bot) stampAfter(latest time.Time) time.Time {
+	now := b.clock.Now()
+	if next := latest.Add(time.Microsecond); now.Before(next) {
+		return next
+	}
+	return now
 }
 
 // insertLocked puts message into memory at index at with the next sequence
@@ -522,15 +555,24 @@ func (b *Bot) insertLocked(chatMemory *ChatMemory, message Message, at int) Mess
 	return message
 }
 
-// fileReply puts a turn's reply into memory right after the last message at
-// or below frontier, or at the end when frontier is 0, and raises the chat's
-// answeredThrough to covered. Messages that arrived while the turn ran have
-// higher sequences, so they stay after the reply. It returns the database ids
-// of the user messages the reply newly answers.
-func (b *Bot) fileReply(chatMemory *ChatMemory, reply Message, frontier, covered uint64) []uint {
+// fileReply stores a turn's reply and puts it into memory right after the
+// last message at or below frontier, or at the end when frontier is 0, and
+// raises the chat's answeredThrough to covered. Messages that arrived while
+// the turn ran have higher sequences, so they stay after the reply. It
+// returns the database ids of the user messages the reply newly answers.
+//
+// The reply is stamped, stored and inserted in one step under the memory
+// lock, so nothing can join between choosing its slot and its timestamp: a
+// reload, which goes by timestamp, then keeps memory's order (replyStamp).
+func (b *Bot) fileReply(chatMemory *ChatMemory, reply *Message, frontier, covered uint64) ([]uint, error) {
 	b.chatMemoriesMu.Lock()
 	defer b.chatMemoriesMu.Unlock()
 
+	at := replyIndex(chatMemory, frontier)
+	reply.Timestamp = b.replyStamp(chatMemory.Messages, at)
+	if err := b.storeMessage(reply); err != nil {
+		return nil, err
+	}
 	before := chatMemory.answeredThrough.Load()
 	var answered []uint
 	for _, m := range chatMemory.Messages {
@@ -538,24 +580,37 @@ func (b *Bot) fileReply(chatMemory *ChatMemory, reply Message, frontier, covered
 			answered = append(answered, m.ID)
 		}
 	}
-	b.insertLocked(chatMemory, reply, replyIndex(chatMemory, frontier))
+	b.insertLocked(chatMemory, *reply, at)
 	if covered > before {
 		chatMemory.answeredThrough.Store(covered)
 	}
-	return answered
+	return answered, nil
 }
 
-// replyPredecessor is the timestamp of the message a reply to a context that
-// ended at frontier will follow, and whether later messages will follow the
-// reply. It is false for a reply that goes at the end, or at the front.
-func (b *Bot) replyPredecessor(chatMemory *ChatMemory, frontier uint64) (time.Time, bool) {
-	b.chatMemoriesMu.RLock()
-	defer b.chatMemoriesMu.RUnlock()
-	at := replyIndex(chatMemory, frontier)
-	if at == 0 || at == len(chatMemory.Messages) {
-		return time.Time{}, false
+// replyStamp is the timestamp for a reply going in at index at of messages:
+// a microsecond after the latest message before its slot, kept before the
+// earliest message after it (halfway, when they are a microsecond or less
+// apart); at the end, now, or after the latest message if the clock has not
+// passed it; at the front, a microsecond before the first. Messages join with
+// increasing stamps (joinConversation), so the slot always has room.
+func (b *Bot) replyStamp(messages []Message, at int) time.Time {
+	if at == len(messages) {
+		return b.stampAfter(latestTimestamp(messages))
 	}
-	return chatMemory.Messages[at-1].Timestamp, true
+	next := messages[at].Timestamp
+	for _, m := range messages[at:] {
+		if m.Timestamp.Before(next) {
+			next = m.Timestamp
+		}
+	}
+	if at == 0 {
+		return next.Add(-time.Microsecond)
+	}
+	latest := latestTimestamp(messages[:at])
+	if stamp := latest.Add(time.Microsecond); stamp.Before(next) {
+		return stamp
+	}
+	return latest.Add(next.Sub(latest) / 2)
 }
 
 // replyIndex is where a reply to a context that ended at frontier goes: right
@@ -822,16 +877,6 @@ func (b *Bot) sendTurnReply(ctx context.Context, turn *chatTurn, to replyTarget,
 	return b.sendOneSegment(ctx, to, text)
 }
 
-// setAside takes a stored user message out of the conversation when it is
-// refused after intake. It never joined, so it is in no memory; only the row
-// changes.
-func (b *Bot) setAside(msg *Message) {
-	msg.Aside = true
-	if err := b.db.Model(&Message{}).Where("id = ?", msg.ID).Update("aside", true).Error; err != nil {
-		ErrorLogger.Printf("[%s] setting message %d aside: %v", b.config.ID, msg.ID, err)
-	}
-}
-
 func (b *Bot) sendOneSegment(ctx context.Context, to replyTarget, text string) error {
 	params := &bot.SendMessageParams{
 		ChatID:               to.chatID,
@@ -1068,14 +1113,11 @@ func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
 			userMessage.StickerPNGFile = message.Sticker.Thumbnail.FileID
 		}
 	}
-	// A handled command and media the bot does not read never join the
-	// conversation.
-	userMessage.Aside = handledCommand(message) != "" || unreadMedia(message)
-
-	// Intake only stores: a message joins memory once it is accepted into
-	// the conversation (joinConversation). Memory is loaded first, or its
-	// first load would read this row before the message joined.
-	b.getOrCreateChatMemory(message.Chat.ID)
+	// Intake only stores, aside: the message joins the conversation, and
+	// leaves aside, once it is accepted (joinConversation). A handled
+	// command, a rate-limited message, a refused or untranscribed voice note
+	// and media the bot does not read never join, and stay aside.
+	userMessage.Aside = true
 	if err := b.storeMessage(&userMessage); err != nil {
 		return Message{}, err
 	}
@@ -1109,16 +1151,11 @@ func (b *Bot) recordTurnReply(turn *chatTurn, chatID int64, response string) (Me
 	// database and then file it a second time.
 	chatMemory := b.getOrCreateChatMemory(chatID)
 	assistantMessage := b.createMessage(chatID, 0, "", "assistant", response, false)
-	if after, filedBefore := b.replyPredecessor(chatMemory, frontier); filedBefore {
-		// Filed before messages that arrived during the turn: stamped just
-		// after the message it follows, so a reload, which goes by
-		// timestamp, keeps memory's order. A reply at the end keeps now.
-		assistantMessage.Timestamp = after.Add(time.Microsecond)
-	}
-	if err := b.storeMessage(&assistantMessage); err != nil {
+	answered, err := b.fileReply(chatMemory, &assistantMessage, frontier, covered)
+	if err != nil {
 		return Message{}, err
 	}
-	b.markAnswered(chatID, b.fileReply(chatMemory, assistantMessage, frontier, covered))
+	b.markAnswered(chatID, answered)
 	return assistantMessage, nil
 }
 
