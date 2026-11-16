@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"debug/elf"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -253,10 +254,27 @@ func onSandboxThread(f func() error) error {
 	return <-done
 }
 
+// sandboxVariant is how the tests may change the sandbox for one of their
+// stand-in tools (sandboxTestVariant).
+type sandboxVariant struct {
+	memory uint64 // RLIMIT_AS instead of the spec's; 0 keeps it
+}
+
+// sandboxTestVariant, set only by sandbox_linux_test.go, picks a variant by
+// the tool's name: the test binary run as a stand-in tool needs more address
+// space than toolMemoryLimit, since on glibc the Go runtime alone takes about
+// 1.6 GiB. Production code never sets it.
+var sandboxTestVariant func(tool string) sandboxVariant
+
 func mediaSandbox(args []string, ppid int) error {
 	inv, err := parseSandboxArgs(args)
 	if err != nil {
 		return err
+	}
+	if sandboxTestVariant != nil {
+		if v := sandboxTestVariant(inv.spec.Tool); v.memory > 0 {
+			inv.spec.MemoryLimit = v.memory
+		}
 	}
 	report, err := applySandbox(inv.spec, ppid)
 	if err != nil {
@@ -314,7 +332,13 @@ func applySandbox(spec sandboxSpec, ppid int) (sandboxReport, error) {
 		return report, err
 	}
 	report.ABI = abi
-	return report, restrictSelf(abi, sandboxRules(spec))
+	// A tool that is no ELF file (a test's shell script) gets no interpreter
+	// rule; a dynamically linked tool without one could not start.
+	interp := ""
+	if spec.Tool != "" {
+		interp, _ = elfInterpreter(spec.Tool)
+	}
+	return report, restrictSelf(abi, sandboxRules(spec, interp))
 }
 
 // sandboxABI is the Landlock ABI the helper applies, from the kernel's
@@ -477,20 +501,31 @@ var landlockProbe = sync.OnceValues(landlockABI)
 // sandboxAvailable reports the kernel's Landlock ABI, or why there is none.
 func sandboxAvailable() (int, error) { return landlockProbe() }
 
-// sandboxSystemRules are what ffprobe and ffmpeg open of the system on every
-// run, as traced on Alpine 3.24 (ffmpeg 8.1.3) and Ubuntu 24.04 (6.1.1). The
-// rest of what they try at start-up (/proc/self/status, /proc/mounts,
+// sandboxSystemRules are what ffprobe and ffmpeg read of the system, as
+// traced on Alpine 3.24 (ffmpeg 8.1.3) and Ubuntu 24.04 (6.1.1): the library
+// directories, the font and fontconfig directories and the loaders' two
+// files, all read only (Ruling 16 item 6). Nothing here may be executed:
+// only the tool and its ELF interpreter can be (sandboxRules). The rest of
+// what the tools try at start-up (/proc/self/status, /proc/mounts,
 // /proc/filesystems, /sys/devices/system/*, /etc/gnutls/config: library
 // probes) is denied, and they cope: renders are byte for byte the same.
-// fontconfig, which drawtext uses when no font file is found, falls back to
-// its built-in configuration without /etc/fonts and still finds the fonts
-// beneath /usr. ffmpeg itself never opened /dev/null in the traces (the bot
-// opens the tool's stdin before the sandbox), but reading it is harmless and
-// ordinary code needs it: a shell gives a background job /dev/null as stdin.
+// /usr/local/lib is where a locally built ffmpeg keeps its libraries; musl's
+// loader looks there first. ffmpeg never opened /dev/null in the traces (the
+// bot opens the tool's stdin before the sandbox), but reading it is harmless
+// and ordinary code needs it: a shell gives a background job /dev/null.
+//
+// Landlock cannot hide metadata: a tool can still stat any path it names,
+// learning whether it exists and its size and times (the database's,
+// config/*.json's), though never its contents.
 var sandboxSystemRules = []sandboxRule{
-	{path: "/usr", access: fsReadExec, optional: true},                            // the tools, their libraries, fonts and fontconfig's own files
-	{path: "/lib", access: fsReadExec, optional: true},                            // musl's loader and libc; a link into /usr on merged-/usr systems
-	{path: "/lib64", access: fsReadExec, optional: true},                          // glibc's loader path on x86-64
+	{path: "/lib", access: fsRead, optional: true},                                // musl's loader and libc; a link to /usr/lib on merged-/usr systems
+	{path: "/lib64", access: fsRead, optional: true},                              // glibc's loader path on x86-64
+	{path: "/usr/lib", access: fsRead, optional: true},                            // the tools' libraries (and glibc's gconv and locales)
+	{path: "/usr/lib64", access: fsRead, optional: true},                          // the same on distributions that split them
+	{path: "/usr/local/lib", access: fsRead, optional: true},                      // a locally built ffmpeg's libraries
+	{path: "/usr/share/fonts", access: fsRead, optional: true},                    // the fonts drawtext and fontconfig find
+	{path: "/usr/share/fontconfig", access: fsRead, optional: true},               // fontconfig's own configuration files
+	{path: "/etc/fonts", access: fsRead, optional: true},                          // fontconfig's configuration
 	{path: "/etc/ld.so.cache", access: fsReadFile, optional: true},                // glibc's loader reads it on every start (/usr/local/lib is found only through it)
 	{path: "/etc/ld-musl-*.path", access: fsReadFile, optional: true, glob: true}, // musl's loader reads its library path on every start, where one is set
 	{path: "/dev/null", access: fsReadFile, optional: true},
@@ -502,9 +537,10 @@ var sandboxSystemRules = []sandboxRule{
 var sandboxTestRules []sandboxRule
 
 // sandboxRules is the whole policy for a spec: the system rules, the input
-// directory and font read only, and the tool read and execute. No rule grants
-// writing, and nothing grants /proc, /sys or the rest of /etc.
-func sandboxRules(spec sandboxSpec) []sandboxRule {
+// directory and font read only, and the tool and its ELF interpreter (interp,
+// "" for none) read and execute. No rule grants writing, and nothing grants
+// /proc, /sys or the rest of /etc and /usr.
+func sandboxRules(spec sandboxSpec, interp string) []sandboxRule {
 	rules := append(slices.Clone(sandboxSystemRules), sandboxRule{path: spec.InputDir, access: fsRead, kind: mustBeDir})
 	if spec.FontFile != "" {
 		rules = append(rules, sandboxRule{path: spec.FontFile, access: fsReadFile, kind: mustBeFile})
@@ -512,7 +548,36 @@ func sandboxRules(spec sandboxSpec) []sandboxRule {
 	if spec.Tool != "" {
 		rules = append(rules, sandboxRule{path: spec.Tool, access: fsReadExec, kind: mustBeFile})
 	}
+	if interp != "" {
+		rules = append(rules, sandboxRule{path: interp, access: fsReadExec, kind: mustBeFile})
+	}
 	return append(rules, sandboxTestRules...)
+}
+
+// elfInterpreter is the ELF interpreter bin names in its PT_INTERP header,
+// such as /lib/ld-musl-x86_64.so.1, or "" when it names none (a static
+// binary). The kernel opens it to run bin, so it needs execute too.
+func elfInterpreter(bin string) (string, error) {
+	f, err := elf.Open(bin)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	for _, p := range f.Progs {
+		if p.Type != elf.PT_INTERP {
+			continue
+		}
+		b, err := io.ReadAll(io.LimitReader(p.Open(), 4096))
+		if err != nil {
+			return "", err
+		}
+		interp := strings.TrimRight(string(b), "\x00")
+		if sandboxPath("ELF interpreter", interp) != nil {
+			return "", fmt.Errorf("%s names the ELF interpreter %q", bin, interp)
+		}
+		return interp, nil
+	}
+	return "", nil
 }
 
 // sandboxProbeName is the file a check tries to create.

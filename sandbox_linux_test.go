@@ -26,12 +26,33 @@ import (
 )
 
 func init() {
-	// Test-only rule (Ruling 14 note 6): the shell stand-ins in the tests are
-	// scripts run by /bin/sh. On Alpine that is /bin/busybox, outside /usr and
-	// /lib, so the sandbox would refuse to execute it. Production code never
-	// sets sandboxTestRules; real ffmpeg needs no shell.
-	if sh, err := filepath.EvalSymlinks("/bin/sh"); err == nil {
-		sandboxTestRules = []sandboxRule{{path: sh, access: fsReadExec}}
+	// Test-only rules (Ruling 14 note 6): the shell stand-ins in the tests are
+	// scripts run by /bin/sh, and some start sleep. The sandbox lets a tool
+	// execute only itself and its ELF interpreter (Ruling 16 item 6), so the
+	// shell, sleep and their interpreters need rules of their own. Production
+	// code never sets sandboxTestRules; real ffmpeg needs no shell.
+	for _, name := range []string{"/bin/sh", "sleep"} {
+		bin, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		if bin, err = filepath.EvalSymlinks(bin); err != nil {
+			continue
+		}
+		sandboxTestRules = append(sandboxTestRules, sandboxRule{path: bin, access: fsReadExec})
+		if interp, err := elfInterpreter(bin); err == nil && interp != "" {
+			sandboxTestRules = append(sandboxTestRules, sandboxRule{path: interp, access: fsReadExec})
+		}
+	}
+	// The test binary as a stand-in tool is a Go program: on glibc its
+	// runtime alone takes about 1.6 GiB of address space, more than
+	// toolMemoryLimit, so it gets room. Real tools keep the cap.
+	sandboxTestVariant = func(tool string) sandboxVariant {
+		var v sandboxVariant
+		if testStandIns[filepath.Base(tool)] != nil {
+			v.memory = 4 << 30
+		}
+		return v
 	}
 	// Every helper the tests start works on a thread that did not inherit
 	// Pdeathsig, so the parent-death test proves the re-arm (review Minor 3).
@@ -39,6 +60,7 @@ func init() {
 	testStandIns["tcp-dial"] = tcpDialStandIn
 	testStandIns["sandbox-parent"] = sandboxParentStandIn
 	testStandIns["truncate-path"] = truncatePathStandIn
+	testStandIns["sandbox-probe"] = sandboxProbeStandIn
 }
 
 // requireLandlock skips the test where the kernel (or a seccomp profile)
@@ -78,6 +100,28 @@ func tcpDialStandIn(args []string) int {
 		return 3
 	}
 	_ = c.Close()
+	return 0
+}
+
+// probeActions are what sandboxProbeStandIn can try, each as a compromised
+// tool might. A nil error means it worked.
+var probeActions = map[string]func(args []string) error{
+	// exec <path>: replace this process with another program.
+	"exec": func(args []string) error {
+		return syscall.Exec(args[0], []string{args[0], "-version"}, []string{"PATH=/usr/bin:/bin"}) // #nosec G204 -- the test's own path
+	},
+}
+
+// sandboxProbeStandIn runs probeActions[args[0]] with the rest: exit 0 when
+// it works, 3 (the error on stderr) when it does not, 2 for a bad call.
+func sandboxProbeStandIn(args []string) int {
+	if len(args) == 0 || probeActions[args[0]] == nil {
+		return 2
+	}
+	if err := probeActions[args[0]](args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 3
+	}
 	return 0
 }
 
@@ -211,6 +255,26 @@ func TestMediaSandbox_FileAccess(t *testing.T) { //NOSONAR go:S100 -- underscore
 	require.NoError(t, err)
 	assert.Equal(t, "this chat's video", string(data), "the input is unchanged")
 	assert.FileExists(t, token, "the fake config is still there")
+}
+
+// A tool may execute only itself and its ELF interpreter, and read only the
+// library, font and fontconfig directories and the loader files: no longer
+// the rest of /usr, such as another program (Ruling 16 item 6).
+func TestMediaSandbox_NarrowGrants(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireLandlock(t)
+	ffprobe, err := lookupTool("ffprobe")
+	if err != nil {
+		t.Skip("ffprobe not on PATH")
+	}
+	standInTool(t, "sandbox-probe")
+	in := inputDir(t)
+	ctx := context.Background()
+
+	out, err := runTool(ctx, "cat", in, "", []string{ffprobe})
+	requireDenied(t, out, err, "read another program")
+	out, err = runTool(ctx, "sandbox-probe", in, "", []string{"exec", ffprobe})
+	requireDenied(t, out, err, "exec another program")
+	require.NoError(t, exec.Command(ffprobe, "-version").Run(), "outside the sandbox it runs") // #nosec G204 -- the system's ffprobe
 }
 
 // A sandboxed render works, font included, and gives exactly the JPEG of the
@@ -479,8 +543,9 @@ func TestMediaSandbox_HardLimitBelowTheCap(t *testing.T) { //NOSONAR go:S100 -- 
 }
 
 // No sandbox rule may reach the bot's own files: a working directory,
-// config/ or data/ beneath a directory every tool may read (/usr, /lib,
-// /lib64) turns video off (review Minor 5).
+// config/ or data/ beneath a directory every tool may read (the library,
+// font and fontconfig directories) turns video off (review Minor 5). Since
+// the grants were narrowed (Ruling 16 item 6), the rest of /usr is fine.
 func TestSandboxSparesBot(t *testing.T) {
 	prev := botDirs
 	t.Cleanup(func() { botDirs = prev })
@@ -495,21 +560,24 @@ func TestSandboxSparesBot(t *testing.T) {
 	assert.NoError(t, sandboxSparesBot(), "nor is this test's own working directory")
 
 	for _, dirs := range [][]string{
-		{"/usr/src/app", "/usr/src/app/config", "/usr/src/app/data"},
-		{"/home/bot", "/home/bot/config", "/usr/local/share/bot-data"},
-		{"/usr"},
+		{"/usr/lib/bot", "/usr/lib/bot/config", "/usr/lib/bot/data"},
+		{"/home/bot", "/home/bot/config", "/usr/share/fonts/bot-data"},
+		{"/usr/local/lib/bot"},
+		{"/etc/fonts/bot"},
 	} {
 		use(dirs...)
-		assert.ErrorContains(t, sandboxSparesBot(), "beneath /usr", "%v", dirs)
+		assert.ErrorContains(t, sandboxSparesBot(), "which the ffmpeg sandbox lets every tool read", "%v", dirs)
 	}
-	use("/lib") // a link into /usr/lib on merged-/usr systems, a directory of its own elsewhere
+	use("/lib") // a link to /usr/lib on merged-/usr systems, a directory of its own elsewhere
 	assert.Error(t, sandboxSparesBot())
+	use("/usr/src/app", "/usr/src/app/config", "/usr/src/app/data")
+	assert.NoError(t, sandboxSparesBot(), "the rest of /usr is no longer granted")
 
-	// A data directory that links into /usr counts where it points.
+	// A data directory that links into a granted directory counts where it points.
 	link := filepath.Join(t.TempDir(), "data")
-	require.NoError(t, os.Symlink("/usr/share", link))
+	require.NoError(t, os.Symlink("/usr/share/fonts", link))
 	use(t.TempDir(), link)
-	assert.ErrorContains(t, sandboxSparesBot(), "beneath /usr")
+	assert.ErrorContains(t, sandboxSparesBot(), "beneath /usr/share/fonts")
 
 	t.Run("gate", func(t *testing.T) {
 		requireFFmpeg(t)
@@ -517,10 +585,10 @@ func TestSandboxSparesBot(t *testing.T) {
 		prevLog := InfoLogger
 		InfoLogger = log.New(&logged, "", 0)
 		t.Cleanup(func() { InfoLogger = prevLog })
-		use("/usr/src/app", "/usr/src/app/config", "/usr/src/app/data")
+		use("/usr/share/fonts/bot", "/usr/share/fonts/bot/config", "/usr/share/fonts/bot/data")
 		b := videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
 		assert.False(t, b.videoOn())
-		assert.Contains(t, logged.String(), "[video_gate_bot] video: the bot's directory /usr/src/app is beneath /usr, "+
+		assert.Contains(t, logged.String(), "[video_gate_bot] video: the bot's directory /usr/share/fonts/bot is beneath /usr/share/fonts, "+
 			"which the ffmpeg sandbox lets every tool read; video watching is off")
 	})
 }
@@ -699,33 +767,62 @@ func TestLandlockAccess(t *testing.T) {
 	}
 }
 
-// The policy itself: read and execute beneath the system library and binary
-// directories; read only on the loaders' two /etc files, on /dev/null and
-// /dev/urandom, beneath the input directory and on the font; read and execute
-// on the tool. Nothing grants writing.
+// The policy itself (Ruling 16 item 6): read only beneath the library, font
+// and fontconfig directories, on the loaders' two /etc files, on /dev/null
+// and /dev/urandom, beneath the input directory and on the font; read and
+// execute only on the tool and its ELF interpreter. Nothing grants writing,
+// and nothing grants the rest of /usr.
 func TestSandboxRules(t *testing.T) {
 	prev := sandboxTestRules
 	sandboxTestRules = nil
 	t.Cleanup(func() { sandboxTestRules = prev })
-	spec := sandboxSpec{InputDir: "/data/videos/1/2/v3", FontFile: "/opt/fonts/f.ttf", Tool: "/usr/bin/ffmpeg", MemoryLimit: toolMemoryLimit}
+	spec := sandboxSpec{InputDir: "/tmp/video-job-1", FontFile: "/opt/fonts/f.ttf", Tool: "/usr/bin/ffmpeg", MemoryLimit: toolMemoryLimit}
+	const interp = "/lib/ld-musl-x86_64.so.1"
 	assert.Equal(t, []sandboxRule{
-		{path: "/usr", access: fsReadExec, optional: true},
-		{path: "/lib", access: fsReadExec, optional: true},
-		{path: "/lib64", access: fsReadExec, optional: true},
+		{path: "/lib", access: fsRead, optional: true},
+		{path: "/lib64", access: fsRead, optional: true},
+		{path: "/usr/lib", access: fsRead, optional: true},
+		{path: "/usr/lib64", access: fsRead, optional: true},
+		{path: "/usr/local/lib", access: fsRead, optional: true},
+		{path: "/usr/share/fonts", access: fsRead, optional: true},
+		{path: "/usr/share/fontconfig", access: fsRead, optional: true},
+		{path: "/etc/fonts", access: fsRead, optional: true},
 		{path: "/etc/ld.so.cache", access: fsReadFile, optional: true},
 		{path: "/etc/ld-musl-*.path", access: fsReadFile, optional: true, glob: true},
 		{path: "/dev/null", access: fsReadFile, optional: true},
 		{path: "/dev/urandom", access: fsReadFile, optional: true},
-		{path: "/data/videos/1/2/v3", access: fsRead, kind: mustBeDir},
+		{path: "/tmp/video-job-1", access: fsRead, kind: mustBeDir},
 		{path: "/opt/fonts/f.ttf", access: fsReadFile, kind: mustBeFile},
 		{path: "/usr/bin/ffmpeg", access: fsReadExec, kind: mustBeFile},
-	}, sandboxRules(spec))
-	for _, r := range sandboxRules(spec) {
+		{path: interp, access: fsReadExec, kind: mustBeFile},
+	}, sandboxRules(spec, interp))
+	for _, r := range sandboxRules(spec, interp) {
 		assert.Zero(t, r.access&^(fsReadExec), "%s: read and execute rights only", r.path)
+		if r.access&unix.LANDLOCK_ACCESS_FS_EXECUTE != 0 {
+			assert.Contains(t, []string{spec.Tool, interp}, r.path, "only the tool and its interpreter execute")
+		}
 	}
 	noFont := spec
 	noFont.FontFile = ""
-	assert.Len(t, sandboxRules(noFont), len(sandboxRules(spec))-1, "no font, no font rule")
+	assert.Len(t, sandboxRules(noFont, interp), len(sandboxRules(spec, interp))-1, "no font, no font rule")
+	assert.Len(t, sandboxRules(spec, ""), len(sandboxRules(spec, interp))-1, "a static tool, no interpreter rule")
+}
+
+// The interpreter rule comes from the tool's own PT_INTERP header.
+func TestElfInterpreter(t *testing.T) {
+	exe, err := os.Executable()
+	require.NoError(t, err)
+	interp, err := elfInterpreter(exe)
+	require.NoError(t, err)
+	t.Logf("the test binary's interpreter: %q", interp)
+	if interp != "" { // cgo builds are dynamically linked
+		assert.True(t, filepath.IsAbs(interp))
+		_, err := os.Stat(interp)
+		assert.NoError(t, err)
+	}
+	script := writeFake(t, t.TempDir(), "script", "#!/bin/sh\n")
+	_, err = elfInterpreter(script)
+	assert.Error(t, err, "a script is no ELF file")
 }
 
 // The checks the self-test runs inside the sandbox report a missing one: run
