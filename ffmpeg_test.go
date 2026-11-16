@@ -38,18 +38,25 @@ func requireFFmpeg(t *testing.T) {
 	allowUnsandboxedWhereNeeded(t)
 }
 
-// allowUnsandboxedWhereNeeded lets tools run without the Landlock sandbox for
-// the rest of the test where none can run (any OS but Linux, or a kernel or
-// seccomp profile without Landlock), as a bot with video.allow_unsandboxed
-// does. Where Landlock runs it changes nothing: the helper always uses it.
+// allowUnsandboxedWhereNeeded lets tools run without the full sandbox for
+// the rest of the test where there is none (any OS but Linux, a kernel or
+// seccomp profile without Landlock or the filter, or a task cap that binds
+// no user, as for root: Ruling 19 item 4), as a bot with
+// video.allow_unsandboxed does. Where the sandbox is whole it changes
+// nothing: the helper always applies every layer it can.
 func allowUnsandboxedWhereNeeded(t *testing.T) {
 	t.Helper()
-	if sandboxUsable(sandboxAvailable()) == nil {
+	if sandboxUsable(sandboxAvailable()) == nil && !taskCapUnboundHere(t) {
 		return
 	}
 	unsandboxedGrants.Add(1)
 	t.Cleanup(func() { unsandboxedGrants.Add(-1) })
 }
+
+// taskCapUnboundHere reports whether RLIMIT_NPROC binds no user here (root);
+// sandbox_linux_test.go sets it on Linux, and elsewhere there is no task cap
+// to bind anyone.
+var taskCapUnboundHere = func(*testing.T) bool { return false }
 
 // ffmpegFixture runs the system ffmpeg with args to write a test clip into its
 // own new directory, under an extensionless name like a download. args must
@@ -654,7 +661,8 @@ func TestNewToolCmd(t *testing.T) {
 }
 
 // No tool runs without the sandbox unless a bot's gate allowed it
-// (video.allow_unsandboxed where there is no Landlock).
+// (video.allow_unsandboxed where there is no Landlock, or where the task cap
+// binds no user, as for root: Ruling 19 item 4).
 func TestRunTool_NeedsASandbox(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not on PATH")
@@ -664,6 +672,11 @@ func TestRunTool_NeedsASandbox(t *testing.T) { //NOSONAR go:S100 -- underscore s
 	t.Cleanup(func() { unsandboxedGrants.Store(prev) })
 	_, err := runTool(context.Background(), "ffmpeg", inputDir(t), "", []string{"-hide_banner", "-version"})
 	if sandboxUsable(sandboxAvailable()) == nil {
+		if taskCapUnboundHere(t) {
+			assert.ErrorAs(t, err, new(*toolError), "the helper refuses the run")
+			assert.Contains(t, toolStderr(err), errTaskCapUnbound.Error(), "as root the sandbox is not whole")
+			return
+		}
 		assert.NoError(t, err, "inside Landlock")
 		return
 	}
@@ -679,6 +692,10 @@ func TestToolSelfTest(t *testing.T) {
 	assert.Less(t, len(selfTestGIF), 2048, "a tiny GIF")
 	noSandbox := sandboxUsable(sandboxAvailable())
 	report, err := toolSelfTest(context.Background(), "", noSandbox == nil)
+	if noSandbox == nil && taskCapUnboundHere(t) {
+		require.ErrorIs(t, err, errTaskCapUnbound, "as root the full self-test fails")
+		report, err = toolSelfTest(context.Background(), "", false) // as the gate does under the opt-out
+	}
 	require.NoError(t, err, "%q", toolStderr(err))
 	if runtime.GOOS != "linux" {
 		assert.Equal(t, sandboxReport{}, report, "no helper and no Landlock off Linux")

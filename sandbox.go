@@ -104,10 +104,18 @@ func sandboxGaps(abi int, seccomp bool) string {
 
 // sandboxReport is what the helper's check run reports to the gate.
 type sandboxReport struct {
-	ABI         int  `json:"landlock_abi"`  // the Landlock ABI applied; 0 for none
-	OOMScoreAdj bool `json:"oom_score_adj"` // whether oom_score_adj was set to 1000
-	Seccomp     bool `json:"seccomp"`       // whether the seccomp filter was installed
+	ABI            int  `json:"landlock_abi"`    // the Landlock ABI applied; 0 for none
+	OOMScoreAdj    bool `json:"oom_score_adj"`   // whether oom_score_adj was set to 1000
+	Seccomp        bool `json:"seccomp"`         // whether the seccomp filter was installed
+	TaskCap        bool `json:"task_cap"`        // whether RLIMIT_NPROC binds the user (root is exempt)
+	NoCapabilities bool `json:"no_capabilities"` // whether every capability set was empty after the drop
 }
+
+// errTaskCapUnbound means RLIMIT_NPROC binds no user here, as for root in the
+// initial user namespace even without capabilities: a tool could start
+// threads until the user's or the host's run out. That is no whole sandbox
+// (Ruling 19 item 4).
+var errTaskCapUnbound = errors.New("the task cap does not bind the bot's user (root, say): run the bot as a non-root user")
 
 // selfTestGIF is the gate's self-test input: a 16×16, four-frame GIF made
 // once with `ffmpeg -f lavfi -i testsrc2=size=16x16:rate=4:duration=1 -f gif`.
@@ -120,7 +128,8 @@ const selfTestTimeout = 30 * time.Second
 // toolSelfTest is the gate's self-test (Ruling 14 note 5). It writes the
 // embedded GIF to a fresh input directory and runs, through the production
 // runner: the helper's check run (where landlock is true it must apply
-// Landlock and the seccomp filter, and each layer there must pass its
+// Landlock, the seccomp filter and a task cap that binds the user, failing
+// with errTaskCapUnbound otherwise, and each layer there must pass its
 // negative checks: Landlock's a read outside the input directory and
 // creating a file, the filter's a socket, a signal to the bot, the bot's
 // limits, F_SETOWN, shmget, chmod and inotify; see checkSandboxed), then
@@ -144,6 +153,8 @@ func toolSelfTest(ctx context.Context, font string, landlock bool) (sandboxRepor
 		return report, fmt.Errorf("sandbox check: %w", err)
 	case landlock && (report.ABI < minSandboxABI || !report.Seccomp):
 		return report, fmt.Errorf("sandbox check: Landlock ABI %d or later and the seccomp filter were not both applied", minSandboxABI)
+	case landlock && !report.TaskCap:
+		return report, fmt.Errorf("sandbox check: %w", errTaskCapUnbound)
 	}
 	probe, err := probeMedia(ctx, path, "animation")
 	if err != nil {

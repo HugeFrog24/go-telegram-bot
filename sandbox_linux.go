@@ -312,7 +312,7 @@ func mediaSandbox(args []string, ppid int) error {
 			inv.spec.MemoryLimit = v.memory
 		}
 	}
-	report, limits, err := applySandbox(inv.spec, ppid, v)
+	report, limits, err := applySandbox(inv.spec, ppid, v, inv.check)
 	if err != nil {
 		return err
 	}
@@ -340,16 +340,34 @@ func mediaSandbox(args []string, ppid int) error {
 	return execTool(inv.spec, limits, inv.argv, os.Environ())
 }
 
-// applySandbox applies, in order: the rlimits (the address-space and task
-// limits themselves come last, see underLastLimits), oom_score_adj (best
-// effort), Pdeathsig re-armed on this thread, no_new_privs, Landlock at the
-// best ABI the kernel has (see sandboxABI), and the seccomp filter (see
-// sandboxSeccomp), all on this thread, which then execs the tool.
-func applySandbox(spec sandboxSpec, ppid int, v sandboxVariant) (sandboxReport, lastLimits, error) {
+// applySandbox applies, in order: the capability drop (dropCapabilities),
+// the rlimits with the task probe (the address-space and task limits
+// themselves come last, see underLastLimits), oom_score_adj (best effort),
+// Pdeathsig re-armed on this thread, no_new_privs, Landlock at the best ABI
+// the kernel has (see sandboxABI), and the seccomp filter (see
+// sandboxSeccomp), all on this thread, which then execs the tool. A task cap
+// that binds no user fails a real run (check false) unless the spec allows
+// running without a whole sandbox (Ruling 19 item 4).
+func applySandbox(spec sandboxSpec, ppid int, v sandboxVariant, check bool) (sandboxReport, lastLimits, error) {
 	var report sandboxReport
+	empty, err := dropCapabilities()
+	switch {
+	case err != nil:
+		return report, lastLimits{}, err
+	case !empty:
+		return report, lastLimits{}, errors.New("capabilities remain after capset")
+	}
+	report.NoCapabilities = true
 	limits, err := setToolLimits(spec.MemoryLimit, spec.CPUSeconds)
 	if err != nil {
 		return report, limits, err
+	}
+	// Uid 0 in the initial user namespace is exempt from RLIMIT_NPROC, even
+	// without capabilities: no task cap, so no whole sandbox. A real run
+	// needs the opt-out; the check run reports it, for the gate to decide.
+	report.TaskCap = limits.taskCap
+	if !report.TaskCap && !spec.AllowUnsandboxed && !check {
+		return report, limits, errTaskCapUnbound
 	}
 	report.OOMScoreAdj = setOOMScoreAdj() == nil
 	// Pdeathsig belongs to the thread that inherited it, and a new thread
@@ -430,8 +448,9 @@ func sandboxABI(kernel int, err error, allowUnsandboxed bool) (int, error) {
 // last system call, since the helper's own Go runtime could not live under
 // them: RLIMIT_AS and RLIMIT_NPROC, soft and hard.
 type lastLimits struct {
-	memory uint64 // bytes of address space
-	tasks  uint64 // the user's tasks
+	memory  uint64 // bytes of address space
+	tasks   uint64 // the user's tasks
+	taskCap bool   // whether RLIMIT_NPROC binds the user at all (root is exempt)
 }
 
 // setToolLimits sets core and file size to 0, open files to toolOpenFiles,
@@ -462,7 +481,7 @@ func setToolLimits(memory, cpu uint64) (lastLimits, error) {
 	if err != nil {
 		return lastLimits{}, fmt.Errorf("counting the user's tasks: %w", err)
 	}
-	running, err := kernelUIDTasks(visible, tasks.Max, func(limit uint64) (bool, error) { return forksUnder(limit, tasks.Max) })
+	running, enforced, err := kernelUIDTasks(visible, tasks.Max, func(limit uint64) (bool, error) { return forksUnder(limit, tasks.Max) })
 	if err != nil {
 		return lastLimits{}, err
 	}
@@ -483,7 +502,7 @@ func setToolLimits(memory, cpu uint64) (lastLimits, error) {
 			return lastLimits{}, fmt.Errorf("setrlimit %s: %w", l.name, err)
 		}
 	}
-	return lastLimits{memory: memory, tasks: min(uint64(running)+toolThreadHeadroom, tasks.Max)}, nil // #nosec G115 -- a count
+	return lastLimits{memory: memory, tasks: min(uint64(running)+toolThreadHeadroom, tasks.Max), taskCap: enforced}, nil // #nosec G115 -- a count
 }
 
 // uidTasks counts the tasks (threads) whose real uid is uid, which is what
@@ -540,7 +559,15 @@ const maxTaskProbes = 64
 // (Ruling 19 item 5): a limit that never lets a fork through, up to the
 // hard limit or to maxUserTasks, and a search over maxTaskProbes forks are
 // errors, and so fail closed.
-func kernelUIDTasks(visible int, hard uint64, forks func(limit uint64) (bool, error)) (int, error) {
+//
+// enforced is false where the limit binds no one (uid 0 in the initial user
+// namespace, or CAP_SYS_RESOURCE): a probe forks even under a limit of 1,
+// which a user the limit binds never can, as the probe and its child are 2
+// tasks. The probe finds that whatever the uid, so root in a user namespace
+// still counts as bound (Ruling 19 item 4). A fork at the visible count
+// alone proves nothing: concurrent runs' threads may have ended since /proc
+// was read, and the search then goes on below it.
+func kernelUIDTasks(visible int, hard uint64, forks func(limit uint64) (bool, error)) (count int, enforced bool, err error) {
 	probes := 0
 	try := func(limit uint64) (bool, error) {
 		if probes++; probes > maxTaskProbes {
@@ -550,16 +577,27 @@ func kernelUIDTasks(visible int, hard uint64, forks func(limit uint64) (bool, er
 	}
 	lo, hi, err := taskBracket(uint64(visible), hard, try) // #nosec G115 -- a count
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	if ok, err := try(lo); err != nil || ok {
-		return visible, err // the limit is not enforced (a privileged user): the count is moot
+	ok, err := try(lo)
+	if err != nil {
+		return 0, false, err
+	}
+	if ok {
+		unbound, err := try(1)
+		switch {
+		case err != nil:
+			return 0, false, err
+		case unbound:
+			return visible, false, nil // the limit binds no one here: the count is moot
+		}
+		lo, hi = 1, lo // the count fell below the visible one
 	}
 	for hi-lo > 1 {
 		mid := lo + (hi-lo)/2
 		ok, err := try(mid)
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
 		if ok {
 			hi = mid
@@ -569,7 +607,7 @@ func kernelUIDTasks(visible int, hard uint64, forks func(limit uint64) (bool, er
 	}
 	// hi, the smallest limit that lets the probe fork, is the count plus
 	// two: the probe itself is one of the user's tasks.
-	return int(lo) - 1, nil // #nosec G115 -- a count
+	return int(lo) - 1, true, nil // #nosec G115 -- a count
 }
 
 // taskBracket finds limits lo, which does not let a fork through (the count
@@ -785,6 +823,31 @@ func execTool(spec sandboxSpec, limits lastLimits, argv, env []string) error {
 		_, _, errno := unix.RawSyscall(unix.SYS_EXECVE, uintptr(unsafe.Pointer(path)), uintptr(unsafe.Pointer(&argvp[0])), uintptr(unsafe.Pointer(&envp[0]))) // #nosec G103 G204
 		return errno
 	})
+}
+
+// dropCapabilities empties this thread's effective, permitted and
+// inheritable capability sets and its ambient set, and reports whether all
+// read back empty (Ruling 19 item 4). The helper does it first, so that the
+// task probe sees the user as the tool will be, and no_new_privs then keeps
+// the exec from granting any back, root included. That closes what
+// CAP_SYS_RESOURCE would allow through the filter (prlimit64(0) raising a
+// hard limit) and CAP_SYS_ADMIN (madvise taking host pages offline).
+// Capabilities are per thread: this is the one that probes and execs.
+func dropCapabilities() (bool, error) {
+	hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+	var sets [2]unix.CapUserData
+	if err := unix.Capset(&hdr, &sets[0]); err != nil {
+		return false, fmt.Errorf("capset: %w", err)
+	}
+	// EINVAL: a kernel before ambient capabilities (4.3), which has none.
+	if err := unix.Prctl(unix.PR_CAP_AMBIENT, unix.PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0); err != nil && !errors.Is(err, unix.EINVAL) {
+		return false, fmt.Errorf("PR_CAP_AMBIENT_CLEAR_ALL: %w", err)
+	}
+	hdr = unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+	if err := unix.Capget(&hdr, &sets[0]); err != nil {
+		return false, fmt.Errorf("capget: %w", err)
+	}
+	return sets == [2]unix.CapUserData{}, nil
 }
 
 // setOOMScoreAdj makes this process, and the tool after the exec, the OOM

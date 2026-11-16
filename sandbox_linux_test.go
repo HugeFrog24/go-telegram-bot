@@ -18,6 +18,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -94,6 +95,10 @@ func init() {
 // requireLandlock skips the test where the kernel (or a seccomp profile)
 // offers no Landlock that counts as a sandbox (ABI minSandboxABI or later),
 // and returns the ABI otherwise.
+//
+// Where the task cap binds no user (root) the sandbox is not whole and a
+// real run needs the opt-out (Ruling 19 item 4), so the test gets it, as a
+// bot with video.allow_unsandboxed would: every other layer still applies.
 func requireLandlock(t *testing.T) int {
 	t.Helper()
 	abi, err := sandboxAvailable()
@@ -101,6 +106,7 @@ func requireLandlock(t *testing.T) int {
 		t.Skipf("no sandbox here: %v", err)
 	}
 	t.Logf("Landlock ABI %d", abi)
+	allowUnsandboxedWhereNeeded(t)
 	return abi
 }
 
@@ -781,6 +787,73 @@ func TestMediaSandbox_AllowlistRefusals(t *testing.T) { //NOSONAR go:S100 -- und
 	assert.False(t, processGone(sleeper), "the other process lives")
 }
 
+func init() { taskCapUnboundHere = taskCapUnbound }
+
+// taskCapUnbound reports whether RLIMIT_NPROC binds no user here: root in
+// the initial user namespace is exempt (in Docker, uid 0 even without
+// CAP_SYS_RESOURCE), so a probe forks even under a limit of 1. The answer is
+// the process's, so one probe serves every test.
+func taskCapUnbound(t *testing.T) bool {
+	t.Helper()
+	forks, err := taskCapProbe()
+	require.NoError(t, err)
+	return forks
+}
+
+var taskCapProbe = sync.OnceValues(func() (bool, error) {
+	var lim syscall.Rlimit
+	if err := syscall.Getrlimit(unix.RLIMIT_NPROC, &lim); err != nil {
+		return false, err
+	}
+	return forksUnder(1, lim.Max)
+})
+
+// The helper drops every capability before anything else (Ruling 19 item
+// 4), so with no_new_privs the tool's exec gains none back, root's included:
+// no prlimit64(0) raising a hard limit, no madvise(MADV_HWPOISON). Read from
+// outside, in /proc/<pid>/status, all four sets are empty. The test means
+// most as root (uid 0, in Docker): a non-root user has none to drop.
+func TestMediaSandbox_NoCapabilities(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	allowUnsandboxedWhereNeeded(t)
+	t.Logf("uid %d", os.Getuid())
+	sleep, err := lookupTool("sleep")
+	require.NoError(t, err)
+	cmd := startSandboxed(t, sleep, "30")
+	status := procFile(t, cmd.Process.Pid, "status")
+	for _, set := range []string{"CapInh", "CapPrm", "CapEff", "CapAmb"} {
+		assert.Contains(t, status, set+":\t0000000000000000\n", "%s is empty", set)
+	}
+}
+
+// Where the task cap binds no user (the bot as root), the sandbox is not
+// whole (Ruling 19 item 4): video is off unless video.allow_unsandboxed,
+// and the log says to run the bot as a non-root user. With the opt-out it
+// runs. Run as uid 0 to test; a user the cap binds skips.
+func TestNewBot_VideoGate_TaskCapUnbound(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	requireLandlock(t)
+	if !taskCapUnbound(t) {
+		t.Skip("the task cap binds this user: run as root (uid 0) to test")
+	}
+	var logged bytes.Buffer
+	prevInfo, prevError := InfoLogger, ErrorLogger
+	InfoLogger, ErrorLogger = log.New(&logged, "", 0), log.New(&logged, "", 0)
+	t.Cleanup(func() { InfoLogger, ErrorLogger = prevInfo, prevError })
+
+	b := videoGateBot(t, setupTestDB(t), &VideoConfig{})
+	assert.False(t, b.videoOn(), "no whole sandbox, no video")
+	assert.Contains(t, logged.String(), "run the bot as a non-root user")
+	assert.Contains(t, logged.String(), "video watching is off")
+
+	logged.Reset()
+	before := unsandboxedGrants.Load()
+	b = videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
+	t.Cleanup(func() { unsandboxedGrants.Store(before) })
+	assert.True(t, b.videoOn(), "the opt-out restores video: %s", logged.String())
+	assert.Contains(t, logged.String(), "Warning: video: ffmpeg runs WITHOUT a full sandbox")
+	assert.Contains(t, logged.String(), "run the bot as a non-root user")
+}
+
 // The task count is probed in a child of its own: the caller's RLIMIT_NPROC
 // never drops to the user's count, where its Go runtime could not start a
 // thread. A limit of 1 never lets a probe fork (it is one of the user's
@@ -790,9 +863,10 @@ func TestKernelUIDTasks(t *testing.T) {
 	require.NoError(t, syscall.Getrlimit(unix.RLIMIT_NPROC, &before))
 	visible, err := uidTasks(os.Getuid())
 	require.NoError(t, err)
-	n, err := kernelUIDTasks(visible, before.Max, func(limit uint64) (bool, error) { return forksUnder(limit, before.Max) })
+	n, enforced, err := kernelUIDTasks(visible, before.Max, func(limit uint64) (bool, error) { return forksUnder(limit, before.Max) })
 	require.NoError(t, err)
 	assert.Positive(t, n)
+	assert.Equal(t, !taskCapUnbound(t), enforced, "the limit binds this user unless it is root")
 	require.NoError(t, syscall.Getrlimit(unix.RLIMIT_NPROC, &after))
 	assert.Equal(t, before, after, "the probes leave the caller's limit alone")
 
@@ -829,19 +903,37 @@ func TestKernelUIDTasks_Terminates(t *testing.T) { //NOSONAR go:S100 -- undersco
 	}
 	const count, k = 40, 30 // the user's tasks; no fork above k
 	forks, calls := fake(t, func(limit uint64) bool { return limit >= count+2 && limit <= k })
-	_, err := kernelUIDTasks(10, infinity, forks)
+	_, _, err := kernelUIDTasks(10, infinity, forks)
 	require.Error(t, err, "a fork refused under every limit is no count")
 	assert.LessOrEqual(t, *calls, 128)
 
 	forks, _ = fake(t, func(limit uint64) bool { return limit >= count+2 })
-	_, err = kernelUIDTasks(10, 35, forks)
+	_, _, err = kernelUIDTasks(10, 35, forks)
 	require.ErrorContains(t, err, "task limit (35)", "refused at the hard limit: out of tasks")
 
 	forks, calls = fake(t, func(limit uint64) bool { return limit >= count+2 })
-	n, err := kernelUIDTasks(10, infinity, forks)
+	n, enforced, err := kernelUIDTasks(10, infinity, forks)
 	require.NoError(t, err)
 	assert.Equal(t, count, n)
+	assert.True(t, enforced)
 	assert.LessOrEqual(t, *calls, 128)
+
+	forks, _ = fake(t, func(uint64) bool { return true })
+	_, enforced, err = kernelUIDTasks(10, infinity, forks)
+	require.NoError(t, err)
+	assert.False(t, enforced, "a probe that forks even under a limit of 1: the limit binds no one (root)")
+
+	// Concurrent runs' threads end between the count in /proc and the
+	// probes, so a fork goes through at the visible count: that alone is no
+	// sign of an unbound cap, as a limit of 1 still refuses it. Seen as
+	// refused runs under four-way concurrency on Ubuntu.
+	const fell = 5 // the user's tasks by the time the probes run
+	forks, calls = fake(t, func(limit uint64) bool { return limit >= fell+2 })
+	n, enforced, err = kernelUIDTasks(10, infinity, forks)
+	require.NoError(t, err)
+	assert.True(t, enforced, "the limit binds: 1 refuses the fork")
+	assert.Equal(t, fell, n, "the count as it is now, below the visible one")
+	assert.LessOrEqual(t, *calls, maxTaskProbes)
 }
 
 // A tool may lock only 64 KiB of memory (RLIMIT_MEMLOCK, Ruling 19 item 3),
@@ -864,6 +956,9 @@ func TestMediaSandbox_LockedMemoryCap(t *testing.T) { //NOSONAR go:S100 -- under
 // GiB of address space, dies of a failed thread creation, and the bot can
 // still start threads.
 func TestMediaSandbox_ThreadCap(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	if taskCapUnbound(t) {
+		t.Skip("RLIMIT_NPROC binds no root user: no cap to test (TestNewBot_VideoGate_TaskCapUnbound)")
+	}
 	allowUnsandboxedWhereNeeded(t)
 	standInTool(t, "bigmem-sandbox-probe")
 	_, err := runTool(context.Background(), "bigmem-sandbox-probe", inputDir(t), "", []string{"threads", strconv.Itoa(toolThreadHeadroom + 16)})
@@ -1553,8 +1648,13 @@ func TestToolSelfTest_Sandboxed(t *testing.T) { //NOSONAR go:S100 -- underscore 
 	requireFFmpeg(t)
 	abi := requireLandlock(t)
 	report, err := toolSelfTest(context.Background(), "", true)
+	if taskCapUnbound(t) {
+		require.ErrorIs(t, err, errTaskCapUnbound, "as root the sandbox is not whole")
+		assert.False(t, report.TaskCap)
+		return
+	}
 	require.NoError(t, err, "%q", toolStderr(err))
-	assert.Equal(t, sandboxReport{ABI: abi, OOMScoreAdj: true, Seccomp: true}, report)
+	assert.Equal(t, sandboxReport{ABI: abi, OOMScoreAdj: true, Seccomp: true, TaskCap: true, NoCapabilities: true}, report)
 }
 
 // The helper's check mode fails, and with it the self-test, if Landlock does
@@ -1572,6 +1672,8 @@ func TestSandboxSelfCheck_Report(t *testing.T) { //NOSONAR go:S100 -- underscore
 	assert.Equal(t, abi, report.ABI)
 	assert.True(t, report.OOMScoreAdj)
 	assert.Equal(t, seccompProbe() == nil, report.Seccomp, "the filter is installed wherever the kernel can run it")
+	assert.True(t, report.NoCapabilities, "every capability set is empty after the drop (Ruling 19 item 4)")
+	assert.Equal(t, !taskCapUnbound(t), report.TaskCap, "the task cap binds every user but root")
 }
 
 // On Linux, newToolCmd runs the tool through the helper: the bot's own binary
@@ -1591,7 +1693,7 @@ func TestNewToolCmd_Linux(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 	require.NoError(t, err)
 	noSandbox := sandboxUsable(sandboxAvailable())
 	assert.Equal(t, sandboxSpec{InputDir: dir, FontFile: "/fonts/f.ttf", Tool: "/abs/ffmpeg", MemoryLimit: toolMemoryLimit, CPUSeconds: 120,
-		AllowUnsandboxed: noSandbox != nil}, inv.spec)
+		AllowUnsandboxed: noSandbox != nil || taskCapUnbound(t)}, inv.spec)
 	require.NotNil(t, cmd.SysProcAttr)
 	assert.Equal(t, syscall.SIGKILL, cmd.SysProcAttr.Pdeathsig, "SIGKILL when the bot dies")
 	assert.True(t, cmd.SysProcAttr.Setpgid, "its own process group (Ruling 12 item 5)")
@@ -1614,6 +1716,9 @@ func TestNewToolCmd_Linux(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 func TestNewBot_VideoGateSandboxOn(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	requireFFmpeg(t)
 	abi := requireLandlock(t)
+	if taskCapUnbound(t) {
+		t.Skip("as root the sandbox is not whole: TestNewBot_VideoGate_TaskCapUnbound")
+	}
 	var logged bytes.Buffer
 	prev := InfoLogger
 	InfoLogger = log.New(&logged, "", 0)

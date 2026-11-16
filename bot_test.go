@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os/exec"
 	"testing"
@@ -183,7 +184,7 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		reset()
 		b := videoGateBot(t, setupTestDB(t), &VideoConfig{SheetFrames: 8})
 		want := VideoConfig{MaxDurationSeconds: 600, SheetFrames: 8, MaxLookups: 6, MaxFramesPerLookup: 12, RetentionHours: 24}
-		if sandboxUsable(sandboxAvailable()) != nil {
+		if sandboxUsable(sandboxAvailable()) != nil || taskCapUnboundHere(t) {
 			assert.False(t, b.videoOn(), "no sandbox and no opt-out: off")
 			assert.Nil(t, b.video)
 			assert.Contains(t, logged.String(), "[video_gate_bot] video: no sandbox for ffmpeg (")
@@ -193,7 +194,7 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 			reset()
 			b = videoGateBot(t, setupTestDB(t), &VideoConfig{SheetFrames: 8, AllowUnsandboxed: true})
 			want.AllowUnsandboxed = true
-			assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a sandbox")
+			assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a full sandbox")
 			assert.NotContains(t, logged.String(), "ffmpeg sandbox on")
 		}
 		assert.True(t, b.videoOn())
@@ -216,7 +217,7 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		b = videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
 		assert.True(t, b.videoOn(), "the opt-out runs ffmpeg without the sandbox")
 		assert.True(t, unsandboxedAllowed())
-		assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a sandbox (simulated: no Landlock)")
+		assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a full sandbox (simulated: no Landlock)")
 		// Only the gate's probe is simulated: on a host with Landlock the
 		// helper still applies it, but the gate says "sandbox on" only when it
 		// found a sandbox.
@@ -239,7 +240,7 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		reset()
 		b = videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
 		assert.True(t, b.videoOn())
-		assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a sandbox (the kernel's Landlock ABI 2 cannot deny file truncation")
+		assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a full sandbox (the kernel's Landlock ABI 2 cannot deny file truncation")
 		assert.NotContains(t, logged.String(), "ffmpeg sandbox on")
 	})
 
@@ -277,6 +278,44 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		b = videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
 		assert.True(t, b.videoOn())
 		assert.Equal(t, before+1, unsandboxedGrants.Load(), "a passing gate keeps its grant")
+	})
+
+	// Only the check run, after the helper drops its capabilities, can tell
+	// that the task cap binds no user (the bot as root): the sandbox is then
+	// not whole, and video is off unless video.allow_unsandboxed, which runs
+	// the self-test again without demanding the full sandbox (Ruling 19
+	// item 4).
+	t.Run("task cap unbound: off, or on under the opt-out", func(t *testing.T) {
+		onPath(t)
+		var demanded []bool
+		selfTest := func(_ context.Context, _ string, landlock bool) (sandboxReport, error) {
+			demanded = append(demanded, landlock)
+			report := sandboxReport{ABI: 7, OOMScoreAdj: true, Seccomp: true, NoCapabilities: true}
+			if landlock {
+				return report, fmt.Errorf("sandbox check: %w", errTaskCapUnbound)
+			}
+			return report, nil
+		}
+		stubGate(t, func() (int, error) { return 7, nil }, selfTest)
+		reset()
+		before := unsandboxedGrants.Load()
+		b := videoGateBot(t, setupTestDB(t), &VideoConfig{})
+		assert.False(t, b.videoOn())
+		assert.Contains(t, logged.String(), "[video_gate_bot] video: no sandbox for ffmpeg (sandbox check: the task cap does not bind")
+		assert.Contains(t, logged.String(), "run the bot as a non-root user")
+		assert.Contains(t, logged.String(), "video watching is off")
+		assert.Equal(t, before, unsandboxedGrants.Load())
+
+		reset()
+		demanded = nil
+		b = videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
+		assert.True(t, b.videoOn())
+		assert.Equal(t, []bool{true, false}, demanded, "the full self-test, then the one without the demand")
+		assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a full sandbox (sandbox check: the task cap")
+		assert.Contains(t, warned.String(), "start threads until the bot's user or the host runs out of them")
+		assert.NotContains(t, logged.String(), "ffmpeg sandbox on")
+		assert.Equal(t, before+1, unsandboxedGrants.Load(), "the opt-out's grant")
+		unsandboxedGrants.Add(-1)
 	})
 
 	// The version check never turns video off; it only warns (Ruling 12 item 6).

@@ -88,19 +88,36 @@ func resolveVideo(config *BotConfig) *VideoConfig {
 	}
 	// Landlock before ABI 3 cannot deny truncation: no sandbox (Ruling 15).
 	noSandbox := sandboxUsable(gateSandbox())
-	if noSandbox != nil {
+	granted := false
+	// A sandbox that is not whole turns video off, unless the block's
+	// video.allow_unsandboxed accepts it, with a loud warning.
+	acceptUnsandboxed := func(why error) bool {
 		if !config.Video.AllowUnsandboxed {
 			InfoLogger.Printf("[%s] video: no sandbox for ffmpeg (%v); video watching is off (video.allow_unsandboxed runs ffmpeg without one)",
-				config.ID, noSandbox)
-			return nil
+				config.ID, why)
+			return false
 		}
-		ErrorLogger.Printf("[%s] Warning: video: ffmpeg runs WITHOUT a sandbox (%v) because video.allow_unsandboxed is set: "+
-			"a video that exploits ffmpeg could read every bot's tokens, the chat database and other chats' media", config.ID, noSandbox)
+		ErrorLogger.Printf("[%s] Warning: video: ffmpeg runs WITHOUT a full sandbox (%v) because video.allow_unsandboxed is set: "+
+			"a video that exploits ffmpeg could %s", config.ID, why, unsandboxedHarm(why))
 		unsandboxedGrants.Add(1)
+		granted = true
+		return true
+	}
+	if noSandbox != nil && !acceptUnsandboxed(noSandbox) {
+		return nil
 	}
 	report, err := gateSelfTest(context.Background(), config.Video.FontFile, noSandbox == nil)
+	if noSandbox == nil && errors.Is(err, errTaskCapUnbound) {
+		// Only the check run can tell: the task cap is probed after the
+		// helper drops its capabilities (Ruling 19 item 4).
+		noSandbox = err
+		if !acceptUnsandboxed(err) {
+			return nil
+		}
+		report, err = gateSelfTest(context.Background(), config.Video.FontFile, false)
+	}
 	if err != nil {
-		if noSandbox != nil {
+		if granted {
 			unsandboxedGrants.Add(-1) // this bot's video is off: its grant goes too
 		}
 		InfoLogger.Printf("[%s] video: the ffmpeg self-test failed: %v, stderr %q; video watching is off", config.ID, err, toolStderr(err))
@@ -123,6 +140,15 @@ func videoRunnable() error {
 		return err
 	}
 	return sandboxSparesBot()
+}
+
+// unsandboxedHarm is what a video that exploits ffmpeg could do for want of
+// the layer why names.
+func unsandboxedHarm(why error) string {
+	if errors.Is(why, errTaskCapUnbound) {
+		return "start threads until the bot's user or the host runs out of them"
+	}
+	return "read every bot's tokens, the chat database and other chats' media"
 }
 
 // logSandbox logs the sandbox the self-test reported: when it counts as one,
