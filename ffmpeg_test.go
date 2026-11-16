@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/jpeg"
+	"log"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -128,7 +132,7 @@ func hasDemuxer(t *testing.T, name string) bool {
 	t.Helper()
 	out, err := exec.Command("ffmpeg", "-hide_banner", "-demuxers").Output()
 	require.NoError(t, err)
-	for _, line := range strings.Split(string(out), "\n") {
+	for line := range strings.SplitSeq(string(out), "\n") {
 		if f := strings.Fields(line); len(f) >= 2 && f[1] == name {
 			return true
 		}
@@ -383,7 +387,7 @@ func TestDecoderLists(t *testing.T) {
 		"mov_text,srt,subrip,ssa,ass,webvtt,text", probeCodecs)
 	assert.Equal(t, "h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,libaom-av1,gif", renderCodecs)
 	for _, list := range []string{probeCodecs, renderCodecs} {
-		for _, name := range strings.Split(list, ",") {
+		for name := range strings.SplitSeq(list, ",") {
 			assert.NotContains(t, []string{"mjpeg", "png", "av1"}, name, "cover-art decoders and native av1 stay off")
 		}
 	}
@@ -600,5 +604,394 @@ func TestGridFor(t *testing.T) {
 		assert.Equal(t, want, [2]int{cols, rows}, "gridFor(%d)", n)
 		assert.GreaterOrEqual(t, cols*rows, n)
 		assert.Equal(t, int(math.Ceil(math.Sqrt(float64(n)))), cols)
+	}
+}
+
+// decodeSheet decodes a rendered JPEG and checks it against the sizing rule.
+func decodeSheet(t *testing.T, data []byte, maxEdge int) image.Image {
+	t.Helper()
+	cfg, err := jpeg.DecodeConfig(bytes.NewReader(data))
+	require.NoError(t, err, "a decodable JPEG")
+	assertWithinImageLimits(t, cfg.Width, cfg.Height, maxEdge)
+	img, err := jpeg.Decode(bytes.NewReader(data))
+	require.NoError(t, err)
+	return img
+}
+
+// portraitClip is a 37 s 720×1280 H.264 clip with AAC audio.
+func portraitClip(t *testing.T) (string, mediaProbe) {
+	t.Helper()
+	path := ffmpegFixture(t, "-f", "lavfi", "-i", "testsrc2=size=720x1280:rate=25:duration=37", "-f", "lavfi", "-i", "sine=duration=37",
+		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", "-f", "mp4")
+	p, err := probeMedia(context.Background(), path, "video")
+	require.NoError(t, err)
+	require.InDelta(t, 37, p.Duration, 0.1)
+	return path, p
+}
+
+func TestRenderSheet_SizesAndTimes(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	path, probe := portraitClip(t)
+	start := time.Now()
+	data, times, err := renderSheet(context.Background(), path, probe, sheetSpec{Start: 0, End: probe.Duration, Frames: 12, MaxEdge: maxImageEdge})
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	t.Logf("12-frame sheet of a 37 s 720x1280 clip: %v, %d bytes", elapsed, len(data))
+	assert.Less(t, elapsed, sheetTimeout/2, "well within the sheet timeout")
+
+	img := decodeSheet(t, data, maxImageEdge)
+	w, h := img.Bounds().Dx(), img.Bounds().Dy()
+	assert.Zero(t, w%4, "4 columns of equal tiles")
+	assert.Zero(t, h%3, "3 rows of equal tiles")
+	assert.InDelta(t, 720.0/1280.0, float64(w/4)/float64(h/3), 0.02, "tiles keep the aspect")
+
+	require.Len(t, times, 12)
+	for i, got := range times {
+		assert.InDelta(t, float64(i)*probe.Duration/12, got, 1e-9, "t_%d", i)
+	}
+}
+
+func TestRenderSheet_SingleFrame(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	path, probe := portraitClip(t)
+	data, times, err := renderSheet(context.Background(), path, probe, sheetSpec{Start: 12.5, End: 1, Frames: 1, MaxEdge: maxImageEdge})
+	require.NoError(t, err, "a 1 s decode window after the seek point holds the frame")
+	img := decodeSheet(t, data, maxImageEdge)
+	assert.Equal(t, [2]int{720, 1280}, [2]int{img.Bounds().Dx(), img.Bounds().Dy()}, "already within the limits: not scaled")
+	assert.Equal(t, []float64{12.5}, times)
+}
+
+func TestRenderSheet_SingleFrameGIF(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	path := ffmpegFixture(t, "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10", "-frames:v", "1", "-f", "gif")
+	probe, err := probeMedia(context.Background(), path, "animation")
+	require.NoError(t, err)
+
+	data, times, err := renderSheet(context.Background(), path, probe, sheetSpec{Start: 0, End: probe.Duration, Frames: 12, MaxEdge: maxImageEdge})
+	require.NoError(t, err, "probed duration %v", probe.Duration)
+	decodeSheet(t, data, maxImageEdge)
+	assert.Len(t, times, 12)
+
+	probe.Duration = 0
+	data, times, err = renderSheet(context.Background(), path, probe, sheetSpec{Start: 0, End: 0, Frames: 12, MaxEdge: maxImageEdge})
+	require.NoError(t, err, "unknown duration: no divide by zero")
+	img := decodeSheet(t, data, maxImageEdge)
+	assert.Equal(t, 160*4, img.Bounds().Dx(), "a full 4×3 grid")
+	assert.Equal(t, make([]float64, 12), times, "every frame at t=0")
+}
+
+// tileCenter is the color a little below the middle of tile (col, row) of a
+// cols×rows sheet, clear of the timestamp box.
+func tileCenter(img image.Image, cols, rows, col, row int) (r, g, b uint32) {
+	tw, th := img.Bounds().Dx()/cols, img.Bounds().Dy()/rows
+	r, g, b, _ = img.At(col*tw+tw/2, row*th+th/2+th/4).RGBA()
+	return r >> 8, g >> 8, b >> 8
+}
+
+func TestRenderSheet_PartialGridIsBlack(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	path := ffmpegFixture(t, mp4Args...)
+	probe, err := probeMedia(context.Background(), path, "video")
+	require.NoError(t, err)
+	data, times, err := renderSheet(context.Background(), path, probe, sheetSpec{Start: 0, End: probe.Duration, Frames: 5, MaxEdge: maxImageEdge})
+	require.NoError(t, err)
+	assert.Len(t, times, 5)
+	img := decodeSheet(t, data, maxImageEdge)
+	r, g, b := tileCenter(img, 3, 2, 2, 1)
+	assert.Less(t, r+g+b, uint32(30), "the sixth tile of a 3×2 grid is black padding, got %d,%d,%d", r, g, b)
+	r, g, b = tileCenter(img, 3, 2, 1, 1)
+	assert.Greater(t, r+g+b, uint32(60), "the fifth tile is a frame")
+}
+
+func TestRenderSheet_StickerAlpha(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	path := ffmpegFixture(t, alphaWebmArgs(512, 3)...)
+	probe, err := probeMedia(context.Background(), path, "sticker")
+	require.NoError(t, err)
+	require.True(t, probe.HasAlpha)
+
+	spec := sheetSpec{Start: 0, End: probe.Duration, Frames: stickerSheetFrames, MaxEdge: stickerSheetEdge}
+	data, times, err := renderSheet(context.Background(), path, probe, spec)
+	require.NoError(t, err)
+	img := decodeSheet(t, data, stickerSheetEdge)
+	assert.Len(t, times, stickerSheetFrames)
+	r, g, b := tileCenter(img, 3, 2, 0, 0)
+	assert.InDelta(t, 128, r, 20, "transparent pixels show the gray background (got %d,%d,%d)", r, g, b)
+	assert.InDelta(t, 128, g, 20)
+	assert.InDelta(t, 128, b, 20)
+
+	// Without the alpha decoder the same clip comes out red: the gray is the alpha path's doing.
+	probe.HasAlpha = false
+	data, _, err = renderSheet(context.Background(), path, probe, spec)
+	require.NoError(t, err)
+	r, g, _ = tileCenter(decodeSheet(t, data, stickerSheetEdge), 3, 2, 0, 0)
+	assert.Greater(t, int(r)-int(g), 100, "red without alpha")
+}
+
+func TestRenderSheet_Timeout(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	path := ffmpegFixture(t, gifArgs...)
+	probe, err := probeMedia(context.Background(), path, "animation")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	_, _, err = renderSheet(ctx, path, probe, sheetSpec{Start: 0, End: probe.Duration, Frames: 4, MaxEdge: maxImageEdge})
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.NotErrorIs(t, err, errUnsupportedMedia, "a timeout is not a decode failure")
+	assert.Less(t, time.Since(start), time.Second)
+}
+
+func TestRenderSheet_RefusesBadInput(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	good := mediaProbe{Format: "mov,mp4,m4a,3gp,3g2,mj2", Codec: "h264", Duration: 37, Width: 720, Height: 1280}
+	spec := sheetSpec{Start: 0, End: 37, Frames: 12, MaxEdge: maxImageEdge}
+	nan, inf := math.NaN(), math.Inf(1)
+	for _, tc := range []struct {
+		name  string
+		probe func(*mediaProbe)
+		spec  func(*sheetSpec)
+	}{
+		{"NaN start", nil, func(s *sheetSpec) { s.Start = nan }},
+		{"+Inf end", nil, func(s *sheetSpec) { s.End = inf }},
+		{"-Inf start", nil, func(s *sheetSpec) { s.Start = -inf }},
+		{"negative start", nil, func(s *sheetSpec) { s.Start = -1 }},
+		{"NaN end on a single frame", nil, func(s *sheetSpec) { s.Frames, s.End = 1, nan }},
+		{"end before start", nil, func(s *sheetSpec) { s.Start, s.End = 20, 10 }},
+		{"empty range", nil, func(s *sheetSpec) { s.Start, s.End = 10, 10 }},
+		{"range too short for the frames", nil, func(s *sheetSpec) { s.Start, s.End = 10, 10.001 }},
+		{"start out of range", nil, func(s *sheetSpec) { s.Start = 1e12 }},
+		{"no frames", nil, func(s *sheetSpec) { s.Frames = 0 }},
+		{"too many frames", nil, func(s *sheetSpec) { s.Frames = maxSheetFrames + 1 }},
+		{"edge too small", nil, func(s *sheetSpec) { s.MaxEdge = 0 }},
+		{"edge over the limit", nil, func(s *sheetSpec) { s.MaxEdge = maxImageEdge + 1 }},
+		{"NaN duration", func(p *mediaProbe) { p.Duration = nan }, nil},
+		{"infinite duration", func(p *mediaProbe) { p.Duration = inf }, nil},
+		{"negative duration", func(p *mediaProbe) { p.Duration = -1 }, nil},
+		{"duration out of range", func(p *mediaProbe) { p.Duration = maxSheetSeconds + 1 }, nil},
+		{"concat format", func(p *mediaProbe) { p.Format = "concat" }, nil},
+		{"lavfi format", func(p *mediaProbe) { p.Format = "lavfi" }, nil},
+		{"mpeg4 codec", func(p *mediaProbe) { p.Codec = "mpeg4" }, nil},
+		{"zero width", func(p *mediaProbe) { p.Width = 0 }, nil},
+		{"width over the cap", func(p *mediaProbe) { p.Width = probeMaxSide + 1 }, nil},
+		{"alpha on h264", func(p *mediaProbe) { p.HasAlpha = true }, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, s := good, spec
+			if tc.probe != nil {
+				tc.probe(&p)
+			}
+			if tc.spec != nil {
+				tc.spec(&s)
+			}
+			_, _, err := renderSheet(context.Background(), filepath.Join(t.TempDir(), "media"), p, s)
+			assert.ErrorIs(t, err, errInvalidSheet)
+		})
+	}
+}
+
+func TestPlanSheet(t *testing.T) {
+	probe := mediaProbe{Format: "mov,mp4,m4a,3gp,3g2,mj2", Codec: "h264", Duration: 37, Width: 720, Height: 1280}
+
+	t.Run("sheet: decode window is the range plus one step", func(t *testing.T) {
+		p, err := planSheet(probe, sheetSpec{Start: 6, End: 18, Frames: 12, MaxEdge: maxImageEdge})
+		require.NoError(t, err)
+		assert.Equal(t, 6.0, p.seek)
+		assert.InDelta(t, 13, p.window, 1e-9, "12 s range + 1 s step")
+		assert.InDelta(t, 1, p.rate, 1e-9)
+		assert.Equal(t, [2]int{4, 3}, [2]int{p.cols, p.rows})
+		assert.Zero(t, p.tileW%2)
+		assert.Zero(t, p.tileH%2)
+		assertWithinImageLimits(t, p.cols*p.tileW, p.rows*p.tileH, maxImageEdge)
+		assert.Equal(t, "mov", p.demuxer)
+		assert.Empty(t, p.decoder)
+	})
+
+	t.Run("single frame: a fixed small window", func(t *testing.T) {
+		p, err := planSheet(probe, sheetSpec{Start: 12.5, End: 0, Frames: 1, MaxEdge: maxImageEdge})
+		require.NoError(t, err)
+		assert.Equal(t, 12.5, p.seek)
+		assert.Equal(t, singleFrameWindow, p.window)
+		assert.Zero(t, p.rate)
+		assert.Equal(t, []float64{12.5}, p.times)
+	})
+
+	t.Run("range clamped to the duration", func(t *testing.T) {
+		p, err := planSheet(probe, sheetSpec{Start: 30, End: 300, Frames: 7, MaxEdge: maxImageEdge})
+		require.NoError(t, err)
+		assert.InDelta(t, 8, p.window, 1e-9, "7 s range + 1 s step")
+		assert.InDelta(t, 36, p.times[6], 1e-9)
+	})
+
+	t.Run("unknown duration: every frame at 0", func(t *testing.T) {
+		unknown := probe
+		unknown.Duration = 0
+		p, err := planSheet(unknown, sheetSpec{Start: 5, End: 9, Frames: 6, MaxEdge: maxImageEdge})
+		require.NoError(t, err)
+		assert.Equal(t, make([]float64, 6), p.times)
+		assert.Equal(t, 0.0, p.seek)
+		assert.Equal(t, singleFrameWindow, p.window)
+		assert.Zero(t, p.rate)
+	})
+
+	t.Run("alpha sticker", func(t *testing.T) {
+		sticker := mediaProbe{Format: "matroska,webm", Codec: "vp9", Duration: 3, Width: 512, Height: 512, HasAlpha: true}
+		p, err := planSheet(sticker, sheetSpec{Start: 0, End: 3, Frames: stickerSheetFrames, MaxEdge: stickerSheetEdge})
+		require.NoError(t, err)
+		assert.Equal(t, "libvpx-vp9", p.decoder)
+		assert.Equal(t, "matroska", p.demuxer)
+		assertWithinImageLimits(t, p.cols*p.tileW, p.rows*p.tileH, stickerSheetEdge)
+	})
+}
+
+func TestToolArgs_Render(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	in := filepath.Join(t.TempDir(), "media")
+	probe := mediaProbe{Format: "mov,mp4,m4a,3gp,3g2,mj2", Codec: "h264", Duration: 37, Width: 720, Height: 1280}
+	plan, err := planSheet(probe, sheetSpec{Start: 6, End: 18, Frames: 12, MaxEdge: maxImageEdge})
+	require.NoError(t, err)
+	got := renderArgs(in, plan, `C:\Windows\Fonts\arial.ttf`, 120)
+	assert.Equal(t, []string{
+		"-hide_banner", "-nostdin", "-loglevel", "error",
+		"-timelimit", "120", "-filter_threads", "1", "-copyts",
+		"-protocol_whitelist", "file", "-format_whitelist", "mov", "-f", "mov",
+		"-codec_whitelist", renderCodecs, "-max_pixels", "16777216", "-max_streams", "32", "-threads", "2",
+		"-ss", "6.000000", "-t", "13.000000",
+		"-i", "file:" + in,
+		"-map", "0:V:0", "-an", "-sn", "-dn",
+		"-vf", "setpts=PTS-6.000000/TB,fps=fps=1:start_time=0:round=up,settb=AVTB,setpts=PTS+6.000000/TB,trim=end_frame=12," +
+			"scale=238:422," +
+			`drawtext=fontfile=C\\:\\\\Windows\\\\Fonts\\\\arial.ttf:text='%{pts\:hms}':fontsize=19:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=4:x=4:y=4,` +
+			"tile=4x3",
+		"-frames:v", "1", "-q:v", "3", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1",
+	}, got)
+	assertNoForbiddenArgs(t, got)
+
+	t.Run("alpha, unknown duration, no font", func(t *testing.T) {
+		sticker := mediaProbe{Format: "matroska,webm", Codec: "vp9", Width: 512, Height: 512, HasAlpha: true}
+		plan, err := planSheet(sticker, sheetSpec{Frames: 6, MaxEdge: stickerSheetEdge})
+		require.NoError(t, err)
+		got := renderArgs(in, plan, "", 40)
+		i := slices.Index(got, "-i")
+		assert.Equal(t, []string{"-c:v", "libvpx-vp9", "-ss", "0.000000", "-t", "1.000000"}, got[i-6:i], "decoder and window are input options")
+		assert.Equal(t, "trim=end_frame=1,loop=loop=5:size=1,setpts=0,trim=end_frame=6,"+
+			"format=yuva420p,split[fg][bgsrc];[bgsrc]lutyuv=y=128:u=128:v=128:a=255[bg];[bg][fg]overlay=format=yuv420,"+
+			"scale=170:170,"+
+			`drawtext=text='%{pts\:hms}':fontsize=14:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=3:x=3:y=3,`+
+			"tile=3x2", got[slices.Index(got, "-vf")+1])
+		assertNoForbiddenArgs(t, got)
+	})
+}
+
+func TestCPUTimeLimit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+	defer cancel()
+	assert.Equal(t, 40, cpuTimeLimit(ctx), "twice a lookup's 20 s")
+	ctx2, cancel2 := context.WithTimeout(context.Background(), sheetTimeout)
+	defer cancel2()
+	assert.Equal(t, 120, cpuTimeLimit(ctx2), "twice a sheet's 60 s")
+}
+
+func TestRenderSheet_RenderAllowlists(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	forged := mediaProbe{Format: "mov,mp4,m4a,3gp,3g2,mj2", Codec: "h264", Duration: 1, Width: 160, Height: 120}
+	gifProbe := mediaProbe{Format: "gif", Codec: "gif", Duration: 1, Width: 160, Height: 120}
+	spec := sheetSpec{Start: 0, End: 1, Frames: 4, MaxEdge: maxImageEdge}
+	for _, tc := range []struct {
+		name  string
+		path  string
+		probe mediaProbe
+	}{
+		{"mpeg4 decoder is not on the render list", ffmpegFixture(t, "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10:duration=1", "-c:v", "mpeg4", "-f", "mp4"), forged},
+		{"-max_pixels stops a frame the probe never saw", ffmpegFixture(t, "-f", "lavfi", "-i", "testsrc2=size=4100x4100:rate=1", "-frames:v", "1", "-f", "gif"), gifProbe},
+		{"-f is pinned from the probe", ffmpegFixture(t, gifArgs...), forged},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := renderSheet(context.Background(), tc.path, tc.probe, spec)
+			assert.ErrorIs(t, err, errUnsupportedMedia)
+			var te *toolError
+			assert.ErrorAs(t, err, &te, "ffmpeg exited non-zero")
+		})
+	}
+}
+
+func TestRenderSheet_NoNestedSlots(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	path := ffmpegFixture(t, gifArgs...)
+	for range cap(toolSlots) - 1 {
+		toolSlots <- struct{}{}
+	}
+	t.Cleanup(func() {
+		for len(toolSlots) > 0 {
+			<-toolSlots
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	probe, err := probeMedia(ctx, path, "animation")
+	require.NoError(t, err, "one free slot is enough")
+	_, _, err = renderSheet(ctx, path, probe, sheetSpec{Start: 0, End: probe.Duration, Frames: 4, MaxEdge: maxImageEdge})
+	require.NoError(t, err, "one free slot is enough: a run never holds two")
+	assert.Equal(t, cap(toolSlots)-1, len(toolSlots), "the slot came back")
+}
+
+func TestFilterValue(t *testing.T) {
+	assert.Equal(t, `C\\:\\\\Windows\\\\Fonts\\\\arial.ttf`, filterValue(`C:\Windows\Fonts\arial.ttf`))
+	assert.Equal(t, `/usr/share/fonts/it\\\'s\,\[a\]\;b.ttf`, filterValue(`/usr/share/fonts/it's,[a];b.ttf`))
+	assert.Equal(t, "/usr/share/fonts/dejavu/DejaVuSans.ttf", filterValue("/usr/share/fonts/dejavu/DejaVuSans.ttf"))
+	assert.Equal(t, "caf\xe9\xff", filterValue("caf\xe9\xff"), "bytes kept as they are")
+}
+
+func TestRenderSheet_FontPathEscaping(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	system := resolveFontFile("")
+	if system == "" {
+		t.Skip("no built-in font file on this system")
+	}
+	font, err := os.ReadFile(system) // #nosec G304 -- a built-in candidate path
+	require.NoError(t, err)
+	dir := filepath.Join(t.TempDir(), "it's [a],b;c")
+	require.NoError(t, os.Mkdir(dir, 0o700))
+	odd := filepath.Join(dir, "font's,[1];x.ttf")
+	require.NoError(t, os.WriteFile(odd, font, 0o600))
+	require.Equal(t, odd, resolveFontFile(odd))
+	t.Logf("font path: %s", odd) // on Windows it also holds ':' and '\'
+
+	path := ffmpegFixture(t, gifArgs...)
+	probe, err := probeMedia(context.Background(), path, "animation")
+	require.NoError(t, err)
+	spec := sheetSpec{Start: 0, End: probe.Duration, Frames: 4, MaxEdge: maxImageEdge, FontFile: odd}
+	data, _, err := renderSheet(context.Background(), path, probe, spec)
+	require.NoError(t, err, "drawtext found the font through both escaping levels")
+	decodeSheet(t, data, maxImageEdge)
+
+	// A regular file that is not a font makes drawtext fail: so the escaped path really reached it.
+	notFont := filepath.Join(dir, "not, a [font].ttf")
+	require.NoError(t, os.WriteFile(notFont, []byte("not a font"), 0o600))
+	spec.FontFile = notFont
+	_, _, err = renderSheet(context.Background(), path, probe, spec)
+	assert.ErrorIs(t, err, errUnsupportedMedia)
+}
+
+func TestResolveFontFile(t *testing.T) {
+	var logged bytes.Buffer
+	prev := InfoLogger
+	InfoLogger = log.New(&logged, "", 0)
+	t.Cleanup(func() { InfoLogger = prev })
+
+	builtIn := resolveFontFile("")
+	good := filepath.Join(t.TempDir(), "font.ttf")
+	require.NoError(t, os.WriteFile(good, []byte("not really a font"), 0o600))
+	assert.Equal(t, good, resolveFontFile(good), "an absolute regular file is used as configured")
+	assert.Empty(t, logged.String())
+
+	for name, bad := range map[string]string{
+		"relative":  "fonts/font.ttf",
+		"directory": t.TempDir(),
+		"missing":   filepath.Join(t.TempDir(), "missing.ttf"),
+	} {
+		logged.Reset()
+		assert.Equal(t, builtIn, resolveFontFile(bad), name)
+		assert.Equal(t, builtIn, resolveFontFile(bad), name)
+		assert.Equal(t, 1, strings.Count(logged.String(), "video: font_file"), "%s: logged once", name)
 	}
 }

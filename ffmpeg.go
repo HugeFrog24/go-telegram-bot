@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -200,7 +201,7 @@ func parseProbe(out []byte, formats []string) (mediaProbe, error) {
 	if !slices.Contains(videoCodecs, s.CodecName) {
 		return mediaProbe{}, fmt.Errorf("%w: codec %q", errUnsupportedMedia, s.CodecName)
 	}
-	if s.Width <= 0 || s.Height <= 0 || s.Width > probeMaxSide || s.Height > probeMaxSide || s.Width*s.Height > probeMaxArea {
+	if !usableSize(s.Width, s.Height) {
 		return mediaProbe{}, fmt.Errorf("%w: %dx%d is not a usable size", errUnsupportedMedia, s.Width, s.Height)
 	}
 	duration, err := probeDuration(s.Duration, doc.Format.Duration)
@@ -301,6 +302,278 @@ func toolArgs(r toolRun) []string {
 // formatSeconds formats a time already checked finite and in range.
 func formatSeconds(s float64) string {
 	return strconv.FormatFloat(s, 'f', 6, 64)
+}
+
+// Bounds on a sheet request. Numbers outside them never reach ffmpeg (item 11).
+const (
+	maxSheetFrames    = 20                         // the config's largest sheet_frames and max_frames_per_lookup
+	minSheetEdge      = 64                         // smallest MaxEdge
+	maxSheetSeconds   = maxVideoMaxDurationSeconds // no watchable video is longer
+	maxSheetRate      = 1000.0                     // frames per second of source time a sheet may sample
+	singleFrameWindow = 1.0                        // seconds decoded after the seek for one frame (Ruling 9)
+)
+
+// errInvalidSheet means renderSheet got numbers out of range, or a probe that
+// probeMedia would not have produced. Nothing ran.
+var errInvalidSheet = errors.New("invalid sheet request")
+
+// sheetSpec asks renderSheet for frames of a probed file.
+type sheetSpec struct {
+	Start, End float64 // seconds; End ignored when Frames == 1
+	Frames     int
+	MaxEdge    int    // maxImageEdge, or stickerSheetEdge for stickers
+	FontFile   string // the configured font; resolveFontFile picks a built-in one when unusable or ""
+}
+
+// sheetPlan is a checked sheet request: every number in it is finite and in range.
+type sheetPlan struct {
+	demuxer, decoder string    // -f and -format_whitelist; input -c:v for alpha ("" otherwise)
+	seek, window     float64   // input -ss and -t (the decode window, Ruling 9)
+	rate             float64   // frames per second sampled; 0 for one frame or an unknown duration
+	frames           int       // tiles in the image
+	cols, rows       int       // grid
+	tileW, tileH     int       // even, so tiles line up on chroma rows
+	times            []float64 // source time of each tile
+}
+
+// renderSheet renders frames of path as one JPEG and returns it with each
+// tile's source time. Frames > 1 gives a gridFor(Frames) sheet of frames at
+// t_i = Start + i·(End−Start)/Frames; Frames == 1 gives the frame at Start.
+// When probe.Duration is 0 (unknown) every frame is the first one, at t=0.
+// The image meets the sizing rule for spec.MaxEdge and each tile has its
+// source time burned in. It runs one ffmpeg process within sheetTimeout or
+// ctx's earlier deadline. A failed run is errUnsupportedMedia; out-of-range
+// input is errInvalidSheet; a timeout is the context's error.
+func renderSheet(ctx context.Context, path string, probe mediaProbe, spec sheetSpec) (jpeg []byte, frameTimes []float64, err error) {
+	plan, err := planSheet(probe, spec)
+	if err != nil {
+		return nil, nil, err
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, sheetTimeout)
+	defer cancel()
+	out, err := runTool(ctx, "ffmpeg", filepath.Dir(abs), renderArgs(abs, plan, resolveFontFile(spec.FontFile), cpuTimeLimit(ctx)))
+	if err != nil {
+		return nil, nil, decodeFailure(err)
+	}
+	if len(out) == 0 {
+		return nil, nil, fmt.Errorf("%w: ffmpeg wrote no frame", errUnsupportedMedia)
+	}
+	return out, plan.times, nil
+}
+
+// planSheet checks a sheet request and works out every number the render uses.
+func planSheet(probe mediaProbe, spec sheetSpec) (sheetPlan, error) {
+	if err := checkSheet(probe, spec); err != nil {
+		return sheetPlan{}, err
+	}
+	demuxer, _, _ := containerFor(probe.Format)
+	p := sheetPlan{demuxer: demuxer, window: singleFrameWindow, frames: spec.Frames, times: make([]float64, spec.Frames)}
+	if probe.HasAlpha {
+		p.decoder = alphaDecoders[probe.Codec]
+	}
+	if probe.Duration > 0 {
+		if err := p.sample(min(spec.Start, probe.Duration), min(spec.End, probe.Duration)); err != nil {
+			return sheetPlan{}, err
+		}
+	}
+	p.cols, p.rows = gridFor(spec.Frames)
+	gridW, gridH := fitImageSize(p.cols*probe.Width, p.rows*probe.Height, spec.MaxEdge)
+	p.tileW, p.tileH = max(2, gridW/p.cols&^1), max(2, gridH/p.rows&^1)
+	return p, nil
+}
+
+// sample sets the seek, decode window, rate and tile times for a file of
+// known duration, with start and end already clamped to it.
+func (p *sheetPlan) sample(start, end float64) error {
+	p.seek, p.times[0] = start, start
+	if p.frames == 1 {
+		return nil
+	}
+	span := end - start
+	if span <= 0 || float64(p.frames)/span > maxSheetRate {
+		return fmt.Errorf("%w: %d frames from %v to %v", errInvalidSheet, p.frames, start, end)
+	}
+	step := span / float64(p.frames)
+	p.rate, p.window = float64(p.frames)/span, span+step
+	for i := range p.times {
+		p.times[i] = start + float64(i)*step
+	}
+	return nil
+}
+
+// checkSheet refuses a probe probeMedia would not have produced and any
+// number out of range, before anything is formatted.
+func checkSheet(probe mediaProbe, spec sheetSpec) error {
+	_, _, ok := containerFor(probe.Format)
+	var bad string
+	switch {
+	case !ok:
+		bad = fmt.Sprintf("format %q", probe.Format)
+	case !slices.Contains(videoCodecs, probe.Codec):
+		bad = fmt.Sprintf("codec %q", probe.Codec)
+	case probe.HasAlpha && alphaDecoders[probe.Codec] == "":
+		bad = fmt.Sprintf("alpha on %q", probe.Codec)
+	case !usableSize(probe.Width, probe.Height):
+		bad = fmt.Sprintf("size %dx%d", probe.Width, probe.Height)
+	case !finiteIn(probe.Duration, 0, maxSheetSeconds):
+		bad = fmt.Sprintf("duration %v", probe.Duration)
+	case !finiteIn(spec.Start, 0, maxSheetSeconds) || !finiteIn(spec.End, 0, maxSheetSeconds):
+		bad = fmt.Sprintf("range %v to %v", spec.Start, spec.End)
+	case spec.Frames < 1 || spec.Frames > maxSheetFrames:
+		bad = fmt.Sprintf("%d frames", spec.Frames)
+	case spec.MaxEdge < minSheetEdge || spec.MaxEdge > maxImageEdge:
+		bad = fmt.Sprintf("max edge %d", spec.MaxEdge)
+	}
+	if bad != "" {
+		return fmt.Errorf("%w: %s", errInvalidSheet, bad)
+	}
+	return nil
+}
+
+// usableSize is the probe-side pixel cap (item 5).
+func usableSize(w, h int) bool {
+	return w > 0 && h > 0 && w <= probeMaxSide && h <= probeMaxSide && w*h <= probeMaxArea
+}
+
+// finiteIn reports whether v is a finite number in [lo, hi].
+func finiteIn(v, lo, hi float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= lo && v <= hi
+}
+
+// renderArgs is the ffmpeg argument vector for a planned sheet. The demuxer is
+// pinned with -f and is the only whitelisted format; one JPEG goes to stdout.
+func renderArgs(input string, p sheetPlan, font string, timeLimit int) []string {
+	return toolArgs(toolRun{
+		tool:      "ffmpeg",
+		formats:   p.demuxer,
+		demuxer:   p.demuxer,
+		codecs:    renderCodecs,
+		decoder:   p.decoder,
+		timeLimit: timeLimit,
+		seek:      p.seek,
+		window:    p.window,
+		input:     input,
+		output: []string{"-map", "0:V:0", "-an", "-sn", "-dn", "-vf", sheetFilter(p, font),
+			"-frames:v", "1", "-q:v", "3", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1"},
+	})
+}
+
+// alphaOnGray flattens a transparent frame onto mid-gray. Pinning yuva420p
+// before split keeps format negotiation from dropping the alpha, which it
+// does once -ss or -t is set.
+const alphaOnGray = "format=yuva420p,split[fg][bgsrc];[bgsrc]lutyuv=y=128:u=128:v=128:a=255[bg];[bg][fg]overlay=format=yuv420"
+
+// timestampText is drawtext's only text: the frame's time (item 11).
+const timestampText = `text='%{pts\:hms}'`
+
+// sheetFilter builds the -vf graph from constants, the plan's checked numbers
+// and the escaped font path; nothing in it comes from the file, the user or
+// the model (item 11). With -copyts the frames keep their source times.
+func sheetFilter(p sheetPlan, font string) string {
+	var f []string
+	switch {
+	case p.rate > 0:
+		// Shift the range to start at 0, take one frame every 1/rate s (round=up
+		// shows the frame on screen at each tile's time), then shift back in a
+		// fine time base so drawtext prints the source time.
+		seek := formatSeconds(p.seek)
+		f = append(f, "setpts=PTS-"+seek+"/TB",
+			"fps=fps="+strconv.FormatFloat(p.rate, 'f', -1, 64)+":start_time=0:round=up",
+			"settb=AVTB", "setpts=PTS+"+seek+"/TB")
+	case p.frames > 1:
+		// Unknown duration: the first frame, repeated, every copy at t=0.
+		f = append(f, "trim=end_frame=1", "loop=loop="+strconv.Itoa(p.frames-1)+":size=1", "setpts=0")
+	}
+	if p.frames > 1 {
+		// Exactly the planned frames reach tile, which pads the rest of the grid black at EOF.
+		f = append(f, "trim=end_frame="+strconv.Itoa(p.frames))
+	}
+	if p.decoder != "" {
+		f = append(f, alphaOnGray)
+	}
+	fontSize := min(max(min(p.tileW/12, p.tileH/6), 8), 48)
+	border := max(1, fontSize/4)
+	draw := "drawtext="
+	if font != "" {
+		draw += "fontfile=" + filterValue(font) + ":"
+	}
+	draw += timestampText + fmt.Sprintf(":fontsize=%d:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=%d:x=%d:y=%d",
+		fontSize, border, border, border)
+	f = append(f, fmt.Sprintf("scale=%d:%d", p.tileW, p.tileH), draw)
+	if p.frames > 1 {
+		f = append(f, fmt.Sprintf("tile=%dx%d", p.cols, p.rows))
+	}
+	return strings.Join(f, ",")
+}
+
+// filterValue escapes s as a filter option value (\ : ') and then for the
+// filtergraph (\ ' [ ] , ;), the two levels in ffmpeg-filters' "Notes on
+// filtergraph escaping". It works on bytes, so any path survives unchanged.
+func filterValue(s string) string {
+	return escapeBytes(escapeBytes(s, `\:'`), `\'[],;`)
+}
+
+func escapeBytes(s, special string) string {
+	var b strings.Builder
+	for i := range len(s) {
+		if strings.IndexByte(special, s[i]) >= 0 {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// cpuTimeLimit is ffmpeg's -timelimit: twice the run's wall-clock timeout in
+// whole seconds, a CPU-time backstop under the context kill (item 10).
+func cpuTimeLimit(ctx context.Context) int {
+	d, ok := ctx.Deadline()
+	if !ok {
+		return 2 * int(sheetTimeout/time.Second)
+	}
+	return 2 * max(1, int(math.Ceil(time.Until(d).Seconds())))
+}
+
+// fontCandidates are the built-in font files, in order (Alpine, Debian/Ubuntu, Windows).
+var fontCandidates = []string{
+	"/usr/share/fonts/dejavu/DejaVuSans.ttf",
+	"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+	`C:\Windows\Fonts\arial.ttf`,
+}
+
+// fontFallbacksLogged holds the configured font paths already logged as unusable.
+var fontFallbacksLogged sync.Map
+
+// resolveFontFile returns configured when it is an absolute path to a regular
+// file. Otherwise (logging once per path when one was configured) it returns
+// the first existing built-in candidate, or "" so drawtext uses its default.
+func resolveFontFile(configured string) string {
+	if configured != "" {
+		if usableFontFile(configured) {
+			return configured
+		}
+		if _, seen := fontFallbacksLogged.LoadOrStore(configured, true); !seen {
+			InfoLogger.Printf("video: font_file %q is not an absolute path to a regular file; using a built-in font", configured)
+		}
+	}
+	for _, c := range fontCandidates {
+		if usableFontFile(c) {
+			return c
+		}
+	}
+	return ""
+}
+
+func usableFontFile(p string) bool {
+	if !filepath.IsAbs(p) {
+		return false
+	}
+	fi, err := os.Stat(p)
+	return err == nil && fi.Mode().IsRegular()
 }
 
 // lookupTool resolves an ffmpeg tool to an absolute path, refusing one found
