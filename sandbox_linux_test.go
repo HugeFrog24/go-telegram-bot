@@ -1077,6 +1077,28 @@ func TestCheckSandboxed_ReportsNoSandbox(t *testing.T) { //NOSONAR go:S100 -- un
 	assert.ErrorContains(t, missing, "cannot read "+filepath.Join(in, "missing"))
 }
 
+// The check tests only the layers the report says are there (Ruling 18
+// item 3): a host without Landlock, under video.allow_unsandboxed, still
+// passes with the seccomp filter alone, and with neither layer there is
+// nothing to check. Run here, unsandboxed, a probe of a missing layer would
+// fail.
+func TestCheckSandboxed_OnlyPresentLayers(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	in := t.TempDir()
+	inside := writeFake(t, in, "media", "inside")
+	outside := writeFake(t, t.TempDir(), "file", "outside")
+	assert.NoError(t, checkSandboxed(in, inside, outside, sandboxReport{}), "no layer, no check")
+
+	err := checkSandboxed(in, inside, outside, sandboxReport{Seccomp: true})
+	require.Error(t, err, "the seccomp probes run, and fail out here")
+	for _, landlock := range []string{"read " + outside, "created a file", "TCP"} {
+		assert.NotContains(t, err.Error(), landlock, "no Landlock, no file or TCP check")
+	}
+
+	err = checkSandboxed(in, inside, outside, sandboxReport{ABI: 7})
+	require.Error(t, err, "the Landlock checks run, and fail out here")
+	assert.NotContains(t, err.Error(), "could signal the bot", "no seccomp filter, no seccomp probe")
+}
+
 // The self-test reports Landlock as on, with the kernel's ABI, when it is.
 func TestToolSelfTest_Sandboxed(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	requireFFmpeg(t)

@@ -632,12 +632,29 @@ func sandboxProbeName() string {
 	return ".media-sandbox-check-" + strconv.Itoa(os.Getpid())
 }
 
-// checkSandboxed is the check run's test of the sandbox it is in, as the
-// report says it is: inside (in the input directory) reads, outside does
-// not, no file can be created in either directory, from ABI 4 no TCP socket
-// can bind, and with the seccomp filter no socket can be made and the bot
-// cannot be signalled. It returns every failure at once.
+// checkSandboxed is the check run's test of the sandbox it is in, layer by
+// layer as the report says it is (Ruling 18 item 3). With Landlock: inside
+// (in the input directory) reads, outside does not, no file can be created
+// in either directory, and from ABI 4 no TCP socket can bind. With the
+// seccomp filter: the seccompDenies probes. It returns every failure at once.
 func checkSandboxed(inputDir, inside, outside string, report sandboxReport) error {
+	var failed []string
+	if report.ABI > 0 {
+		failed = append(failed, landlockDenies(inputDir, inside, outside, report.ABI)...)
+	}
+	if report.Seccomp {
+		failed = append(failed, seccompDenies()...)
+	}
+	if len(failed) > 0 {
+		return errors.New("sandbox check failed: " + strings.Join(failed, "; "))
+	}
+	return nil
+}
+
+// landlockDenies checks what Landlock at abi must refuse; checkSandboxed
+// runs it only when Landlock is there (Ruling 18 item 3), so a host without
+// Landlock under video.allow_unsandboxed passes on the filter alone.
+func landlockDenies(inputDir, inside, outside string, abi int) []string {
 	var failed []string
 	if _, err := os.ReadFile(inside); err != nil { // #nosec G304 -- the bot's own self-test file
 		failed = append(failed, fmt.Sprintf("cannot read %s: %v", inside, err))
@@ -657,18 +674,12 @@ func checkSandboxed(inputDir, inside, outside string, report sandboxReport) erro
 			failed = append(failed, fmt.Sprintf("creating a file in %s failed oddly: %v", dir, err))
 		}
 	}
-	if report.ABI >= 4 {
+	if abi >= 4 {
 		if err := tcpBindDenied(); err != nil {
 			failed = append(failed, err.Error())
 		}
 	}
-	if report.Seccomp {
-		failed = append(failed, seccompDenies()...)
-	}
-	if len(failed) > 0 {
-		return errors.New("sandbox check failed: " + strings.Join(failed, "; "))
-	}
-	return nil
+	return failed
 }
 
 // seccompDenies checks two things only the seccomp filter refuses at any
