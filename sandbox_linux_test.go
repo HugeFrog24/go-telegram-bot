@@ -916,6 +916,33 @@ func TestMediaSandbox_RenderSameAsUnsandboxed(t *testing.T) { //NOSONAR go:S100 
 	assert.True(t, err != nil || !bytes.Equal(out, sandboxed), "the font rule is what lets ffmpeg read the font")
 }
 
+// On Linux the helper's RLIMIT_CPU caps a run's CPU time, and ffmpeg gets
+// no -timelimit (Ruling 19 item 7): its own setrlimit(RLIMIT_CPU, {lim,
+// lim+1}) asked for a hard limit above the helper's and failed on every run,
+// printing "setrlimit: Operation not permitted". A real render through the
+// helper, stderr and all, has no setrlimit in it.
+func TestMediaSandbox_RenderNoTimelimit(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	allowUnsandboxedWhereNeeded(t)
+	clip := ffmpegFixture(t, gifArgs...)
+	ctx := context.Background()
+	probe, err := probeMedia(ctx, clip, "animation")
+	require.NoError(t, err, "%q", toolStderr(err))
+	plan, err := planSheet(probe, sheetSpec{Start: 0, End: probe.Duration, Frames: 4, MaxEdge: 512})
+	require.NoError(t, err)
+	args := renderArgs(clip, plan, resolveFontFile(""), 120)
+	assert.NotContains(t, args, "-timelimit")
+	bin, err := lookupTool("ffmpeg")
+	require.NoError(t, err)
+	cmd, err := newToolCmd(ctx, bin, filepath.Dir(clip), resolveFontFile(""), args)
+	require.NoError(t, err)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	require.NoError(t, cmd.Run(), "%q", stderr.String())
+	assert.NotEmpty(t, stdout.Bytes())
+	assert.NotContains(t, stderr.String(), "setrlimit")
+}
+
 // With no font file at all, drawtext asks fontconfig for its default, which
 // reads its configuration and the font directories and tries to write and
 // chmod its cache. That fallback still renders under the sandbox, the seccomp

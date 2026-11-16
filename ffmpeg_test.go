@@ -1690,9 +1690,13 @@ func TestToolArgs_Render(t *testing.T) { //NOSONAR go:S100 -- underscore separat
 	plan, err := planSheet(probe, sheetSpec{Start: 16, End: 28, Frames: 12, MaxEdge: maxImageEdge})
 	require.NoError(t, err)
 	got := renderArgs(in, plan, `C:\Windows\Fonts\arial.ttf`, 120)
-	assert.Equal(t, []string{
-		"-hide_banner", "-nostdin", "-loglevel", "error", "-max_alloc", "134217728",
-		"-timelimit", "120", "-filter_threads", "1", "-copyts",
+	timeLimit := []string{"-timelimit", "120"} // off Linux only: there the helper's RLIMIT_CPU replaces it
+	if !toolTimeLimitFlag {
+		timeLimit = nil
+	}
+	assert.Equal(t, slices.Concat([]string{
+		"-hide_banner", "-nostdin", "-loglevel", "error", "-max_alloc", "134217728"}, timeLimit, []string{
+		"-filter_threads", "1", "-copyts",
 		"-protocol_whitelist", "file", "-format_whitelist", "mov", "-f", "mov",
 		"-codec_whitelist", "h264,hevc,vp8,vp9,libdav1d,gif", "-max_pixels", "16777216", "-max_streams", "32", "-threads", "2",
 		"-ss", "6.000000", "-t", "23.000000", // 10 s lookback before Start 16
@@ -1703,7 +1707,7 @@ func TestToolArgs_Render(t *testing.T) { //NOSONAR go:S100 -- underscore separat
 			`drawtext=fontfile=C\\:\\\\Windows\\\\Fonts\\\\arial.ttf:text='%{pts\:hms}':fontsize=19:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=4:x=4:y=4,` +
 			"tile=4x3",
 		"-frames:v", "1", "-threads", "1", "-q:v", "3", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1",
-	}, got)
+	}), got)
 	assertNoForbiddenArgs(t, got)
 
 	t.Run("alpha, unknown duration, no font", func(t *testing.T) {

@@ -13,6 +13,10 @@ import (
 // Ruling 13).
 const toolMemoryCapped = false
 
+// toolTimeLimitFlag is true: with no helper to set RLIMIT_CPU here, ffmpeg's
+// own -timelimit is the CPU-time backstop.
+const toolTimeLimitFlag = true
+
 // toolCommand runs the tool directly, and only once a bot's gate allowed
 // tools without a sandbox (video.allow_unsandboxed): there is none here.
 func toolCommand(bin, _, _ string, _ int, args []string) (string, []string, error) {

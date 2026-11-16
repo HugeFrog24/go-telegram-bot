@@ -369,7 +369,7 @@ type toolRun struct {
 	demuxer   string   // -f, pinned from the probe (render only)
 	codecs    string   // -codec_whitelist
 	decoder   string   // input -c:v (alpha inputs only)
-	timeLimit int      // -timelimit CPU seconds (ffmpeg only)
+	timeLimit int      // -timelimit CPU seconds (ffmpeg only, and only where toolTimeLimitFlag)
 	seek      float64  // input -ss (render only)
 	window    float64  // input -t decode window; 0 leaves out -ss and -t
 	input     string   // absolute path, passed as file:<path>
@@ -378,7 +378,8 @@ type toolRun struct {
 
 // toolArgs is the one argument builder for every probe, sheet and lookup
 // (item 12). Every input option comes before -i (item 1). ffprobe takes
-// neither -nostdin nor -timelimit, so only ffmpeg gets them.
+// neither -nostdin nor -timelimit, so only ffmpeg gets them, and -timelimit
+// only off Linux, where no helper sets RLIMIT_CPU (toolTimeLimitFlag).
 //
 // There is no -fflags +noparse+nofillin, which would stop the codec parsers
 // running on streams the decoder lists then refuse. It was tried (Ruling 12
@@ -392,8 +393,11 @@ func toolArgs(r toolRun) []string {
 		args = append(args, "-nostdin")
 	}
 	args = append(args, "-loglevel", "error", "-max_alloc", strconv.Itoa(toolMaxAlloc))
+	if ffmpeg && toolTimeLimitFlag {
+		args = append(args, "-timelimit", strconv.Itoa(r.timeLimit))
+	}
 	if ffmpeg {
-		args = append(args, "-timelimit", strconv.Itoa(r.timeLimit), "-filter_threads", "1", "-copyts")
+		args = append(args, "-filter_threads", "1", "-copyts")
 	}
 	args = append(args, "-protocol_whitelist", "file", "-format_whitelist", r.formats)
 	if r.demuxer != "" {
@@ -728,8 +732,10 @@ func escapeBytes(s, special string) string {
 	return b.String()
 }
 
-// cpuTimeLimit is ffmpeg's -timelimit: twice the run's wall-clock timeout in
-// whole seconds, a CPU-time backstop under the context kill (item 10).
+// cpuTimeLimit is a run's CPU-time limit: twice its wall-clock timeout in
+// whole seconds, a backstop under the context kill (item 10). On Linux the
+// helper sets it as RLIMIT_CPU for both tools; elsewhere ffmpeg gets it as
+// -timelimit.
 func cpuTimeLimit(ctx context.Context) int {
 	d, ok := ctx.Deadline()
 	if !ok {
@@ -931,8 +937,8 @@ func runToolCmd(ctx context.Context, name string, build func(context.Context) (*
 // newToolCmd builds the child process for bin. On Linux it runs bin through
 // the sandbox helper (ffmpeg_linux.go, sandbox_linux.go); elsewhere directly,
 // once a bot allowed that. It fails with errNoSandbox when neither can be.
-// On Linux the run's CPU time is capped at twice ctx's timeout, the same
-// cpuTimeLimit ffmpeg's -timelimit gets (Ruling 16 item 2).
+// On Linux the run's CPU time is capped at twice ctx's timeout, as
+// RLIMIT_CPU (cpuTimeLimit; Ruling 16 item 2, Ruling 19 item 7).
 func newToolCmd(ctx context.Context, bin, dir, font string, args []string) (*exec.Cmd, error) {
 	path, argv, err := toolCommand(bin, dir, font, cpuTimeLimit(ctx), args)
 	if err != nil {

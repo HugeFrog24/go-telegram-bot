@@ -15,6 +15,12 @@ import (
 // which the sandbox helper sets whether or not Landlock is there.
 const toolMemoryCapped = true
 
+// toolTimeLimitFlag is false: on Linux the helper's RLIMIT_CPU caps every
+// run's CPU time, soft and hard, so ffmpeg gets no -timelimit, whose own
+// setrlimit(RLIMIT_CPU, {lim, lim+1}) asks for more than that hard limit
+// and fails on every run (Ruling 19 item 7).
+const toolTimeLimitFlag = false
+
 // toolCommand runs bin with args through the media sandbox helper: the bot's
 // own binary, told the spec, which limits and Landlocks itself and then execs
 // bin in place (sandbox_linux.go). It replaced Ruling 12's /bin/sh wrapper.
