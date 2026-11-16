@@ -102,7 +102,7 @@ func newSandboxSpec(dir, font, tool string) (sandboxSpec, error) {
 	if font != "" {
 		font = filepath.Clean(font) // the same file; resolveFontFile already took it
 	}
-	spec := sandboxSpec{InputDir: dir, FontFile: font, Tool: tool, MemoryLimit: toolMemoryLimit, AllowUnsandboxed: unsandboxedTools.Load()}
+	spec := sandboxSpec{InputDir: dir, FontFile: font, Tool: tool, MemoryLimit: toolMemoryLimit, AllowUnsandboxed: unsandboxedAllowed()}
 	if err := sandboxUsable(sandboxAvailable()); err != nil && !spec.AllowUnsandboxed {
 		return spec, fmt.Errorf("%w: %w", errNoSandbox, err)
 	}

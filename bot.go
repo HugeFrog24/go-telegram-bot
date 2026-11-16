@@ -96,10 +96,13 @@ func resolveVideo(config *BotConfig) *VideoConfig {
 		}
 		ErrorLogger.Printf("[%s] Warning: video: ffmpeg runs WITHOUT a sandbox (%v) because video.allow_unsandboxed is set: "+
 			"a video that exploits ffmpeg could read every bot's tokens, the chat database and other chats' media", config.ID, noSandbox)
-		unsandboxedTools.Store(true)
+		unsandboxedGrants.Add(1)
 	}
 	report, err := gateSelfTest(context.Background(), config.Video.FontFile, noSandbox == nil)
 	if err != nil {
+		if noSandbox != nil {
+			unsandboxedGrants.Add(-1) // this bot's video is off: its grant goes too
+		}
 		InfoLogger.Printf("[%s] video: the ffmpeg self-test failed: %v, stderr %q; video watching is off", config.ID, err, toolStderr(err))
 		return nil
 	}

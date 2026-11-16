@@ -118,8 +118,8 @@ func TestStripDeadFileIDFromMemory_UnknownChatIsNoop(t *testing.T) {
 // when the test ends.
 func videoGateBot(t *testing.T, db *gorm.DB, video *VideoConfig) *Bot {
 	t.Helper()
-	prev := unsandboxedTools.Load()
-	t.Cleanup(func() { unsandboxedTools.Store(prev) })
+	prev := unsandboxedGrants.Load()
+	t.Cleanup(func() { unsandboxedGrants.Store(prev) })
 	b, err := NewBot(db, BotConfig{
 		ID:              "video_gate_bot",
 		OwnerTelegramID: 1,
@@ -188,7 +188,7 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 			assert.Nil(t, b.video)
 			assert.Contains(t, logged.String(), "[video_gate_bot] video: no sandbox for ffmpeg (")
 			assert.Contains(t, logged.String(), "video watching is off")
-			assert.False(t, unsandboxedTools.Load(), "nothing may run without the sandbox")
+			assert.False(t, unsandboxedAllowed(), "nothing may run without the sandbox")
 
 			reset()
 			b = videoGateBot(t, setupTestDB(t), &VideoConfig{SheetFrames: 8, AllowUnsandboxed: true})
@@ -215,7 +215,7 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		reset()
 		b = videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
 		assert.True(t, b.videoOn(), "the opt-out runs ffmpeg without the sandbox")
-		assert.True(t, unsandboxedTools.Load())
+		assert.True(t, unsandboxedAllowed())
 		assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a sandbox (simulated: no Landlock)")
 		// Only the gate's probe is simulated: on a host with Landlock the
 		// helper still applies it, but the gate says "sandbox on" only when it
@@ -255,6 +255,27 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		assert.Nil(t, b.video)
 		assert.Contains(t, logged.String(), "[video_gate_bot] video: the ffmpeg self-test failed: probe: ")
 		assert.Contains(t, logged.String(), `stderr "probe \"exploded\"\n"; video watching is off`)
+	})
+
+	// A gate that let tools run unsandboxed and then failed its self-test has
+	// video off, so it takes that grant back; one that passed keeps it
+	// (review Minor 6).
+	t.Run("no Landlock, self-test fails: the unsandboxed grant is taken back", func(t *testing.T) {
+		onPath(t)
+		failing := func(context.Context, string, bool) (sandboxReport, error) {
+			return sandboxReport{}, errors.New("simulated")
+		}
+		stubGate(t, func() (int, error) { return 0, errors.New("simulated: no Landlock") }, failing)
+		before := unsandboxedGrants.Load()
+		b := videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
+		assert.False(t, b.videoOn())
+		assert.Equal(t, before, unsandboxedGrants.Load(), "the failed gate leaves no grant behind")
+
+		passing := func(context.Context, string, bool) (sandboxReport, error) { return sandboxReport{}, nil }
+		stubGate(t, func() (int, error) { return 0, errors.New("simulated: no Landlock") }, passing)
+		b = videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
+		assert.True(t, b.videoOn())
+		assert.Equal(t, before+1, unsandboxedGrants.Load(), "a passing gate keeps its grant")
 	})
 
 	// The version check never turns video off; it only warns (Ruling 12 item 6).

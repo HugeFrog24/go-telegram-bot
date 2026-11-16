@@ -46,9 +46,8 @@ func allowUnsandboxedWhereNeeded(t *testing.T) {
 	if sandboxUsable(sandboxAvailable()) == nil {
 		return
 	}
-	prev := unsandboxedTools.Load()
-	unsandboxedTools.Store(true)
-	t.Cleanup(func() { unsandboxedTools.Store(prev) })
+	unsandboxedGrants.Add(1)
+	t.Cleanup(func() { unsandboxedGrants.Add(-1) })
 }
 
 // ffmpegFixture runs the system ffmpeg with args to write a test clip into its
@@ -633,9 +632,9 @@ func TestRunTool_NeedsASandbox(t *testing.T) { //NOSONAR go:S100 -- underscore s
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not on PATH")
 	}
-	prev := unsandboxedTools.Load()
-	unsandboxedTools.Store(false)
-	t.Cleanup(func() { unsandboxedTools.Store(prev) })
+	prev := unsandboxedGrants.Load()
+	unsandboxedGrants.Store(0)
+	t.Cleanup(func() { unsandboxedGrants.Store(prev) })
 	_, err := runTool(context.Background(), "ffmpeg", t.TempDir(), "", []string{"-hide_banner", "-version"})
 	if sandboxUsable(sandboxAvailable()) == nil {
 		assert.NoError(t, err, "inside Landlock")

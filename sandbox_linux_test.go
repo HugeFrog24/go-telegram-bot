@@ -102,7 +102,7 @@ func sandboxParentStandIn(args []string) int {
 	if len(args) < 2 {
 		return 2
 	}
-	unsandboxedTools.Store(true) // only matters where there is no Landlock: the helper uses it whenever it can
+	unsandboxedGrants.Add(1) // only matters where there is no Landlock: the helper uses it whenever it can
 	cmd, err := newToolCmd(context.Background(), args[0], args[1], "", args[2:])
 	if err == nil {
 		err = cmd.Start()

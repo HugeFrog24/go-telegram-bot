@@ -27,10 +27,17 @@ const mediaSandboxArg = "__media_sandbox"
 // the tool.
 const sandboxExitCode = 125
 
-// unsandboxedTools is set once a bot's gate lets tools run without the
+// unsandboxedGrants counts the bots whose gate lets tools run without the
 // Landlock sandbox: video.allow_unsandboxed where the kernel or OS has none.
-// Until then no tool runs without it (errNoSandbox).
-var unsandboxedTools atomic.Bool
+// While it is 0 no tool runs without the sandbox (errNoSandbox). A gate whose
+// self-test then fails takes its grant back (review Minor 6); bots start
+// concurrently, so this is a count rather than a flag one bot could clear
+// under another.
+var unsandboxedGrants atomic.Int32
+
+// unsandboxedAllowed reports whether some bot's gate lets tools run without
+// the sandbox.
+func unsandboxedAllowed() bool { return unsandboxedGrants.Load() > 0 }
 
 // errNoSandbox means a tool was not run: there is no sandbox, and no bot
 // allowed running without one.
