@@ -547,8 +547,10 @@ func uidTasks(uid int) (int, error) {
 // the kernel has PIDs (PID_MAX_LIMIT, 4,194,304 on 64-bit systems).
 const maxUserTasks = 1 << 22
 
-// maxTaskProbes caps the forks one count may take: the doubling reaches
-// maxUserTasks in at most 16, and the binary search takes no more.
+// maxTaskProbes caps the forks one count may take. A count takes at most
+// 40: the doubling, from the visible count plus 2 × toolThreadHeadroom up to
+// maxUserTasks (2^22), at most 17; the forks at lo and at 1, 2; and the
+// binary search over what is left, a range at most 2^21 wide, at most 21.
 const maxTaskProbes = 64
 
 // kernelUIDTasks is the kernel's own count of the user's tasks, which is
