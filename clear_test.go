@@ -182,3 +182,32 @@ func TestHandlePhotoMessage_ClearBetweenStoreAndJoinReadsTheNewMemory(t *testing
 	assert.False(t, strings.Contains(body, "OLD-SECRET"), "and none of the cleared history")
 	assert.Equal(t, []string{"", "Open the Farm tab."}, memoryTexts(b, chatID), "the reply follows the photo")
 }
+
+// /clear lands while a voice turn is synthesising its answer: the turn ends
+// silently, with no text fallback after the confirmation and nothing filed.
+func TestClear_DuringSpeechSynthesisSendsNothing(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	stub := newAnthropicStub(t, candleFarmStream())
+	b, tg := setupBotForTest(t, ownerChat)
+	useAnthropicStub(b, stub)
+	oneConnection(t, b)
+	sent := recordSends(tg)
+	voices := &voiceStubs{text: transcript, speaking: make(chan struct{}, 1), speak: make(chan struct{})}
+	voices.install(t, b, tg)
+	t.Cleanup(func() { close(voices.speak) })
+	voice := voiceMessage(ownerChat, 972)
+	userMsg, err := b.screenIncomingMessage(voice)
+	require.NoError(t, err)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.handleVoiceMessage(context.Background(), voice, userMsg, replyTarget{chatID: ownerChat},
+			123, "owner", "", "", false, "en", 0)
+	}()
+	<-voices.speaking // the model has answered; speech is being made
+
+	b.clearChatHistory(context.Background(), replyTarget{chatID: ownerChat}, 123, 0, 0, false)
+	<-done
+
+	assert.Equal(t, []string{clearedNotice}, sentTexts(sent), "nothing after the confirmation")
+	assert.Empty(t, memoryTexts(b, ownerChat))
+}

@@ -95,10 +95,13 @@ func serveTelegramFiles(t *testing.T, tg *MockTelegramClient, release chan struc
 // voiceStubs stands in for Telegram's file download and ElevenLabs. Speech
 // to text answers with text, or fails when text is empty; text to speech
 // always fails, so a voice turn falls back to a text reply. release, when
-// set, holds every download until it is closed.
+// set, holds every download until it is closed; speaking, when set, is told
+// of each text-to-speech request and holds it until speak is closed.
 type voiceStubs struct {
-	text    string
-	release chan struct{}
+	text     string
+	release  chan struct{}
+	speaking chan struct{}
+	speak    chan struct{}
 }
 
 func (v *voiceStubs) install(t *testing.T, b *Bot, tg *MockTelegramClient) {
@@ -113,7 +116,14 @@ func (v *voiceStubs) install(t *testing.T, b *Bot, tg *MockTelegramClient) {
 		_, _ = io.WriteString(w, `{"text":`+jsonString(v.text)+`}`)
 	}))
 	t.Cleanup(stt.Close)
-	tts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	tts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if v.speaking != nil {
+			v.speaking <- struct{}{}
+			select {
+			case <-v.speak:
+			case <-r.Context().Done():
+			}
+		}
 		http.Error(w, "tts off in tests", http.StatusServiceUnavailable)
 	}))
 	t.Cleanup(tts.Close)

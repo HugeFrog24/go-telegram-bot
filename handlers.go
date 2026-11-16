@@ -91,6 +91,9 @@ func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, u
 	defer stopRecording()
 
 	audioReader, err := b.generateSpeech(ctx, response)
+	if b.clearedTurn(turn) {
+		return
+	}
 	if err != nil {
 		ErrorLogger.Printf("Error generating speech, falling back to text: %v", err)
 		if err := b.sendTurnReply(ctx, turn, to, response); err != nil {
