@@ -377,10 +377,11 @@ func TestParseProbe(t *testing.T) {
 			{"rotated -90: display size", doc(mov, "37", video("h264", 720, 1280, "37", `,"side_data_list":[{"rotation":-90}]`)),
 				with(portrait, func(p *mediaProbe) { p.Width, p.Height = 1280, 720 })},
 			{"rotated 180: same size", doc(mov, "37", video("h264", 720, 1280, "37", `,"side_data_list":[{"rotation":180}]`)), portrait},
-			{"vp9 alpha", doc("matroska,webm", "3", video("vp9", 512, 512, "N/A", `,"tags":{"alpha_mode":"1"}`)),
-				mediaProbe{Format: "matroska,webm", Codec: "vp9", Duration: 3, Width: 512, Height: 512, HasAlpha: true}},
-			{"alpha tag on h264 is ignored", doc("matroska,webm", "3", video("h264", 512, 512, "N/A", `,"tags":{"alpha_mode":"1"}`)),
-				mediaProbe{Format: "matroska,webm", Codec: "h264", Duration: 3, Width: 512, Height: 512}},
+			// Only a sticker decodes through libvpx (see "stickers" below).
+			{"vp9 alpha tag on a video: native decoder", doc("matroska,webm", "3", video("vp9", 512, 512, "N/A", `,"tags":{"alpha_mode":"1"}`)),
+				mediaProbe{Format: "matroska,webm", Codec: "vp9", Duration: 3, Width: 512, Height: 512}},
+			{"vp9 alpha tag on a large video", doc("matroska,webm", "3", video("vp9", 3840, 2160, "N/A", `,"tags":{"ALPHA_MODE":"1"}`)),
+				mediaProbe{Format: "matroska,webm", Codec: "vp9", Duration: 3, Width: 3840, Height: 2160}},
 			{"8192 side and 16777216 pixels", doc(mov, "1", video("hevc", 8192, 2048, "1", "")),
 				mediaProbe{Format: mov, Codec: "hevc", Duration: 1, Width: 8192, Height: 2048}},
 			// Matroska keeps a stream's length in its DURATION tag; the container's
@@ -413,7 +414,7 @@ func TestParseProbe(t *testing.T) {
 				mediaProbe{Format: mov, Codec: "h264", Duration: 30, Width: 720, Height: 1280, StartTime: 20, ContainerStart: 20}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				got, err := parseProbe(tc.out, []string{"mov", "matroska"})
+				got, err := parseProbe(tc.out, "video")
 				require.NoError(t, err)
 				assert.Equal(t, tc.want, got)
 			})
@@ -448,9 +449,59 @@ func TestParseProbe(t *testing.T) {
 			{"start time out of range", "start time", doc(mov, "1", video("h264", 720, 1280, "1", `,"start_time":"90000.000000"`))},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				_, err := parseProbe(tc.out, []string{"mov", "matroska"})
+				_, err := parseProbe(tc.out, "video")
 				assert.ErrorIs(t, err, errUnsupportedMedia)
 				assert.Contains(t, err.Error(), tc.want)
+			})
+		}
+	})
+
+	// libvpx checks a frame's size only after decoding it, so it decodes
+	// stickers alone, and only sticker-sized ones (Ruling 12 item 3).
+	t.Run("stickers", func(t *testing.T) {
+		const mkv = "matroska,webm"
+		alpha := `,"tags":{"alpha_mode":"1"}`
+		sticker := func(codec string, size int, duration, extra string) []byte {
+			return doc(mkv, duration, video(codec, size, size, "N/A", extra))
+		}
+		for _, tc := range []struct {
+			name, kind string
+			out        []byte
+			hasAlpha   bool
+		}{
+			{"vp9 alpha sticker: libvpx", "sticker", sticker("vp9", 512, "3", alpha), true},
+			{"vp8 alpha sticker: libvpx", "sticker", sticker("vp8", 512, "3", alpha), true},
+			{"at the bounds", "sticker", sticker("vp9", 512, "10", alpha), true},
+			{"unknown duration: the decode window bounds it", "sticker", sticker("vp9", 512, "N/A", alpha), true},
+			{"no alpha tag", "sticker", sticker("vp9", 512, "3", ""), false},
+			{"alpha tag other than 1", "sticker", sticker("vp9", 512, "3", `,"tags":{"alpha_mode":"0"}`), false},
+			{"alpha tag on h264 is ignored", "sticker", sticker("h264", 512, "3", alpha), false},
+			{"the same file as a video", "video", sticker("vp9", 512, "3", alpha), false},
+			{"the same file as a document", "document", sticker("vp9", 512, "3", alpha), false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := parseProbe(tc.out, tc.kind)
+				require.NoError(t, err)
+				assert.Equal(t, tc.hasAlpha, got.HasAlpha)
+			})
+		}
+
+		for _, tc := range []struct {
+			name string
+			out  []byte
+		}{
+			{"wider than 512", doc(mkv, "3", video("vp9", 513, 512, "N/A", alpha))},
+			{"taller than 512", doc(mkv, "3", video("vp9", 512, 513, "N/A", alpha))},
+			{"longer than 10 s", sticker("vp9", 512, "10.001", alpha)},
+			{"longer than 10 s by its DURATION tag", sticker("vp9", 512, "N/A", `,"tags":{"alpha_mode":"1","DURATION":"00:00:11.000000000"}`)},
+			{"over the bounds without alpha too", sticker("vp9", 1024, "3", "")},
+		} {
+			t.Run("refused: "+tc.name, func(t *testing.T) {
+				_, err := parseProbe(tc.out, "sticker")
+				require.ErrorIs(t, err, errUnsupportedMedia)
+				assert.Contains(t, err.Error(), "sticker")
+				_, err = parseProbe(tc.out, "document")
+				assert.NoError(t, err, "the bounds are for stickers only")
 			})
 		}
 	})
@@ -512,16 +563,17 @@ func assertNoForbiddenArgs(t *testing.T, args []string) {
 }
 
 func TestDecoderLists(t *testing.T) {
-	assert.Equal(t, "h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,libaom-av1,gif,"+
+	assert.Equal(t, "h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,gif,"+
 		"aac,aac_fixed,mp3,mp3float,mp2,mp2float,opus,libopus,vorbis,libvorbis,flac,alac,ac3,eac3,"+
 		"amrnb,amrwb,libopencore_amrnb,libopencore_amrwb,adpcm_ima_qt,"+
 		"pcm_s8,pcm_u8,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,pcm_s32be,"+
 		"pcm_f32le,pcm_f32be,pcm_f64le,pcm_f64be,pcm_mulaw,pcm_alaw,"+
 		"mov_text,srt,subrip,ssa,ass,webvtt,text", probeCodecs)
-	assert.Equal(t, "h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,libaom-av1,gif", renderCodecs)
+	assert.Equal(t, "h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,gif", renderCodecs)
 	for _, list := range []string{probeCodecs, renderCodecs} {
 		for name := range strings.SplitSeq(list, ",") {
 			assert.NotContains(t, []string{"mjpeg", "png", "av1"}, name, "cover-art decoders and native av1 stay off")
+			assert.NotEqual(t, "libaom-av1", name, "libaom checks a frame's size only after decoding it: AV1 is libdav1d's alone")
 		}
 	}
 }
@@ -1109,6 +1161,60 @@ func TestRenderSheet_StickerAlpha(t *testing.T) { //NOSONAR go:S100 -- underscor
 	assert.Greater(t, int(r)-int(g), 100, "red without alpha")
 }
 
+// libvpx checks a frame's size only after decoding it, so -max_pixels does
+// not bound it: only a sticker-sized sticker decodes through it. The same
+// alpha-tagged VP9 file sent any other way renders with the native decoder.
+func TestProbeMedia_AlphaOnlyForStickers(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	path := ffmpegFixture(t, alphaWebmArgs(512, 3)...)
+	inputOptions := func(p mediaProbe, spec sheetSpec) []string {
+		t.Helper()
+		plan, err := planSheet(p, spec)
+		require.NoError(t, err)
+		args := renderArgs(path, plan, "", 120)
+		return args[:slices.Index(args, "-i")]
+	}
+
+	for _, kind := range []string{"video", "document"} {
+		t.Run(kind, func(t *testing.T) {
+			p, err := probeMedia(context.Background(), path, kind)
+			require.NoError(t, err)
+			assert.False(t, p.HasAlpha)
+			spec := sheetSpec{Start: 0, End: p.Duration, Frames: 4, MaxEdge: maxImageEdge}
+			assert.NotContains(t, inputOptions(p, spec), "-c:v", "no decoder is forced: vp9 is the native one")
+
+			data, _, err := renderSheet(context.Background(), path, p, spec)
+			require.NoError(t, err)
+			r, g, b := tileCenter(decodeSheet(t, data, maxImageEdge), 2, 2, 0, 0)
+			assert.Greater(t, int(r)-int(g), 100, "the native decoder shows the colour, not the sticker's gray (got %d,%d,%d)", r, g, b)
+		})
+	}
+
+	t.Run("sticker", func(t *testing.T) {
+		p, err := probeMedia(context.Background(), path, "sticker")
+		require.NoError(t, err)
+		require.True(t, p.HasAlpha)
+		got := inputOptions(p, sheetSpec{Start: 0, End: p.Duration, Frames: stickerSheetFrames, MaxEdge: stickerSheetEdge})
+		i := slices.Index(got, "-c:v")
+		require.GreaterOrEqual(t, i, 0)
+		assert.Equal(t, "libvpx-vp9", got[i+1])
+	})
+
+	for name, args := range map[string][]string{
+		"640x640 sticker": alphaWebmArgs(640, 1),
+		"12 s sticker":    alphaWebmArgs(64, 12),
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := ffmpegFixture(t, args...)
+			_, err := probeMedia(context.Background(), path, "sticker")
+			assert.ErrorIs(t, err, errUnsupportedMedia, "larger or longer than a sticker")
+			p, err := probeMedia(context.Background(), path, "document")
+			require.NoError(t, err, "as a document it is an ordinary video")
+			assert.False(t, p.HasAlpha)
+		})
+	}
+}
+
 func TestRenderSheet_Timeout(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	requireFFmpeg(t)
 	path := ffmpegFixture(t, gifArgs...)
@@ -1158,6 +1264,13 @@ func TestRenderSheet_RefusesBadInput(t *testing.T) { //NOSONAR go:S100 -- unders
 		{"zero width", func(p *mediaProbe) { p.Width = 0 }, nil},
 		{"width over the cap", func(p *mediaProbe) { p.Width = probeMaxSide + 1 }, nil},
 		{"alpha on h264", func(p *mediaProbe) { p.HasAlpha = true }, nil},
+		// libvpx only ever sees what a sticker can be, whatever the caller passes.
+		{"alpha on a probe larger than a sticker", func(p *mediaProbe) {
+			p.Format, p.Codec, p.HasAlpha, p.Width, p.Height, p.Duration = "matroska,webm", "vp9", true, 1024, 1024, 3
+		}, nil},
+		{"alpha on a probe longer than a sticker", func(p *mediaProbe) {
+			p.Format, p.Codec, p.HasAlpha, p.Width, p.Height = "matroska,webm", "vp9", true, 512, 512
+		}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p, s := good, spec

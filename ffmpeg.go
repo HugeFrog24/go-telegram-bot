@@ -47,7 +47,10 @@ const (
 
 // renderCodecs are the only decoders a render may open (item 4). It maps only
 // the chosen video stream, so it never needs an audio or subtitle decoder.
-const renderCodecs = "h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,libaom-av1,gif"
+// libaom-av1 is left off: like libvpx it checks a frame's size only after
+// decoding it, so AV1 decodes through libdav1d, which -max_pixels bounds, or
+// not at all (Ruling 12 item 3).
+const renderCodecs = "h264,hevc,vp8,vp9,libvpx,libvpx-vp9,libdav1d,gif"
 
 // probeCodecs is the research's §6.1 probe list without mjpeg and png, so
 // files with cover art are refused (item 4, "Cover art"). ffprobe opens a
@@ -60,11 +63,20 @@ const probeCodecs = renderCodecs + "," +
 	"mov_text,srt,subrip,ssa,ass,webvtt,text"
 
 // videoCodecs are the codec_name values the chosen stream may have (item 4).
-// Native av1 decoding is on neither list; av1 decodes through libdav1d or libaom-av1.
+// Native av1 decoding is on neither list; av1 decodes through libdav1d alone.
 var videoCodecs = []string{"h264", "hevc", "vp8", "vp9", "av1", "gif"}
 
-// alphaDecoders keep a WebM stream's alpha channel; the native vp8/vp9 decoders drop it.
+// alphaDecoders keep a WebM stream's alpha channel; the native vp8/vp9 decoders
+// drop it. libvpx checks a frame's size only after decoding it, so -max_pixels
+// does not bound it: it decodes stickers alone, and only sticker-sized ones
+// (Ruling 12 item 3). A size change mid-stream is left to the memory cap.
 var alphaDecoders = map[string]string{"vp8": "libvpx", "vp9": "libvpx-vp9"}
+
+// A video sticker must probe at most this large and this long, or it is refused.
+const (
+	stickerMaxSide    = 512
+	stickerMaxSeconds = 10.0
+)
 
 // containers maps an accepted ffprobe format_name to the demuxer name that
 // -format_whitelist and -f take, and to the extension a stored file gets.
@@ -108,7 +120,7 @@ type mediaProbe struct {
 	Codec          string  // codec_name of the chosen stream (first video stream with attached_pic=0)
 	Duration       float64 // seconds of the chosen stream; 0 when unknown
 	Width, Height  int     // display size: swapped when the stream is rotated a quarter turn
-	HasAlpha       bool    // VP8/VP9 in WebM with alpha (video stickers)
+	HasAlpha       bool    // VP8/VP9 in WebM with alpha, for kind "sticker" only: decoded with libvpx
 	StartTime      float64 // the chosen stream's first timestamp; every sheet time counts from it
 	ContainerStart float64 // the file's start time, which ffmpeg's -ss counts from
 }
@@ -153,7 +165,7 @@ func probeMedia(ctx context.Context, path, kind string) (mediaProbe, error) {
 	if err != nil {
 		return mediaProbe{}, decodeFailure(err)
 	}
-	return parseProbe(out, formats)
+	return parseProbe(out, kind)
 }
 
 // probeArgs is the ffprobe argument vector for an absolute input path.
@@ -187,11 +199,13 @@ type probeStream struct {
 	} `json:"side_data_list"`
 }
 
-// parseProbe checks ffprobe's JSON against the container list (formats), the
-// stream count cap, the chosen-stream codec list and the pixel caps. The
-// chosen stream is the first video stream that is not an attached picture;
-// attached pictures never count for codec, size or duration.
-func parseProbe(out []byte, formats []string) (mediaProbe, error) {
+// parseProbe checks ffprobe's JSON against kind's container list, the stream
+// count cap, the chosen-stream codec list and the pixel caps, and a sticker
+// against the sticker bounds. The chosen stream is the first video stream
+// that is not an attached picture; attached pictures never count for codec,
+// size or duration.
+func parseProbe(out []byte, kind string) (mediaProbe, error) {
+	formats := kindFormats[kind]
 	var doc struct {
 		Streams []probeStream `json:"streams"`
 		Format  struct {
@@ -223,12 +237,13 @@ func parseProbe(out []byte, formats []string) (mediaProbe, error) {
 	if !usableSize(s.Width, s.Height) {
 		return mediaProbe{}, fmt.Errorf("%w: %dx%d is not a usable size", errUnsupportedMedia, s.Width, s.Height)
 	}
+	sticker := kind == "sticker"
 	p := mediaProbe{
 		Format:   doc.Format.FormatName,
 		Codec:    s.CodecName,
 		Width:    s.Width,
 		Height:   s.Height,
-		HasAlpha: s.Tags.AlphaMode == "1" && alphaDecoders[s.CodecName] != "" && demuxer == "matroska",
+		HasAlpha: sticker && s.Tags.AlphaMode == "1" && alphaDecoders[s.CodecName] != "" && demuxer == "matroska",
 	}
 	if err := p.readTimes(s, doc.Format.Duration, doc.Format.StartTime, demuxer == "matroska"); err != nil {
 		return mediaProbe{}, err
@@ -239,7 +254,17 @@ func parseProbe(out []byte, formats []string) (mediaProbe, error) {
 			break
 		}
 	}
+	if sticker && !stickerSized(p) {
+		return mediaProbe{}, fmt.Errorf("%w: a %dx%d, %v s sticker is over %dx%d or %v s",
+			errUnsupportedMedia, p.Width, p.Height, p.Duration, stickerMaxSide, stickerMaxSide, stickerMaxSeconds)
+	}
 	return p, nil
+}
+
+// stickerSized reports whether p is within the sticker bounds. An unknown
+// duration (0) passes: the render then decodes one fixed window from the start.
+func stickerSized(p mediaProbe) bool {
+	return p.Width <= stickerMaxSide && p.Height <= stickerMaxSide && p.Duration <= stickerMaxSeconds
 }
 
 // readTimes sets the start times and the duration from the chosen stream and
@@ -552,6 +577,9 @@ func checkSheet(probe mediaProbe, spec sheetSpec) error {
 		bad = fmt.Sprintf("codec %q", probe.Codec)
 	case probe.HasAlpha && alphaDecoders[probe.Codec] == "":
 		bad = fmt.Sprintf("alpha on %q", probe.Codec)
+	case probe.HasAlpha && !stickerSized(probe):
+		// libvpx is not bounded by -max_pixels, so it never gets more than a sticker.
+		bad = fmt.Sprintf("alpha on a %dx%d, %v s probe, more than a sticker", probe.Width, probe.Height, probe.Duration)
 	case !usableSize(probe.Width, probe.Height):
 		bad = fmt.Sprintf("size %dx%d", probe.Width, probe.Height)
 	case !finiteIn(probe.Duration, 0, maxSheetSeconds):
