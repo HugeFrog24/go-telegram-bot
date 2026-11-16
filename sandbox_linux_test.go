@@ -82,6 +82,7 @@ func init() {
 	testStandIns["noseccomp-tcp-dial"] = tcpDialStandIn
 	testStandIns["sandbox-parent"] = sandboxParentStandIn
 	testStandIns["truncate-path"] = truncatePathStandIn
+	testStandIns["noseccomp-truncate-path"] = truncatePathStandIn
 	testStandIns["bigmem-sandbox-probe"] = sandboxProbeStandIn
 	// The probe also answers to its variants' names: "noseccomp-" runs it
 	// without the seccomp filter, "abi4-" with Landlock held to ABI 4.
@@ -230,6 +231,161 @@ var probeActions = map[string]func(args []string) error{
 		}
 		return nil
 	},
+	// The round-3 findings' attacks (blind-task-2b-r2-findings.md), each a
+	// harmless stand-in that would change nothing if it got through.
+	//
+	// prlimit <pid>: read another process's open-files limit; the findings
+	// set its CPU limit to 1, which kills it.
+	"prlimit": func(args []string) error {
+		pid, err := strconv.Atoi(args[0])
+		if err != nil {
+			return err
+		}
+		var old unix.Rlimit
+		return unix.Prlimit(pid, unix.RLIMIT_NOFILE, nil, &old)
+	},
+	// setown, setsig: make the bot the owner of this tool's stderr pipe, or
+	// pick SIGUSR1 for it; without O_ASYNC no signal follows. With both and
+	// O_ASYNC, the findings signalled the bot below ABI 6.
+	"setown": func([]string) error {
+		_, err := unix.FcntlInt(2, unix.F_SETOWN, os.Getppid())
+		return err
+	},
+	"setsig": func([]string) error {
+		_, err := unix.FcntlInt(2, unix.F_SETSIG, int(syscall.SIGUSR1))
+		return err
+	},
+	// shmget, msgget: a SysV segment or queue, which outlives the tool;
+	// removed again at once.
+	"shmget": func([]string) error {
+		id, err := unix.SysvShmGet(unix.IPC_PRIVATE, 4096, unix.IPC_CREAT|0o600)
+		if err != nil {
+			return err
+		}
+		_, err = unix.SysvShmCtl(id, unix.IPC_RMID, nil)
+		return err
+	},
+	"msgget": func([]string) error {
+		id, _, errno := syscall.RawSyscall(unix.SYS_MSGGET, unix.IPC_PRIVATE, unix.IPC_CREAT|0o600, 0)
+		if errno != 0 {
+			return errno
+		}
+		if _, _, errno := syscall.RawSyscall(unix.SYS_MSGCTL, id, unix.IPC_RMID, 0); errno != 0 {
+			return errno
+		}
+		return nil
+	},
+	// chmod, chown, utimensat, setxattr <path>: metadata changes, which
+	// Landlock does not cover, on a file it cannot read: its own mode, its
+	// own owner, its times left as they are (UTIME_OMIT), and an attribute
+	// replaced that is not there (ENODATA if the call got through).
+	"chmod": func(args []string) error {
+		var st unix.Stat_t
+		if err := unix.Stat(args[0], &st); err != nil {
+			return err
+		}
+		return unix.Chmod(args[0], st.Mode&0o7777)
+	},
+	"chown": func(args []string) error {
+		var st unix.Stat_t
+		if err := unix.Stat(args[0], &st); err != nil {
+			return err
+		}
+		return unix.Chown(args[0], int(st.Uid), int(st.Gid))
+	},
+	"utimensat": func(args []string) error {
+		omit := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, {Nsec: unix.UTIME_OMIT}}
+		return unix.UtimesNanoAt(unix.AT_FDCWD, args[0], omit, 0)
+	},
+	"setxattr": func(args []string) error {
+		return unix.Setxattr(args[0], "user.media-sandbox-probe", []byte("x"), unix.XATTR_REPLACE)
+	},
+	// setpriority <pid> <nice>: set a process's nice value to the one it has.
+	"setpriority": func(args []string) error {
+		pid, err := strconv.Atoi(args[0])
+		if err != nil {
+			return err
+		}
+		nice, err := strconv.Atoi(args[1])
+		if err != nil {
+			return err
+		}
+		return unix.Setpriority(unix.PRIO_PROCESS, pid, nice)
+	},
+	// sched_setaffinity <pid>: an empty CPU set, which the kernel itself
+	// refuses with EINVAL if the call gets through.
+	"sched_setaffinity": func(args []string) error {
+		pid, err := strconv.Atoi(args[0])
+		if err != nil {
+			return err
+		}
+		var none unix.CPUSet
+		return unix.SchedSetaffinity(pid, &none)
+	},
+	// sched_setscheduler <pid>: an unknown policy, EINVAL if it gets through.
+	"sched_setscheduler": func(args []string) error {
+		pid, err := strconv.Atoi(args[0])
+		if err != nil {
+			return err
+		}
+		var param [1]int32
+		if _, _, errno := syscall.RawSyscall(unix.SYS_SCHED_SETSCHEDULER, uintptr(pid), 99,
+			uintptr(unsafe.Pointer(&param[0]))); errno != 0 { // #nosec G103 -- sched_setscheduler(2)
+			return errno
+		}
+		return nil
+	},
+	// ioprio_set <pid>: an unknown I/O class, EINVAL if it gets through.
+	"ioprio_set": func(args []string) error {
+		pid, err := strconv.Atoi(args[0])
+		if err != nil {
+			return err
+		}
+		const whoProcess, badClass = 1, 7 << 13
+		if _, _, errno := syscall.RawSyscall(unix.SYS_IOPRIO_SET, whoProcess, uintptr(pid), badClass); errno != 0 {
+			return errno
+		}
+		return nil
+	},
+	// pdeathsig: clear the parent-death signal, to outlive the bot.
+	"pdeathsig": func([]string) error { return unix.Prctl(unix.PR_SET_PDEATHSIG, 0, 0, 0, 0) },
+	// inotify, fanotify: watch the bot's directories for new names.
+	"inotify": func([]string) error {
+		fd, err := unix.InotifyInit1(unix.IN_CLOEXEC)
+		if err != nil {
+			return err
+		}
+		return unix.Close(fd)
+	},
+	"fanotify": func([]string) error {
+		fd, err := unix.FanotifyInit(unix.FAN_CLASS_NOTIF|unix.FAN_REPORT_FID, unix.O_RDONLY)
+		if err != nil {
+			return err
+		}
+		return unix.Close(fd)
+	},
+	// modify_ldt: read the LDT, on x86-64 only (its number there, 154).
+	"modify_ldt": func([]string) error {
+		if runtime.GOARCH != "amd64" {
+			return errors.New("modify_ldt is x86's")
+		}
+		var ldt [16]byte
+		if _, _, errno := syscall.RawSyscall(154, 0, uintptr(unsafe.Pointer(&ldt[0])), uintptr(len(ldt))); errno != 0 { // #nosec G103 -- modify_ldt(2)
+			return errno
+		}
+		return nil
+	},
+	// syscall <nr>: a call by number, with no arguments.
+	"syscall": func(args []string) error {
+		nr, err := strconv.Atoi(args[0])
+		if err != nil {
+			return err
+		}
+		if _, _, errno := syscall.RawSyscall(uintptr(nr), 0, 0, 0); errno != 0 {
+			return errno
+		}
+		return nil
+	},
 	// raise: abort the way C code does, raise(SIGABRT) with tgkill on this
 	// thread and the default action. It must die of it.
 	"raise": func([]string) error {
@@ -319,16 +475,17 @@ func writeFake(t *testing.T, root, rel, content string) string {
 }
 
 // requireDenied checks that a sandboxed run was refused: a non-zero exit
-// whose stderr says "Permission denied" (EACCES, Landlock) or "Operation not
-// permitted" (EPERM, the seccomp filter), never "No such file".
+// whose stderr says "Permission denied" (EACCES, Landlock), "Operation not
+// permitted" (EPERM, an argument check of the seccomp filter) or "Function
+// not implemented" (ENOSYS, a call off its allowlist), never "No such file".
 func requireDenied(t *testing.T, out []byte, err error, what string) {
 	t.Helper()
 	var te *toolError
 	require.ErrorAs(t, err, &te, "%s: the run must fail", what)
 	assert.Empty(t, out, what)
 	stderr := strings.ToLower(te.Stderr())
-	assert.True(t, strings.Contains(stderr, "permission denied") || strings.Contains(stderr, "operation not permitted"),
-		"%s: refused by the sandbox, got %q", what, te.Stderr())
+	assert.True(t, strings.Contains(stderr, "permission denied") || strings.Contains(stderr, "operation not permitted") ||
+		strings.Contains(stderr, "function not implemented"), "%s: refused by the sandbox, got %q", what, te.Stderr())
 }
 
 // The sandbox lets a tool read inside its input directory and nothing else
@@ -392,13 +549,19 @@ func TestMediaSandbox_FileAccess(t *testing.T) { //NOSONAR go:S100 -- underscore
 	// Truncation, which Landlock can deny only from ABI 3 (Ruling 15): the
 	// truncate tool opens the file for writing first, so the write rule
 	// stops it too; truncate(2) by path opens nothing, so only the truncate
-	// right does. An ABI 1 or 2 kernel would let it empty the database.
+	// right does. An ABI 1 or 2 kernel would let it empty the database. The
+	// seccomp filter refuses truncate(2) as well, so it is tried without the
+	// filter too: Landlock alone must refuse it.
 	standInTool(t, "truncate-path")
+	standInTool(t, "noseccomp-truncate-path")
 	for _, p := range []string{db, video} {
 		out, err := runTool(ctx, "truncate", in, "", []string{"-s", "0", p})
 		requireDenied(t, out, err, "truncate -s 0 "+p)
 		out, err = runTool(ctx, "truncate-path", in, "", []string{p})
 		requireDenied(t, out, err, "truncate(2) "+p)
+		out, err = runTool(ctx, "noseccomp-truncate-path", in, "", []string{p})
+		requireDenied(t, out, err, "truncate(2) without the filter "+p)
+		assert.Contains(t, toolStderr(err), "permission denied", "Landlock's own refusal")
 	}
 	data, err := os.ReadFile(db) // #nosec G304 -- the test's own fixture
 	require.NoError(t, err)
@@ -409,12 +572,13 @@ func TestMediaSandbox_FileAccess(t *testing.T) { //NOSONAR go:S100 -- underscore
 	assert.FileExists(t, token, "the fake config is still there")
 }
 
-// The seccomp filter (Ruling 16 item 1) stops what Landlock leaves open. Each
-// thing is tried by the probe stand-in through the real helper and runTool,
-// and must fail with EPERM. Where the container allows it, the same try
-// without the filter ("noseccomp-") works, so the failure is the filter's.
-// Signals are tried at ABI 4 too, where Landlock does not scope them, so
-// the filter alone keeps the bot and other processes safe.
+// The seccomp filter (Rulings 16 and 18) stops what Landlock leaves open.
+// Each thing is tried by the probe stand-in through the real helper and
+// runTool, and must fail with EPERM (an argument check) or ENOSYS (a call
+// off the allowlist). Where the container allows it, the same try without
+// the filter ("noseccomp-") works, so the failure is the filter's. Signals
+// are tried at ABI 4 too, where Landlock does not scope them, so the filter
+// alone keeps the bot and other processes safe.
 func TestMediaSandbox_Seccomp(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	requireLandlock(t)
 	for _, name := range []string{"sandbox-probe", "noseccomp-sandbox-probe", "abi4-sandbox-probe", "noseccomp-abi4-sandbox-probe"} {
@@ -426,7 +590,7 @@ func TestMediaSandbox_Seccomp(t *testing.T) { //NOSONAR go:S100 -- underscore se
 		out, err := runTool(ctx, tool, inputDir(t), "", args)
 		var te *toolError
 		if assert.ErrorAs(t, err, &te, "%s: the run must fail", what) {
-			assert.Contains(t, te.Stderr(), "operation not permitted", what)
+			assert.Regexp(t, "operation not permitted|function not implemented", te.Stderr(), what)
 		}
 		assert.Empty(t, out, what)
 	}
@@ -516,6 +680,84 @@ func TestMediaSandbox_Seccomp(t *testing.T) { //NOSONAR go:S100 -- underscore se
 	ws, ok := exitErr.Sys().(syscall.WaitStatus)
 	require.True(t, ok)
 	assert.True(t, ws.Signaled() && ws.Signal() == syscall.SIGABRT, "died of SIGABRT: %v, %q", exitErr, toolStderr(err))
+}
+
+// The round-3 findings' attacks (Ruling 18 item 1), each through the real
+// helper by the probe stand-in, all refused: EPERM where an allowed call's
+// argument check refuses it, ENOSYS (the filter's own mark: the kernel has
+// these calls) where the call is off the allowlist. Where harmless, the
+// same try without the filter works, so the refusal is the filter's. The
+// thread bomb is TestMediaSandbox_ThreadCap's, raise(SIGABRT) the end of
+// TestMediaSandbox_Seccomp.
+func TestMediaSandbox_AllowlistRefusals(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireLandlock(t)
+	for _, name := range []string{"sandbox-probe", "noseccomp-sandbox-probe", "abi4-sandbox-probe", "noseccomp-abi4-sandbox-probe"} {
+		standInTool(t, name)
+	}
+	ctx := context.Background()
+	refused := func(errno, what, tool string, args ...string) {
+		t.Helper()
+		out, err := runTool(ctx, tool, inputDir(t), "", args)
+		var te *toolError
+		if assert.ErrorAs(t, err, &te, "%s: the run must fail", what) {
+			assert.Contains(t, strings.ToLower(te.Stderr()), errno, what)
+		}
+		assert.Empty(t, out, what)
+	}
+	const eperm, enosys = "operation not permitted", "function not implemented"
+	works := func(what, tool string, args ...string) {
+		t.Helper()
+		_, err := runTool(ctx, tool, inputDir(t), "", args)
+		assert.NoError(t, err, "%s without the filter: %q", what, toolStderr(err))
+	}
+
+	other := exec.Command("sleep", "30") // another process of the same user
+	require.NoError(t, other.Start())
+	t.Cleanup(func() { _ = other.Process.Kill(); _ = other.Wait() })
+	bot, sleeper := strconv.Itoa(os.Getpid()), strconv.Itoa(other.Process.Pid)
+
+	refused(eperm, "prlimit64 on the bot", "sandbox-probe", "prlimit", bot)
+	refused(eperm, "prlimit64 on another process", "sandbox-probe", "prlimit", sleeper)
+	works("prlimit64 on the bot", "noseccomp-sandbox-probe", "prlimit", bot)
+	for _, action := range []string{"setown", "setsig"} {
+		refused(eperm, action+" at ABI 4", "abi4-sandbox-probe", action)
+		works(action+" at ABI 4", "noseccomp-abi4-sandbox-probe", action)
+	}
+	refused(eperm, "PR_SET_PDEATHSIG 0", "sandbox-probe", "pdeathsig")
+	works("PR_SET_PDEATHSIG 0", "noseccomp-sandbox-probe", "pdeathsig")
+
+	for _, action := range []string{"shmget", "msgget", "inotify"} {
+		refused(enosys, action, "sandbox-probe", action)
+		works(action, "noseccomp-sandbox-probe", action)
+	}
+	refused(enosys, "fanotify_init", "sandbox-probe", "fanotify")
+
+	// A file outside the input directory, which Landlock lets no tool read.
+	outside := writeFake(t, t.TempDir(), "bot.db", "fake chat history")
+	before, err := os.Stat(outside)
+	require.NoError(t, err)
+	for _, action := range []string{"chmod", "chown", "utimensat", "setxattr"} {
+		refused(enosys, action+" outside the input directory", "sandbox-probe", action, outside)
+	}
+	for _, action := range []string{"chmod", "chown", "utimensat"} {
+		works(action+" outside the input directory", "noseccomp-sandbox-probe", action, outside)
+	}
+	after, err := os.Stat(outside)
+	require.NoError(t, err)
+	assert.Equal(t, before.Mode(), after.Mode(), "the file's mode is as it was")
+	assert.Equal(t, before.ModTime(), after.ModTime(), "the file's time is as it was")
+
+	prio, err := unix.Getpriority(unix.PRIO_PROCESS, 0) // the kernel's 20 - nice
+	require.NoError(t, err)
+	refused(enosys, "setpriority on the bot", "sandbox-probe", "setpriority", bot, strconv.Itoa(20-prio))
+	for _, action := range []string{"sched_setaffinity", "sched_setscheduler", "ioprio_set"} {
+		refused(enosys, action+" on the bot", "sandbox-probe", action, bot)
+	}
+	if runtime.GOARCH == "amd64" {
+		refused(enosys, "modify_ldt", "sandbox-probe", "modify_ldt")
+	}
+	refused(enosys, "an unknown, high call", "sandbox-probe", "syscall", "1000")
+	assert.False(t, processGone(sleeper), "the other process lives")
 }
 
 // The task count is probed in a child of its own: the caller's RLIMIT_NPROC
@@ -1157,7 +1399,8 @@ func TestCheckSandboxed_ReportsNoSandbox(t *testing.T) { //NOSONAR go:S100 -- un
 	err := checkSandboxed(in, inside, outside, sandboxReport{ABI: 4, Seccomp: true})
 	require.Error(t, err)
 	for _, want := range []string{"read " + outside, "created a file in " + in, "created a file in " + filepath.Dir(outside), "TCP",
-		"made a unix socket", "could signal the bot"} {
+		"making a unix socket worked", "signalling the bot worked", "reading the bot's limits worked", "F_SETOWN on stderr worked",
+		"shmget worked", "chmod outside the input directory worked", "inotify_init1 worked"} {
 		assert.Contains(t, err.Error(), want)
 	}
 	assert.NoFileExists(t, filepath.Join(in, sandboxProbeName()), "the check cleans up after itself")
@@ -1185,7 +1428,7 @@ func TestCheckSandboxed_OnlyPresentLayers(t *testing.T) { //NOSONAR go:S100 -- u
 
 	err = checkSandboxed(in, inside, outside, sandboxReport{ABI: 7})
 	require.Error(t, err, "the Landlock checks run, and fail out here")
-	assert.NotContains(t, err.Error(), "could signal the bot", "no seccomp filter, no seccomp probe")
+	assert.NotContains(t, err.Error(), "signalling the bot", "no seccomp filter, no seccomp probe")
 }
 
 // The self-test reports Landlock as on, with the kernel's ABI, when it is.

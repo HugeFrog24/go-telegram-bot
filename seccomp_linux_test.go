@@ -4,6 +4,7 @@ package main
 
 import (
 	"encoding/binary"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -12,13 +13,15 @@ import (
 )
 
 // evalSeccomp runs a classic BPF seccomp program on one system call, as the
-// kernel does: the arch, the call number and its first argument.
-func evalSeccomp(t *testing.T, prog []unix.SockFilter, arch, nr uint32, arg0 uint64) uint32 {
+// kernel does: the arch, the call number and its first two arguments.
+func evalSeccomp(t *testing.T, prog []unix.SockFilter, arch, nr uint32, args ...uint64) uint32 {
 	t.Helper()
 	var data [64]byte // struct seccomp_data
 	binary.LittleEndian.PutUint32(data[seccompNr:], nr)
 	binary.LittleEndian.PutUint32(data[seccompArchWord:], arch)
-	binary.LittleEndian.PutUint64(data[seccompArg0Low:], arg0)
+	for i, arg := range args {
+		binary.LittleEndian.PutUint64(data[seccompArg0Low+8*i:], arg)
+	}
 	jump := func(taken bool, in unix.SockFilter) int {
 		if taken {
 			return int(in.Jt)
@@ -47,61 +50,163 @@ func evalSeccomp(t *testing.T, prog []unix.SockFilter, arch, nr uint32, arg0 uin
 	return 0
 }
 
-// The filter's answer to each kind of call (Ruling 16 item 1).
+// The allowlist, pinned: a call added or dropped must be added or dropped
+// here too, on purpose (Ruling 18 item 1).
+var (
+	wantSeccompAllowed = []string{
+		"brk", "clock_getres", "clock_gettime", "clock_nanosleep", "close", "dup", "dup3", "epoll_create1", "epoll_ctl",
+		"epoll_pwait", "eventfd2", "execve", "exit", "exit_group", "faccessat", "faccessat2", "fstat", "fstatfs",
+		"futex", "getcwd", "getdents64", "getegid", "geteuid", "getgid", "getpid", "getppid", "getrandom", "getrusage", "gettid",
+		"gettimeofday", "getuid", "lseek", "madvise", "membarrier", "mlock", "mmap", "mprotect", "mremap", "munmap",
+		"nanosleep", "newfstatat", "openat", "pread64", "read", "readlinkat", "readv", "restart_syscall", "rseq",
+		"rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "sched_yield", "set_robust_list", "set_tid_address",
+		"sigaltstack", "statfs", "statx", "write", "writev",
+	}
+	wantSeccompChecked = []string{"clone", "fcntl", "ioctl", "kill", "prctl", "prlimit64", "rt_sigqueueinfo",
+		"rt_tgsigqueueinfo", "sched_getaffinity", "tgkill", "tkill"}
+	wantSeccompAMD64Extra = []string{"access", "arch_prctl", "dup2", "lstat", "open", "readlink", "stat", "time"}
+)
+
+func TestSeccompAllowlist(t *testing.T) {
+	var allowed []string
+	for _, group := range seccompAllowed {
+		allowed = append(allowed, group...)
+	}
+	slices.Sort(allowed)
+	assert.Equal(t, wantSeccompAllowed, allowed)
+	checked := append(append(slices.Clone(seccompSelfTargets), seccompSelfOrZero...), "clone", "fcntl", "prctl", "ioctl")
+	slices.Sort(checked)
+	assert.Equal(t, wantSeccompChecked, checked)
+	extra := slices.Clone(seccompAMD64.extra)
+	slices.Sort(extra)
+	assert.Equal(t, wantSeccompAMD64Extra, extra)
+	assert.Empty(t, seccompARM64.extra, "AArch64 has only the *at calls")
+	for name := range seccompNumbers {
+		assert.True(t, slices.Contains(allowed, name) || slices.Contains(checked, name) || slices.Contains(extra, name),
+			"%s is numbered but not in the filter", name)
+	}
+}
+
+// The filter's answer to each kind of call, on both architectures: x86-64's
+// program and AArch64's, built here from the same names (Ruling 18 item 1).
 func TestSeccompFilter(t *testing.T) {
-	const self = 4242
-	prog := seccompFilter(self)
-	require.Less(t, len(prog), 4096, "within the kernel's BPF_MAXINSNS")
-	thread := uint64(unix.CLONE_VM | unix.CLONE_FS | unix.CLONE_FILES | unix.CLONE_SIGHAND | unix.CLONE_THREAD |
-		unix.CLONE_SYSVSEM | unix.CLONE_SETTLS | unix.CLONE_PARENT_SETTID | unix.CLONE_CHILD_CLEARTID) // glibc's and Go's
 	for _, tc := range []struct {
 		name string
-		nr   uint32
-		arg0 uint64
-		want uint32
-	}{
-		{"read", unix.SYS_READ, 0, seccompAllow},
-		{"mmap", unix.SYS_MMAP, 0, seccompAllow},
-		{"execve", unix.SYS_EXECVE, 0, seccompAllow},
-		{"futex", unix.SYS_FUTEX, 0, seccompAllow},
-		{"socket", unix.SYS_SOCKET, unix.AF_UNIX, seccompEPERM},
-		{"kill itself", unix.SYS_KILL, self, seccompAllow},
-		{"kill itself, high bits set", unix.SYS_KILL, self | 1<<40, seccompAllow},
-		{"kill another process", unix.SYS_KILL, self + 1, seccompEPERM},
-		{"kill its process group", unix.SYS_KILL, 0, seccompEPERM},
-		{"kill everything", unix.SYS_KILL, ^uint64(0), seccompEPERM},
-		{"kill a group by -pgid", unix.SYS_KILL, uint64(^uint32(self - 1)), seccompEPERM},
-		{"tgkill one of its threads", unix.SYS_TGKILL, self, seccompAllow},
-		{"tgkill another process", unix.SYS_TGKILL, 1, seccompEPERM},
-		{"tkill its main thread", unix.SYS_TKILL, self, seccompAllow},
-		{"tkill another thread", unix.SYS_TKILL, self + 3, seccompEPERM},
-		{"rt_sigqueueinfo another", unix.SYS_RT_SIGQUEUEINFO, 1, seccompEPERM},
-		{"rt_tgsigqueueinfo itself", unix.SYS_RT_TGSIGQUEUEINFO, self, seccompAllow},
-		{"pidfd_open itself", unix.SYS_PIDFD_OPEN, self, seccompAllow},
-		{"pidfd_open another", unix.SYS_PIDFD_OPEN, 1, seccompEPERM},
-		{"a thread", unix.SYS_CLONE, thread, seccompAllow},
-		{"fork through clone", unix.SYS_CLONE, uint64(unix.SIGCHLD), seccompEPERM},
-		{"vfork through clone", unix.SYS_CLONE, uint64(unix.CLONE_VM | unix.CLONE_VFORK | unix.SIGCHLD), seccompEPERM},
-		{"a thread in a new user namespace", unix.SYS_CLONE, thread | unix.CLONE_NEWUSER, seccompEPERM},
-		{"a thread in a new network namespace", unix.SYS_CLONE, thread | unix.CLONE_NEWNET, seccompEPERM},
-		{"a child in a new user namespace", unix.SYS_CLONE, uint64(unix.CLONE_NEWUSER | unix.SIGCHLD), seccompEPERM},
-		{"clone3", unix.SYS_CLONE3, 0, seccompENOSYS},
-	} {
-		assert.Equal(t, tc.want, evalSeccomp(t, prog, seccompArch, tc.nr, tc.arg0), tc.name)
+		arch seccompArch
+	}{{"amd64", seccompAMD64}, {"arm64", seccompARM64}} {
+		t.Run(tc.name, func(t *testing.T) { testSeccompFilter(t, tc.arch) })
 	}
-	for _, nr := range seccompDenied {
-		assert.Equal(t, uint32(seccompEPERM), evalSeccomp(t, prog, seccompArch, nr, 0), "call %d is denied", nr)
+}
+
+func testSeccompFilter(t *testing.T, arch seccompArch) {
+	const self = 4242
+	prog, err := seccompProgram(arch, self)
+	require.NoError(t, err)
+	require.Less(t, len(prog), 4096, "within the kernel's BPF_MAXINSNS")
+	nr := func(name string) uint32 {
+		n, err := arch.nr(name)
+		require.NoError(t, err)
+		return n
 	}
-	for _, nr := range []uint32{unix.SYS_SETSID, unix.SYS_SETPGID, unix.SYS_PTRACE, unix.SYS_UNSHARE, unix.SYS_IO_URING_SETUP,
-		unix.SYS_BPF, unix.SYS_MOUNT, unix.SYS_SENDMSG, unix.SYS_PIDFD_SEND_SIGNAL} {
-		assert.Contains(t, seccompDenied, nr, "call %d is on the deny list", nr)
+	eval := func(name string, args ...uint64) uint32 {
+		return evalSeccomp(t, prog, arch.audit, nr(name), args...)
 	}
 
-	assert.Equal(t, uint32(seccompKill), evalSeccomp(t, prog, 0x40000003 /* AUDIT_ARCH_I386 */, unix.SYS_READ, 0),
-		"another architecture's call is killed")
-	if seccompX32Bit != 0 {
-		assert.Equal(t, uint32(seccompKill), evalSeccomp(t, prog, seccompArch, unix.SYS_READ|seccompX32Bit, 0), "an x32 call is killed")
+	// Every number up to 1023, and far beyond: the listed calls are allowed,
+	// the checked ones are tried below, and every other gets ENOSYS.
+	plain, checked := map[uint32]bool{}, map[uint32]bool{}
+	for _, group := range append(slices.Clone(seccompAllowed), arch.extra) {
+		for _, name := range group {
+			plain[nr(name)] = true
+		}
 	}
-	assert.Equal(t, uint32(seccompEPERM), evalSeccomp(t, seccompFilter(99), seccompArch, unix.SYS_KILL, self),
+	for _, name := range wantSeccompChecked {
+		checked[nr(name)] = true
+	}
+	for n := uint32(0); n < 1024; n++ {
+		switch {
+		case checked[n]:
+		case plain[n]:
+			assert.Equal(t, uint32(seccompAllow), evalSeccomp(t, prog, arch.audit, n), "call %d is allowed", n)
+		default:
+			assert.Equal(t, uint32(seccompENOSYS), evalSeccomp(t, prog, arch.audit, n), "call %d gets ENOSYS", n)
+		}
+	}
+	assert.Equal(t, uint32(seccompENOSYS), evalSeccomp(t, prog, arch.audit, 0x3ffffff0), "an unknown, high call gets ENOSYS")
+
+	thread := uint64(unix.CLONE_VM | unix.CLONE_FS | unix.CLONE_FILES | unix.CLONE_SIGHAND | unix.CLONE_THREAD |
+		unix.CLONE_SYSVSEM | unix.CLONE_SETTLS | unix.CLONE_PARENT_SETTID | unix.CLONE_CHILD_CLEARTID) // glibc's and Go's
+	for _, c := range []struct {
+		what string
+		call string
+		args []uint64
+		want uint32
+	}{
+		{"kill itself", "kill", []uint64{self}, seccompAllow},
+		{"kill itself, high bits set", "kill", []uint64{self | 1<<40}, seccompAllow},
+		{"kill another process", "kill", []uint64{self + 1}, seccompEPERM},
+		{"kill its process group", "kill", []uint64{0}, seccompEPERM},
+		{"kill everything", "kill", []uint64{^uint64(0)}, seccompEPERM},
+		{"kill a group by -pgid", "kill", []uint64{uint64(^uint32(self - 1))}, seccompEPERM},
+		{"tgkill one of its threads", "tgkill", []uint64{self}, seccompAllow},
+		{"tgkill another process", "tgkill", []uint64{1}, seccompEPERM},
+		{"tkill its main thread", "tkill", []uint64{self}, seccompAllow},
+		{"tkill another thread", "tkill", []uint64{self + 3}, seccompEPERM},
+		{"rt_sigqueueinfo another", "rt_sigqueueinfo", []uint64{1}, seccompEPERM},
+		{"rt_tgsigqueueinfo itself", "rt_tgsigqueueinfo", []uint64{self}, seccompAllow},
+		{"prlimit64 of itself as 0", "prlimit64", []uint64{0}, seccompAllow},
+		{"prlimit64 of itself by PID", "prlimit64", []uint64{self}, seccompAllow},
+		{"prlimit64 of the bot", "prlimit64", []uint64{self - 1}, seccompEPERM},
+		{"prlimit64 of init", "prlimit64", []uint64{1}, seccompEPERM},
+		{"sched_getaffinity of itself", "sched_getaffinity", []uint64{0}, seccompAllow},
+		{"sched_getaffinity of another", "sched_getaffinity", []uint64{1}, seccompEPERM},
+		{"a thread", "clone", []uint64{thread}, seccompAllow},
+		{"fork through clone", "clone", []uint64{uint64(unix.SIGCHLD)}, seccompEPERM},
+		{"vfork through clone", "clone", []uint64{uint64(unix.CLONE_VM | unix.CLONE_VFORK | unix.SIGCHLD)}, seccompEPERM},
+		{"a thread in a new user namespace", "clone", []uint64{thread | unix.CLONE_NEWUSER}, seccompEPERM},
+		{"a thread in a new network namespace", "clone", []uint64{thread | unix.CLONE_NEWNET}, seccompEPERM},
+		{"a child in a new user namespace", "clone", []uint64{uint64(unix.CLONE_NEWUSER | unix.SIGCHLD)}, seccompEPERM},
+		{"F_GETFD", "fcntl", []uint64{1, unix.F_GETFD}, seccompAllow},
+		{"F_SETFD", "fcntl", []uint64{1, unix.F_SETFD}, seccompAllow},
+		{"F_GETFL", "fcntl", []uint64{1, unix.F_GETFL}, seccompAllow},
+		{"F_SETFL", "fcntl", []uint64{1, unix.F_SETFL}, seccompAllow},
+		{"F_DUPFD", "fcntl", []uint64{1, unix.F_DUPFD}, seccompAllow},
+		{"F_DUPFD_CLOEXEC", "fcntl", []uint64{1, unix.F_DUPFD_CLOEXEC}, seccompAllow},
+		{"F_GETLK", "fcntl", []uint64{1, unix.F_GETLK}, seccompAllow},
+		{"F_GETFD, high bits set", "fcntl", []uint64{1, 1<<40 | unix.F_GETFD}, seccompAllow},
+		{"F_SETOWN", "fcntl", []uint64{1, unix.F_SETOWN}, seccompEPERM},
+		{"F_SETOWN_EX", "fcntl", []uint64{1, unix.F_SETOWN_EX}, seccompEPERM},
+		{"F_SETSIG", "fcntl", []uint64{1, unix.F_SETSIG}, seccompEPERM},
+		{"F_SETLEASE", "fcntl", []uint64{1, unix.F_SETLEASE}, seccompEPERM},
+		{"F_NOTIFY", "fcntl", []uint64{1, unix.F_NOTIFY}, seccompEPERM},
+		{"F_SETLK", "fcntl", []uint64{1, unix.F_SETLK}, seccompEPERM},
+		{"F_OFD_SETLK", "fcntl", []uint64{1, unix.F_OFD_SETLK}, seccompEPERM},
+		{"PR_SET_NAME", "prctl", []uint64{unix.PR_SET_NAME}, seccompAllow},
+		{"PR_GET_NAME", "prctl", []uint64{unix.PR_GET_NAME}, seccompAllow},
+		{"PR_CAPBSET_READ", "prctl", []uint64{unix.PR_CAPBSET_READ}, seccompAllow},
+		{"PR_SET_VMA", "prctl", []uint64{unix.PR_SET_VMA}, seccompAllow},
+		{"PR_SET_PDEATHSIG", "prctl", []uint64{unix.PR_SET_PDEATHSIG}, seccompEPERM},
+		{"PR_SET_DUMPABLE", "prctl", []uint64{unix.PR_SET_DUMPABLE}, seccompEPERM},
+		{"PR_SET_PTRACER", "prctl", []uint64{unix.PR_SET_PTRACER}, seccompEPERM},
+		{"PR_SET_MM", "prctl", []uint64{unix.PR_SET_MM}, seccompEPERM},
+		{"TCGETS", "ioctl", []uint64{2, unix.TCGETS}, seccompAllow},
+		{"TIOCGWINSZ", "ioctl", []uint64{2, unix.TIOCGWINSZ}, seccompAllow},
+		{"TIOCSTI", "ioctl", []uint64{0, unix.TIOCSTI}, seccompEPERM},
+		{"TIOCLINUX", "ioctl", []uint64{0, unix.TIOCLINUX}, seccompEPERM},
+		{"FIONREAD", "ioctl", []uint64{0, unix.TIOCINQ}, seccompEPERM},
+	} {
+		assert.Equal(t, c.want, eval(c.call, c.args...), c.what)
+	}
+
+	assert.Equal(t, uint32(seccompKill), evalSeccomp(t, prog, 0x40000003 /* AUDIT_ARCH_I386 */, 0),
+		"another architecture's call is killed")
+	assert.Equal(t, uint32(seccompKill), evalSeccomp(t, prog, 0x40000028 /* AUDIT_ARCH_ARM */, 0),
+		"another architecture's call is killed")
+	if arch.x32Bit != 0 {
+		assert.Equal(t, uint32(seccompKill), evalSeccomp(t, prog, arch.audit, nr("read")|arch.x32Bit), "an x32 call is killed")
+	}
+	other, err := seccompProgram(arch, 99)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(seccompEPERM), evalSeccomp(t, other, arch.audit, nr("kill"), self),
 		"the PID is the filter's own: another tool's is another PID")
 }

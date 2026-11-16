@@ -867,7 +867,7 @@ func checkSandboxed(inputDir, inside, outside string, report sandboxReport) erro
 		failed = append(failed, landlockDenies(inputDir, inside, outside, report.ABI)...)
 	}
 	if report.Seccomp {
-		failed = append(failed, seccompDenies()...)
+		failed = append(failed, seccompDenies(outside)...)
 	}
 	if len(failed) > 0 {
 		return errors.New("sandbox check failed: " + strings.Join(failed, "; "))
@@ -906,19 +906,45 @@ func landlockDenies(inputDir, inside, outside string, abi int) []string {
 	return failed
 }
 
-// seccompDenies checks two things only the seccomp filter refuses at any
-// Landlock ABI: making a socket and signalling the bot (the parent).
-func seccompDenies() []string {
+// seccompDenies checks what only the seccomp filter refuses at any Landlock
+// ABI (Ruling 18 item 3): making a socket, signalling the bot (the parent),
+// reading the bot's resource limits, taking ownership of a pipe (F_SETOWN,
+// a way to signal below ABI 6), SysV shared memory, a mode change outside
+// the input directory and an inotify instance. Each must fail with EPERM
+// (an argument check) or ENOSYS (a call off the allowlist). None would
+// change anything if it worked: the owner would be the helper itself, the
+// mode the outside file's own, and a segment is removed again.
+func seccompDenies(outside string) []string {
 	var failed []string
-	if fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0); err == nil {
+	refused := func(what string, err error) {
+		switch {
+		case err == nil:
+			failed = append(failed, what+" worked")
+		case !errors.Is(err, unix.EPERM) && !errors.Is(err, unix.ENOSYS):
+			failed = append(failed, fmt.Sprintf("%s failed oddly: %v", what, err))
+		}
+	}
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err == nil {
 		_ = unix.Close(fd)
-		failed = append(failed, "made a unix socket")
-	} else if !errors.Is(err, unix.EPERM) {
-		failed = append(failed, fmt.Sprintf("making a socket failed oddly: %v", err))
 	}
-	if err := unix.Kill(unix.Getppid(), 0); !errors.Is(err, unix.EPERM) {
-		failed = append(failed, fmt.Sprintf("could signal the bot (%v)", err))
+	refused("making a unix socket", err)
+	refused("signalling the bot", unix.Kill(unix.Getppid(), 0))
+	var limit unix.Rlimit
+	refused("reading the bot's limits", unix.Prlimit(unix.Getppid(), unix.RLIMIT_NOFILE, nil, &limit))
+	_, err = unix.FcntlInt(2, unix.F_SETOWN, unix.Getpid())
+	refused("F_SETOWN on stderr", err)
+	id, err := unix.SysvShmGet(unix.IPC_PRIVATE, 4096, unix.IPC_CREAT|0o600)
+	if err == nil {
+		_, _ = unix.SysvShmCtl(id, unix.IPC_RMID, nil)
 	}
+	refused("shmget", err)
+	refused("chmod outside the input directory", unix.Chmod(outside, 0o600))
+	fd, err = unix.InotifyInit1(unix.IN_CLOEXEC)
+	if err == nil {
+		_ = unix.Close(fd)
+	}
+	refused("inotify_init1", err)
 	return failed
 }
 

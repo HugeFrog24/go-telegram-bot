@@ -112,11 +112,12 @@ const selfTestTimeout = 30 * time.Second
 // toolSelfTest is the gate's self-test (Ruling 14 note 5). It writes the
 // embedded GIF to a fresh input directory and runs, through the production
 // runner: the helper's check run (where landlock is true it must apply
-// Landlock and the seccomp filter and pass the negative checks: a read
-// outside the input directory, creating a file, making a socket and
-// signalling the bot all failing), then probeMedia and a one-frame
-// renderSheet with font. That catches a blocked Landlock, a bad rlimit, a
-// broken ffmpeg and a missing font at once.
+// Landlock and the seccomp filter, and each layer there must pass its
+// negative checks: Landlock's a read outside the input directory and
+// creating a file, the filter's a socket, a signal to the bot, the bot's
+// limits, F_SETOWN, shmget, chmod and inotify; see checkSandboxed), then
+// probeMedia and a one-frame renderSheet with font. That catches a blocked
+// Landlock, a bad rlimit, a broken ffmpeg and a missing font at once.
 func toolSelfTest(ctx context.Context, font string, landlock bool) (sandboxReport, error) {
 	ctx, cancel := context.WithTimeout(ctx, selfTestTimeout)
 	defer cancel()
