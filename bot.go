@@ -52,7 +52,8 @@ type Bot struct {
 	statusLines        openStatusLines
 
 	// video is the defaulted video block; nil means video watching is off
-	// (no block configured, or ffmpeg/ffprobe not found as absolute paths).
+	// (no block configured, ffmpeg/ffprobe not found as absolute paths, no
+	// sandbox without video.allow_unsandboxed, or a failed self-test).
 	// It is the feature's only switch: later code tests b.video (or
 	// videoOn), never b.config.Video, which stays set when the tools are missing.
 	video *VideoConfig
@@ -63,11 +64,19 @@ func (b *Bot) videoOn() bool {
 	return b.video != nil
 }
 
+// The gate's Landlock probe and self-test; variables so tests can stand in
+// for a host without Landlock or for tools that cannot pass a real self-test.
+var (
+	gateSandbox  = sandboxAvailable
+	gateSelfTest = toolSelfTest
+)
+
 // resolveVideo returns the defaulted video block when the feature can run:
 // the block is configured, both ffmpeg and ffprobe resolve to absolute paths
-// on PATH (lookupTool), and the runner can apply its limits (on Linux, the
-// memory-cap shell). Otherwise it returns nil, logging why when the block
-// asked for the feature.
+// on PATH (lookupTool), the tools' limits can be set, the Landlock sandbox
+// is there (or video.allow_unsandboxed accepts its absence, with a loud
+// warning), and the self-test passes through the production runner.
+// Otherwise it returns nil, logging why when the block asked for the feature.
 func resolveVideo(config *BotConfig) *VideoConfig {
 	if config.Video == nil {
 		return nil
@@ -78,9 +87,31 @@ func resolveVideo(config *BotConfig) *VideoConfig {
 			return nil
 		}
 	}
-	if err := toolRunnerReady(); err != nil {
+	if err := toolLimitsUsable(); err != nil {
 		InfoLogger.Printf("[%s] video: %v; video watching is off", config.ID, err)
 		return nil
+	}
+	_, noSandbox := gateSandbox()
+	if noSandbox != nil {
+		if !config.Video.AllowUnsandboxed {
+			InfoLogger.Printf("[%s] video: no sandbox for ffmpeg (%v); video watching is off (video.allow_unsandboxed runs ffmpeg without one)",
+				config.ID, noSandbox)
+			return nil
+		}
+		ErrorLogger.Printf("[%s] Warning: video: ffmpeg runs WITHOUT a sandbox (%v) because video.allow_unsandboxed is set: "+
+			"a video that exploits ffmpeg could read every bot's tokens, the chat database and other chats' media", config.ID, noSandbox)
+		unsandboxedTools.Store(true)
+	}
+	report, err := gateSelfTest(context.Background(), config.Video.FontFile, noSandbox == nil)
+	if err != nil {
+		InfoLogger.Printf("[%s] video: the ffmpeg self-test failed: %v, stderr %q; video watching is off", config.ID, err, toolStderr(err))
+		return nil
+	}
+	if report.ABI > 0 {
+		InfoLogger.Printf("[%s] video: ffmpeg sandbox on (Landlock ABI %d)", config.ID, report.ABI)
+	}
+	if toolMemoryCapped && !report.OOMScoreAdj {
+		InfoLogger.Printf("[%s] video: oom_score_adj could not be set; under memory pressure the OOM killer may pick the bot before ffmpeg", config.ID)
 	}
 	logToolVersion(config.ID)
 	video := config.Video.withDefaults()

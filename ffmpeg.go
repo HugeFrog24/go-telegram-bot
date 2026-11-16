@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,7 +37,7 @@ const (
 // ("item N" below refers to it).
 const (
 	toolMaxAlloc    = 134217728  // -max_alloc on both tools: the largest single allocation (Ruling 12 item 1)
-	toolMemoryLimit = 1536 << 20 // address space of each child, on Linux only (Ruling 12 item 2; ffmpeg_linux.go)
+	toolMemoryLimit = 1536 << 20 // address space of each child, on Linux only (Ruling 12 item 2; sandbox_linux.go)
 	toolMaxPixels   = 16777216   // -max_pixels on both tools (item 5)
 	probeMaxSide    = 8192       // the probe refuses a wider or taller stream (item 5)
 	probeMaxArea    = 16777216   // ... or one with more pixels (item 5)
@@ -163,7 +165,7 @@ func probeMedia(ctx context.Context, path, kind string) (mediaProbe, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	out, err := runTool(ctx, "ffprobe", filepath.Dir(abs), probeArgs(abs, formats))
+	out, err := runTool(ctx, "ffprobe", filepath.Dir(abs), "", probeArgs(abs, formats))
 	if err != nil {
 		return mediaProbe{}, decodeFailure(err)
 	}
@@ -497,7 +499,8 @@ func renderSheet(ctx context.Context, path string, probe mediaProbe, spec sheetS
 	}
 	ctx, cancel := context.WithTimeout(ctx, sheetTimeout)
 	defer cancel()
-	out, err := renderOutcome(runTool(ctx, "ffmpeg", filepath.Dir(abs), renderArgs(abs, plan, resolveFontFile(spec.FontFile), cpuTimeLimit(ctx))))
+	font := resolveFontFile(spec.FontFile)
+	out, err := renderOutcome(runTool(ctx, "ffmpeg", filepath.Dir(abs), font, renderArgs(abs, plan, font, cpuTimeLimit(ctx))))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -780,22 +783,75 @@ func lookupTool(name string) (string, error) {
 	return p, nil
 }
 
-// toolShell is the shell every tool runs through on Linux, to apply the
-// memory cap (ffmpeg_linux.go). It is a variable only so a test can make it
-// missing.
-var toolShell = "/bin/sh"
+// mediaSandboxArg, as the first argument, makes the bot's binary the media
+// sandbox helper instead of the bot (main, sandbox_linux.go).
+const mediaSandboxArg = "__media_sandbox"
 
-// toolRunnerReady says why runTool cannot run tools at all, or returns nil.
-// On Linux a missing or unusable toolShell turns video watching off (fail
-// closed, Ruling 12 item 2); elsewhere there is nothing to check.
-func toolRunnerReady() error {
-	if !toolMemoryCapped {
-		return nil
+// sandboxExitCode is the helper's exit status when it refuses or fails to run
+// the tool.
+const sandboxExitCode = 125
+
+// unsandboxedTools is set once a bot's gate lets tools run without the
+// Landlock sandbox: video.allow_unsandboxed where the kernel or OS has none.
+// Until then no tool runs without it (errNoSandbox).
+var unsandboxedTools atomic.Bool
+
+// errNoSandbox means a tool was not run: there is no sandbox, and no bot
+// allowed running without one.
+var errNoSandbox = errors.New("no sandbox for ffmpeg")
+
+// sandboxReport is what the helper's check run reports to the gate.
+type sandboxReport struct {
+	ABI         int  `json:"landlock_abi"`  // the Landlock ABI applied; 0 for none
+	OOMScoreAdj bool `json:"oom_score_adj"` // whether oom_score_adj was set to 1000
+}
+
+// selfTestGIF is the gate's self-test input: a 16×16, four-frame GIF made
+// once with `ffmpeg -f lavfi -i testsrc2=size=16x16:rate=4:duration=1 -f gif`.
+//
+//go:embed selftest.gif
+var selfTestGIF []byte
+
+const selfTestTimeout = 30 * time.Second
+
+// toolSelfTest is the gate's self-test (Ruling 14 note 5). It writes the
+// embedded GIF to a fresh input directory and runs, through the production
+// runner: the helper's check run (where landlock is true it must apply
+// Landlock and pass the negative checks, a read outside the input directory
+// and creating a file both failing), then probeMedia and a one-frame
+// renderSheet with font. That catches a blocked Landlock, a bad rlimit, a
+// broken ffmpeg and a missing font at once.
+func toolSelfTest(ctx context.Context, font string, landlock bool) (sandboxReport, error) {
+	ctx, cancel := context.WithTimeout(ctx, selfTestTimeout)
+	defer cancel()
+	dir, err := os.MkdirTemp("", "video-selftest-")
+	if err != nil {
+		return sandboxReport{}, err
 	}
-	if _, err := exec.LookPath(toolShell); err != nil {
-		return fmt.Errorf("%s, which applies the ffmpeg memory cap, cannot be run: %w", toolShell, err)
+	defer func() { _ = os.RemoveAll(dir) }()
+	path := filepath.Join(dir, "media")
+	if err := os.WriteFile(path, selfTestGIF, 0o600); err != nil {
+		return sandboxReport{}, err
 	}
-	return nil
+	report, err := sandboxSelfCheck(ctx, dir, path)
+	switch {
+	case err != nil:
+		return report, fmt.Errorf("sandbox check: %w", err)
+	case landlock && report.ABI == 0:
+		return report, errors.New("sandbox check: Landlock was not applied")
+	}
+	probe, err := probeMedia(ctx, path, "animation")
+	if err != nil {
+		return report, fmt.Errorf("probe: %w", err)
+	}
+	img, _, err := renderSheet(ctx, path, probe, sheetSpec{Frames: 1, MaxEdge: minSheetEdge, FontFile: font})
+	if err != nil {
+		return report, fmt.Errorf("render: %w", err)
+	}
+	if !bytes.HasPrefix(img, []byte{0xFF, 0xD8, 0xFF}) {
+		return report, errors.New("render: not a JPEG")
+	}
+	return report, nil
 }
 
 // The gate's one version check (Ruling 12 item 6).
@@ -821,7 +877,7 @@ func toolVersion(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
-	out, err := runTool(ctx, "ffmpeg", dir, []string{"-hide_banner", "-version"})
+	out, err := runTool(ctx, "ffmpeg", dir, "", []string{"-hide_banner", "-version"})
 	if err != nil {
 		return "", err
 	}
@@ -880,15 +936,31 @@ func toolStderr(err error) string {
 	return ""
 }
 
-// runTool runs one ffprobe/ffmpeg process: an absolute binary, a slot from
-// toolSlots (waiting counts against ctx), a minimal environment, stdout bounded
-// at toolOutputLimit and the last toolStderrTail bytes of stderr. No retries.
-func runTool(ctx context.Context, name, dir string, args []string) ([]byte, error) {
+// runTool runs one ffprobe/ffmpeg process: an absolute binary, run in dir
+// (the directory that holds only the input) inside the sandbox, which lets it
+// read beneath dir and the font file font ("" for none) and nothing of the
+// bot's. See runToolCmd for the rest.
+func runTool(ctx context.Context, name, dir, font string, args []string) ([]byte, error) {
 	bin, err := lookupTool(name)
 	if err != nil {
 		return nil, err
 	}
+	return runToolCmd(ctx, name, func(ctx context.Context) (*exec.Cmd, error) {
+		return newToolCmd(ctx, bin, dir, font, args)
+	})
+}
+
+// runToolCmd runs the process build makes: with a slot from toolSlots
+// (waiting counts against ctx), stdout bounded at toolOutputLimit and the
+// last toolStderrTail bytes of stderr kept. No retries.
+func runToolCmd(ctx context.Context, name string, build func(context.Context) (*exec.Cmd, error)) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd, err := build(runCtx)
+	if err != nil {
 		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	select {
@@ -898,9 +970,6 @@ func runTool(ctx context.Context, name, dir string, args []string) ([]byte, erro
 		return nil, fmt.Errorf("%s: waiting for a slot: %w", name, ctx.Err())
 	}
 
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	cmd := newToolCmd(runCtx, bin, dir, args)
 	stdout := &boundedBuffer{limit: toolOutputLimit, onOverflow: cancel}
 	stderr := &tailBuffer{max: toolStderrTail}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
@@ -916,12 +985,23 @@ func runTool(ctx context.Context, name, dir string, args []string) ([]byte, erro
 	return stdout.buf.Bytes(), nil
 }
 
-// newToolCmd builds the child process: its stdin stays nil (the null device),
-// its environment holds only PATH (and SYSTEMROOT on Windows), and it runs in
-// dir, the directory that holds only the input file (item 9). On Linux it
-// runs under the memory cap and leads its own process group (ffmpeg_linux.go).
-func newToolCmd(ctx context.Context, bin, dir string, args []string) *exec.Cmd {
-	path, argv := toolCommand(bin, args)
+// newToolCmd builds the child process for bin. On Linux it runs bin through
+// the sandbox helper (ffmpeg_linux.go, sandbox_linux.go); elsewhere directly,
+// once a bot allowed that. It fails with errNoSandbox when neither can be.
+func newToolCmd(ctx context.Context, bin, dir, font string, args []string) (*exec.Cmd, error) {
+	path, argv, err := toolCommand(bin, dir, font, args)
+	if err != nil {
+		return nil, err
+	}
+	return toolProcess(ctx, dir, path, argv...), nil
+}
+
+// toolProcess is a child of the ffmpeg layer: its stdin stays nil (the null
+// device), its environment holds only PATH (and SYSTEMROOT on Windows), and
+// it runs in dir, the directory that holds only the input file (item 9). On
+// Linux it leads its own process group, and a timeout kills that group
+// (ffmpeg_linux.go).
+func toolProcess(ctx context.Context, dir, path string, argv ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, path, argv...) // #nosec G204 -- fixed binary, generated arguments
 	cmd.Dir = dir
 	cmd.Env = toolEnv()

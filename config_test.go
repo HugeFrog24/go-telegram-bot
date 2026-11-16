@@ -11,7 +11,20 @@ import (
 	"testing"
 )
 
+// testStandIns are harmless tools played by the test binary itself: put on
+// PATH under one of these names (a symlink to the test binary), it runs the
+// function instead of the tests. sandbox_linux_test.go fills it.
+var testStandIns = map[string]func(args []string) int{}
+
 func TestMain(m *testing.M) {
+	// The test binary is also the media sandbox helper: newToolCmd re-execs
+	// /proc/self/exe, which here is this binary (see main).
+	if len(os.Args) > 1 && os.Args[1] == mediaSandboxArg {
+		os.Exit(runMediaSandbox(os.Args[2:]))
+	}
+	if run, ok := testStandIns[filepath.Base(os.Args[0])]; ok {
+		os.Exit(run(os.Args[1:]))
+	}
 	initLoggers()
 	os.Exit(m.Run())
 }

@@ -2,13 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"log"
 	"os/exec"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 )
 
@@ -112,8 +114,12 @@ func TestStripDeadFileIDFromMemory_UnknownChatIsNoop(t *testing.T) {
 
 // videoGateBot builds a Bot around the given video block. The database is
 // created by the caller so a test can change PATH after it and before NewBot.
+// The gate may let tools run unsandboxed for the process; that is undone
+// when the test ends.
 func videoGateBot(t *testing.T, db *gorm.DB, video *VideoConfig) *Bot {
 	t.Helper()
+	prev := unsandboxedTools.Load()
+	t.Cleanup(func() { unsandboxedTools.Store(prev) })
 	b, err := NewBot(db, BotConfig{
 		ID:              "video_gate_bot",
 		OwnerTelegramID: 1,
@@ -129,11 +135,38 @@ func videoGateBot(t *testing.T, db *gorm.DB, video *VideoConfig) *Bot {
 	return b
 }
 
+// stubGate replaces the gate's Landlock probe and, when selfTest is not nil,
+// its self-test for one test.
+func stubGate(t *testing.T, probe func() (int, error), selfTest func(context.Context, string, bool) (sandboxReport, error)) {
+	t.Helper()
+	prevProbe, prevSelfTest := gateSandbox, gateSelfTest
+	t.Cleanup(func() { gateSandbox, gateSelfTest = prevProbe, prevSelfTest })
+	gateSandbox = probe
+	if selfTest != nil {
+		gateSelfTest = selfTest
+	}
+}
+
+// onPath skips the test unless ffmpeg and ffprobe are on PATH. Unlike
+// requireFFmpeg it leaves the unsandboxed switch alone: the gate sets it.
+func onPath(t *testing.T) {
+	t.Helper()
+	for _, tool := range []string{"ffmpeg", "ffprobe"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not on PATH", tool)
+		}
+	}
+}
+
 func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	var logged, warned bytes.Buffer
 	prev, prevErr := InfoLogger, ErrorLogger
 	InfoLogger, ErrorLogger = log.New(&logged, "", 0), log.New(&warned, "", 0)
 	t.Cleanup(func() { InfoLogger, ErrorLogger = prev, prevErr })
+	reset := func() {
+		logged.Reset()
+		warned.Reset()
+	}
 
 	t.Run("no video block: off", func(t *testing.T) {
 		b := videoGateBot(t, setupTestDB(t), nil)
@@ -142,19 +175,64 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		assert.NotContains(t, logged.String(), "video:")
 	})
 
-	t.Run("video block with ffmpeg and ffprobe: on, defaults filled", func(t *testing.T) {
-		for _, tool := range []string{"ffmpeg", "ffprobe"} {
-			if _, err := exec.LookPath(tool); err != nil {
-				t.Skipf("%s not on PATH", tool)
-			}
-		}
-		logged.Reset()
+	// Real tools and the real sandbox probe. Where Landlock runs, video is on
+	// (TestNewBot_VideoGateSandboxOn checks the ABI line). Elsewhere, as on
+	// Windows, it is off unless allow_unsandboxed, and then on with a warning.
+	t.Run("video block with ffmpeg and ffprobe", func(t *testing.T) {
+		onPath(t)
+		reset()
 		b := videoGateBot(t, setupTestDB(t), &VideoConfig{SheetFrames: 8})
+		want := VideoConfig{MaxDurationSeconds: 600, SheetFrames: 8, MaxLookups: 6, MaxFramesPerLookup: 12, RetentionHours: 24}
+		if _, err := sandboxAvailable(); err != nil {
+			assert.False(t, b.videoOn(), "no sandbox and no opt-out: off")
+			assert.Nil(t, b.video)
+			assert.Contains(t, logged.String(), "[video_gate_bot] video: no sandbox for ffmpeg (")
+			assert.Contains(t, logged.String(), "video watching is off")
+			assert.False(t, unsandboxedTools.Load(), "nothing may run without the sandbox")
+
+			reset()
+			b = videoGateBot(t, setupTestDB(t), &VideoConfig{SheetFrames: 8, AllowUnsandboxed: true})
+			want.AllowUnsandboxed = true
+			assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a sandbox")
+			assert.NotContains(t, logged.String(), "ffmpeg sandbox on")
+		}
 		assert.True(t, b.videoOn())
-		assert.Equal(t, VideoConfig{
-			MaxDurationSeconds: 600, SheetFrames: 8, MaxLookups: 6, MaxFramesPerLookup: 12, RetentionHours: 24,
-		}, *b.video)
+		require.NotNil(t, b.video)
+		assert.Equal(t, want, *b.video)
 		assert.Contains(t, logged.String(), `[video_gate_bot] video: "ffmpeg version `, "the version line is logged once video is on")
+	})
+
+	// The brief's test hook: Landlock unavailable, whatever the host has.
+	t.Run("no Landlock: off without allow_unsandboxed, on with it", func(t *testing.T) {
+		onPath(t)
+		stubGate(t, func() (int, error) { return 0, errors.New("simulated: no Landlock") }, nil)
+		reset()
+		b := videoGateBot(t, setupTestDB(t), &VideoConfig{})
+		assert.False(t, b.videoOn())
+		assert.Contains(t, logged.String(), "[video_gate_bot] video: no sandbox for ffmpeg (simulated: no Landlock); video watching is off")
+		assert.Empty(t, warned.String())
+
+		reset()
+		b = videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
+		assert.True(t, b.videoOn(), "the opt-out runs ffmpeg without the sandbox")
+		assert.True(t, unsandboxedTools.Load())
+		assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a sandbox (simulated: no Landlock)")
+		// Only the gate's probe is simulated: on a host with Landlock the
+		// helper still applies it, and the gate logs what the helper reported.
+	})
+
+	// Any self-test failure turns video off, and the log carries the tool's
+	// stderr tail, quoted.
+	t.Run("self-test fails: off, stderr logged", func(t *testing.T) {
+		db := setupTestDB(t)
+		fakeTool(t, "ffprobe", `echo 'probe "exploded"' >&2; exit 1`)
+		fakeTool(t, "ffmpeg", "exit 0")
+		reset()
+		b := videoGateBot(t, db, &VideoConfig{AllowUnsandboxed: true})
+		assert.False(t, b.videoOn())
+		assert.Nil(t, b.video)
+		assert.Contains(t, logged.String(), "[video_gate_bot] video: the ffmpeg self-test failed: probe: ")
+		assert.Contains(t, logged.String(), `stderr "probe \"exploded\"\n"; video watching is off`)
 	})
 
 	// The version check never turns video off; it only warns (Ruling 12 item 6).
@@ -171,10 +249,15 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 			db := setupTestDB(t)
 			fakeTool(t, "ffprobe", "exit 0")
 			fakeTool(t, "ffmpeg", tc.ffmpeg)
-			logged.Reset()
-			warned.Reset()
+			// The stand-ins cannot pass a real self-test; this is about the version line.
+			stubGate(t, func() (int, error) { return 7, nil },
+				func(context.Context, string, bool) (sandboxReport, error) {
+					return sandboxReport{ABI: 7, OOMScoreAdj: true}, nil
+				})
+			reset()
 			b := videoGateBot(t, db, &VideoConfig{})
 			assert.True(t, b.videoOn(), "never fatal")
+			assert.Contains(t, logged.String(), "[video_gate_bot] video: ffmpeg sandbox on (Landlock ABI 7)")
 			assert.Contains(t, logged.String(), tc.logs)
 			if tc.warns == "" {
 				assert.Empty(t, warned.String())
@@ -184,30 +267,24 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		})
 	}
 
-	// On Linux every tool runs through /bin/sh, which applies the memory cap:
-	// without it the feature fails closed. Other OSes have no cap and need no shell.
-	t.Run("video block without the memory-cap shell: off on Linux, logged", func(t *testing.T) {
-		requireFFmpeg(t)
-		db := setupTestDB(t)
-		logged.Reset()
-		prev := toolShell
-		toolShell = filepath.Join(t.TempDir(), "sh")
-		t.Cleanup(func() { toolShell = prev })
-		b := videoGateBot(t, db, &VideoConfig{})
+	// oom_score_adj is a preference, not a control: when it cannot be set the
+	// gate says so and video stays on (Ruling 14 note 4).
+	t.Run("oom_score_adj not applied: on, logged", func(t *testing.T) {
 		if !toolMemoryCapped {
-			assert.True(t, b.videoOn(), "no shell is needed off Linux")
-			return
+			t.Skip("oom_score_adj is set only on Linux")
 		}
-		assert.False(t, b.videoOn())
-		assert.Nil(t, b.video)
-		assert.Contains(t, logged.String(), "[video_gate_bot] video: "+toolShell)
-		assert.Contains(t, logged.String(), "memory cap")
-		assert.Contains(t, logged.String(), "video watching is off")
+		onPath(t)
+		stubGate(t, func() (int, error) { return 7, nil },
+			func(context.Context, string, bool) (sandboxReport, error) { return sandboxReport{ABI: 7}, nil })
+		reset()
+		b := videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
+		assert.True(t, b.videoOn())
+		assert.Contains(t, logged.String(), "[video_gate_bot] video: oom_score_adj could not be set")
 	})
 
 	t.Run("video block without the tools on PATH: off, logged", func(t *testing.T) {
 		db := setupTestDB(t)
-		logged.Reset()
+		reset()
 		t.Setenv("PATH", "")
 		b := videoGateBot(t, db, &VideoConfig{})
 		assert.False(t, b.videoOn())

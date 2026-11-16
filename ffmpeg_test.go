@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -13,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -25,7 +25,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// requireFFmpeg skips the test when ffmpeg or ffprobe is not on PATH.
+// requireFFmpeg skips the test when ffmpeg or ffprobe is not on PATH. Where
+// Landlock runs, the test's tools run inside it; elsewhere they run without
+// it, as video.allow_unsandboxed has them run.
 func requireFFmpeg(t *testing.T) {
 	t.Helper()
 	for _, tool := range []string{"ffmpeg", "ffprobe"} {
@@ -33,6 +35,21 @@ func requireFFmpeg(t *testing.T) {
 			t.Skipf("%s not on PATH", tool)
 		}
 	}
+	allowUnsandboxedWhereNeeded(t)
+}
+
+// allowUnsandboxedWhereNeeded lets tools run without the Landlock sandbox for
+// the rest of the test where none can run (any OS but Linux, or a kernel or
+// seccomp profile without Landlock), as a bot with video.allow_unsandboxed
+// does. Where Landlock runs it changes nothing: the helper always uses it.
+func allowUnsandboxedWhereNeeded(t *testing.T) {
+	t.Helper()
+	if _, err := sandboxAvailable(); err == nil {
+		return
+	}
+	prev := unsandboxedTools.Load()
+	unsandboxedTools.Store(true)
+	t.Cleanup(func() { unsandboxedTools.Store(prev) })
 }
 
 // ffmpegFixture runs the system ffmpeg with args to write a test clip into its
@@ -304,7 +321,7 @@ func ffprobeRun(t *testing.T, path, drop string) (probed struct {
 		require.GreaterOrEqual(t, i, 0, "probeMedia passes %s", drop)
 		args = slices.Delete(args, i, i+2)
 	}
-	out, err := runTool(context.Background(), "ffprobe", filepath.Dir(path), args)
+	out, err := runTool(context.Background(), "ffprobe", filepath.Dir(path), "", args)
 	if err == nil {
 		err = json.Unmarshal(out, &probed)
 	}
@@ -532,20 +549,25 @@ func TestToolArgs_MaxAlloc(t *testing.T) { //NOSONAR go:S100 -- underscore separ
 	require.NoError(t, err)
 	plan, err := planSheet(probe, sheetSpec{Start: 0, End: probe.Duration, Frames: 4, MaxEdge: maxImageEdge})
 	require.NoError(t, err)
-	for tool, args := range map[string][]string{
-		"ffprobe": probeArgs(path, kindFormats["video"]),
-		"ffmpeg":  renderArgs(path, plan, resolveFontFile(""), 120),
+	font := resolveFontFile("")
+	for tool, run := range map[string]struct {
+		font string
+		args []string
+	}{
+		"ffprobe": {"", probeArgs(path, kindFormats["video"])},
+		"ffmpeg":  {font, renderArgs(path, plan, font, 120)},
 	} {
 		t.Run(tool, func(t *testing.T) {
+			args := run.args
 			i := slices.Index(args, "-max_alloc")
 			require.GreaterOrEqual(t, i, 0, "%s gets -max_alloc", tool)
 			assert.Equal(t, strconv.Itoa(toolMaxAlloc), args[i+1])
-			_, err := runTool(context.Background(), tool, filepath.Dir(path), args)
+			_, err := runTool(context.Background(), tool, filepath.Dir(path), run.font, args)
 			require.NoError(t, err, "the real cap leaves a normal file alone")
 
 			low := slices.Clone(args)
 			low[i+1] = "16384"
-			_, err = runTool(context.Background(), tool, filepath.Dir(path), low)
+			_, err = runTool(context.Background(), tool, filepath.Dir(path), run.font, low)
 			var te *toolError
 			assert.ErrorAs(t, err, &te, "a 16 KiB cap fails the run, so the option is in effect")
 		})
@@ -586,8 +608,10 @@ func TestToolConcurrency(t *testing.T) {
 }
 
 func TestNewToolCmd(t *testing.T) {
+	allowUnsandboxedWhereNeeded(t)
 	dir := t.TempDir()
-	cmd := newToolCmd(context.Background(), "/abs/ffmpeg", dir, []string{"-version"})
+	cmd, err := newToolCmd(context.Background(), "/abs/ffmpeg", dir, "", []string{"-version"})
+	require.NoError(t, err)
 	assert.Equal(t, dir, cmd.Dir)
 	assert.Equal(t, 2*time.Second, cmd.WaitDelay)
 	assert.Nil(t, cmd.Stdin)
@@ -598,21 +622,42 @@ func TestNewToolCmd(t *testing.T) {
 	assert.Equal(t, want, cmd.Env, "only PATH (and SYSTEMROOT on Windows) reaches the child")
 	assert.Equal(t, 1536<<20, toolMemoryLimit)
 	if runtime.GOOS != "linux" {
+		// Linux runs the tool through the sandbox helper: TestNewToolCmd_Linux.
 		assert.False(t, toolMemoryCapped)
-		assert.Equal(t, []string{"/abs/ffmpeg", "-version"}, cmd.Args, "the tool runs directly: no memory cap off Linux")
+		assert.Equal(t, []string{"/abs/ffmpeg", "-version"}, cmd.Args, "no sandbox here: with the opt-out the tool runs directly")
+	}
+}
+
+// No tool runs without the sandbox unless a bot's gate allowed it
+// (video.allow_unsandboxed where there is no Landlock).
+func TestRunTool_NeedsASandbox(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not on PATH")
+	}
+	prev := unsandboxedTools.Load()
+	unsandboxedTools.Store(false)
+	t.Cleanup(func() { unsandboxedTools.Store(prev) })
+	_, err := runTool(context.Background(), "ffmpeg", t.TempDir(), "", []string{"-hide_banner", "-version"})
+	if _, landlock := sandboxAvailable(); landlock == nil {
+		assert.NoError(t, err, "inside Landlock")
 		return
 	}
+	assert.ErrorIs(t, err, errNoSandbox)
+	_, err = newToolCmd(context.Background(), "/abs/ffmpeg", t.TempDir(), "", nil)
+	assert.ErrorIs(t, err, errNoSandbox)
+}
 
-	// Linux: the memory-cap wrapper (Ruling 12 item 2), which execs the tool in place.
-	assert.True(t, toolMemoryCapped)
-	assert.Equal(t, "/bin/sh", cmd.Path)
-	assert.Equal(t, []string{"/bin/sh", "-c", `ulimit -v 1572864 && echo 1000 > /proc/self/oom_score_adj && exec "$0" "$@"`,
-		"/abs/ffmpeg", "-version"}, cmd.Args)
-	require.NotNil(t, cmd.SysProcAttr)
-	attr := reflect.ValueOf(cmd.SysProcAttr).Elem()
-	assert.EqualValues(t, 9, attr.FieldByName("Pdeathsig").Int(), "SIGKILL when the bot dies")
-	assert.True(t, attr.FieldByName("Setpgid").Bool(), "its own process group (Ruling 12 item 5)")
-	assert.NotNil(t, cmd.Cancel, "a timeout kills the whole group")
+// The gate's self-test probes and renders the embedded GIF through the
+// production runner, with the font.
+func TestToolSelfTest(t *testing.T) {
+	requireFFmpeg(t)
+	assert.Less(t, len(selfTestGIF), 2048, "a tiny GIF")
+	_, noSandbox := sandboxAvailable()
+	report, err := toolSelfTest(context.Background(), "", noSandbox == nil)
+	require.NoError(t, err, "%q", toolStderr(err))
+	if runtime.GOOS != "linux" {
+		assert.Equal(t, sandboxReport{}, report, "no helper and no Landlock off Linux")
+	}
 }
 
 // fakeTool writes a harmless shell script named name into a new directory
@@ -620,49 +665,12 @@ func TestNewToolCmd(t *testing.T) {
 func fakeTool(t *testing.T, name, body string) {
 	t.Helper()
 	if runtime.GOOS != "linux" {
-		t.Skip("stand-in tools are shell scripts; the memory cap and process groups are Linux's")
+		t.Skip("stand-in tools are shell scripts; the sandbox, its limits and process groups are Linux's")
 	}
+	allowUnsandboxedWhereNeeded(t)
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+body+"\n"), 0o700)) // #nosec G306 -- executable test script
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-}
-
-// The cap reaches the process that runs the tool: a stand-in tool reports its
-// own limits, OOM score and process group from /proc. Its process group being
-// its own PID shows it is the very process runTool started (exec, no fork).
-func TestRunTool_LinuxMemoryCap(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
-	fakeTool(t, "limits-tool", `read -r stat < /proc/self/stat
-echo "pid $$"
-echo "stat $stat"
-read -r adj < /proc/self/oom_score_adj
-echo "oom $adj"
-while IFS= read -r line; do echo "limit $line"; done < /proc/self/limits`)
-	out, err := runTool(context.Background(), "limits-tool", t.TempDir(), nil)
-	require.NoError(t, err)
-	report := map[string]string{}
-	var limits []string
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		key, value, _ := strings.Cut(line, " ")
-		if key == "limit" {
-			limits = append(limits, value)
-			continue
-		}
-		report[key] = value
-	}
-	t.Logf("%q", report)
-
-	limit := strconv.Itoa(toolMemoryLimit)
-	i := slices.IndexFunc(limits, func(l string) bool { return strings.HasPrefix(l, "Max address space") })
-	require.GreaterOrEqual(t, i, 0, "%q", limits)
-	assert.Equal(t, []string{limit, limit, "bytes"}, strings.Fields(strings.TrimPrefix(limits[i], "Max address space")),
-		"soft and hard address-space limits are toolMemoryLimit")
-	assert.Equal(t, "1000", report["oom"], "the OOM killer's first choice")
-
-	_, rest, ok := strings.Cut(report["stat"], ") ") // pid (comm) state ppid pgrp ...
-	require.True(t, ok, report["stat"])
-	fields := strings.Fields(rest)
-	require.GreaterOrEqual(t, len(fields), 3)
-	assert.Equal(t, report["pid"], fields[2], "the tool leads its own process group")
 }
 
 // processGone reports whether pid has exited (or is a zombie, dead but not
@@ -677,22 +685,28 @@ func processGone(pid string) bool {
 }
 
 // A timeout kills everything the tool started, not only the tool: a
-// stand-in tool that leaves a sleeping child must not orphan it.
+// stand-in tool that leaves a sleeping child must not orphan it. The
+// stand-in reports the child's PID on stdout, since the sandbox lets it
+// write no file.
 func TestRunTool_KillsProcessGroup(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	fakeTool(t, "spawner", `sleep 300 &
-echo $! > child.pid
+echo $!
 wait`)
-	dir := t.TempDir()
+	bin, err := lookupTool("spawner")
+	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	start := time.Now()
-	_, err := runTool(ctx, "spawner", dir, nil)
-	elapsed := time.Since(start)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
-
-	data, err := os.ReadFile(filepath.Join(dir, "child.pid"))
-	require.NoError(t, err, "the stand-in started its child")
-	child := strings.TrimSpace(string(data))
+	cmd, err := newToolCmd(ctx, bin, t.TempDir(), "", nil)
+	require.NoError(t, err)
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	defer func() { _ = r.Close() }()
+	cmd.Stdout = w
+	require.NoError(t, cmd.Start())
+	_ = w.Close()
+	line, err := bufio.NewReader(r).ReadString('\n')
+	require.NoError(t, err, "the stand-in reports its child")
+	child := strings.TrimSpace(line)
 	t.Cleanup(func() {
 		if pid, err := strconv.Atoi(child); err == nil && !processGone(child) {
 			if p, err := os.FindProcess(pid); err == nil {
@@ -700,9 +714,13 @@ wait`)
 			}
 		}
 	})
+
+	start := time.Now()
+	require.Error(t, cmd.Wait(), "the timeout killed the tool")
+	assert.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), toolWaitDelay, "the kill took the whole group at once")
 	assert.Eventually(t, func() bool { return processGone(child) }, 3*time.Second, 20*time.Millisecond,
 		"the sleeping grandchild %s died with the tool's process group", child)
-	assert.Less(t, elapsed, toolWaitDelay, "no orphan held the output pipes open after the kill")
 }
 
 func TestFFmpegMajor(t *testing.T) {
@@ -823,12 +841,12 @@ func TestRunTool_StdoutBound(t *testing.T) { //NOSONAR go:S100 -- underscore sep
 		return []string{"-hide_banner", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=4096x2048:rate=1",
 			"-frames:v", frames, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"}
 	}
-	out, err := runTool(context.Background(), "ffmpeg", t.TempDir(), raw("1"))
+	out, err := runTool(context.Background(), "ffmpeg", t.TempDir(), "", raw("1"))
 	require.NoError(t, err, "exactly 8 MiB passes")
 	assert.Len(t, out, toolOutputLimit)
 
 	start := time.Now()
-	out, err = runTool(context.Background(), "ffmpeg", t.TempDir(), raw("5"))
+	out, err = runTool(context.Background(), "ffmpeg", t.TempDir(), "", raw("5"))
 	assert.ErrorIs(t, err, errToolOutputTooLarge)
 	assert.Nil(t, out)
 	assert.Less(t, time.Since(start), 10*time.Second, "the process is killed, not drained")
@@ -846,11 +864,11 @@ func TestRunTool_FailureIsExitStatus(t *testing.T) { //NOSONAR go:S100 -- unders
 	if !strings.Contains(stderrSeen.String(), "not on whitelist") {
 		t.Log("this ffmpeg prints no whitelist noise for the AAC track; the run must succeed all the same")
 	}
-	_, err := runTool(context.Background(), "ffmpeg", filepath.Dir(clip), cmd.Args[1:])
+	_, err := runTool(context.Background(), "ffmpeg", filepath.Dir(clip), "", cmd.Args[1:])
 	assert.NoError(t, err, "stderr content alone is never a failure")
 
 	// A failing run with nothing on stderr is still a failure.
-	_, err = runTool(context.Background(), "ffmpeg", t.TempDir(), []string{"-hide_banner", "-nostdin", "-loglevel", "quiet", "-i", "file:" + filepath.Join(t.TempDir(), "missing"), "-f", "null", "-"})
+	_, err = runTool(context.Background(), "ffmpeg", t.TempDir(), "", []string{"-hide_banner", "-nostdin", "-loglevel", "quiet", "-i", "file:" + filepath.Join(t.TempDir(), "missing"), "-f", "null", "-"})
 	var te *toolError
 	require.ErrorAs(t, err, &te)
 	assert.Empty(t, te.Stderr())
@@ -915,17 +933,17 @@ func TestRunTool_Semaphore(t *testing.T) { //NOSONAR go:S100 -- underscore separ
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := runTool(ctx, "ffmpeg", t.TempDir(), []string{"-hide_banner", "-version"})
+	_, err := runTool(ctx, "ffmpeg", t.TempDir(), "", []string{"-hide_banner", "-version"})
 	assert.ErrorIs(t, err, context.DeadlineExceeded, "the extra run waits for a slot, within its own timeout")
 	assert.Less(t, time.Since(start), 3*time.Second)
 
 	cancelled, cancel2 := context.WithCancel(context.Background())
 	cancel2()
-	_, err = runTool(cancelled, "ffmpeg", t.TempDir(), []string{"-hide_banner", "-version"})
+	_, err = runTool(cancelled, "ffmpeg", t.TempDir(), "", []string{"-hide_banner", "-version"})
 	assert.ErrorIs(t, err, context.Canceled)
 
 	<-toolSlots // one slot free: a run takes it and gives it back
-	_, err = runTool(context.Background(), "ffmpeg", t.TempDir(), []string{"-hide_banner", "-version"})
+	_, err = runTool(context.Background(), "ffmpeg", t.TempDir(), "", []string{"-hide_banner", "-version"})
 	assert.NoError(t, err)
 	assert.Equal(t, cap(toolSlots)-1, len(toolSlots))
 }

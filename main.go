@@ -9,6 +9,13 @@ import (
 )
 
 func main() {
+	// The bot re-runs its own binary as the media sandbox helper for every
+	// ffprobe/ffmpeg run (sandbox_linux.go). That run must never reach the
+	// bot's startup: no config, no logs, no database.
+	if len(os.Args) > 1 && os.Args[1] == mediaSandboxArg {
+		os.Exit(runMediaSandbox(os.Args[2:]))
+	}
+
 	initLoggers()
 
 	InfoLogger.Println("Starting Telegram Bot Application")
