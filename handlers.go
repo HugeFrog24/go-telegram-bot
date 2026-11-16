@@ -556,12 +556,13 @@ var handledCommands = map[string]bool{
 	"/stats": true, "/whoami": true, "/clear": true, "/clear_hard": true, "/set_model": true,
 }
 
-// handledCommand is the first command in message the bot handles itself, or
-// "" when there is none.
+// handledCommand is the command the bot handles itself that message starts
+// with, or "" when there is none. A command anywhere else ("what does /stats
+// do?") is part of what the user is saying, and goes to the model as text.
 func handledCommand(message *models.Message) string {
 	var byteAt []int
 	for _, entity := range message.Entities {
-		if entity.Type != "bot_command" {
+		if entity.Type != "bot_command" || entity.Offset != 0 {
 			continue
 		}
 		if byteAt == nil {

@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"math"
 	"testing"
 
 	"github.com/go-telegram/bot/models"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func commandMessage(text string, entities ...models.MessageEntity) *models.Message {
@@ -57,24 +59,56 @@ func TestHandledCommand_OverlappingEntities(t *testing.T) { //NOSONAR go:S100 --
 	})
 }
 
-// Text before the command that takes more bytes than UTF-16 units: the
-// offset is converted, not used as a byte index.
-func TestHandledCommand_UTF16Offsets(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+// A command counts only at the start of the message. Elsewhere it is part of
+// what the user is saying, in any script, and goes to the model as text.
+func TestHandledCommand_OnlyAtTheStart(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	for name, tc := range map[string]struct {
 		text           string
 		offset, length int
+		want           string
 	}{
-		"Cyrillic":       {"привет /clear", 7, 6}, // 2 bytes, 1 unit per letter
-		"emoji":          {"😀 /clear", 3, 6},      // 4 bytes, 2 units
-		"emoji and text": {"hi 👋🏽 /stats user", 8, 6},
+		"Cyrillic before it":     {"привет /clear", 7, 6, ""},
+		"emoji before it":        {"😀 /clear", 3, 6, ""},
+		"a question about it":    {"what does /stats do?", 10, 6, ""},
+		"emoji and text":         {"hi 👋🏽 /stats user", 8, 6, ""},
+		"alone":                  {"/stats", 0, 6, "/stats"},
+		"with an argument":       {"/clear 5", 0, 6, "/clear"},
+		"with an emoji after it": {"/clear 😀", 0, 6, "/clear"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			want := tc.text[len(tc.text)-len("/clear"):]
-			if name == "emoji and text" {
-				want = "/stats"
-			}
-			assert.Equal(t, want, handledCommand(commandMessage(tc.text,
+			assert.Equal(t, tc.want, handledCommand(commandMessage(tc.text,
 				models.MessageEntity{Offset: tc.offset, Length: tc.length})))
 		})
 	}
+}
+
+// Through the handler: a command mid-text reaches the model as text; one at
+// the start is answered by the bot and never reaches it.
+func TestHandleUpdate_CommandMidTextIsText(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	stub := newAnthropicStub(t, candleFarmStream())
+	b, tg := setupBotForTest(t, 123)
+	useAnthropicStub(b, stub)
+	sent := recordSends(tg)
+	user := &models.User{ID: 123, Username: "owner"}
+	update := func(id int, text string, offset int) *models.Update {
+		u := textUpdate(123, id, user, text)
+		u.Message.Entities = []models.MessageEntity{{Type: "bot_command", Offset: offset, Length: 6}}
+		return u
+	}
+
+	b.handleUpdate(context.Background(), nil, update(1300, "what does /stats do?", 10))
+	b.handleUpdate(context.Background(), nil, update(1301, "привет /clear", 7))
+	require.Len(t, stub.requestBetas(), 2, "both reach the model")
+	_, text := stub.lastMessage(t, 0)
+	assert.Equal(t, "what does /stats do?", text)
+	_, text = stub.lastMessage(t, 1)
+	assert.Equal(t, "привет /clear", text)
+
+	b.handleUpdate(context.Background(), nil, update(1302, "/stats", 0))
+	b.handleUpdate(context.Background(), nil, update(1303, "/clear 5", 0))
+	assert.Len(t, stub.requestBetas(), 2, "commands at the start never reach the model")
+	texts := sentTexts(sent)
+	require.Len(t, texts, 4)
+	assert.Contains(t, texts[2], "Bot Statistics")
+	assert.Equal(t, "User with ID 5 not found.", texts[3], "/clear 5 acts on user 5")
 }
