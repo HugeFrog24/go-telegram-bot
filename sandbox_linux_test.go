@@ -361,6 +361,31 @@ func TestMediaSandbox_HelperFitsUnderTheLimit(t *testing.T) { //NOSONAR go:S100 
 	}
 }
 
+// A tool that cannot be exec'd fails the run cleanly. execve's error comes
+// after RLIMIT_AS, where the helper must allocate nothing, so it writes a
+// message made beforehand and the errno and exits sandboxExitCode, never the
+// Go runtime's "out of memory" (exit status 2) (review Minor 7).
+func TestMediaSandbox_ExecFailsCleanly(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	exe, err := os.Executable()
+	require.NoError(t, err)
+	dir := t.TempDir()
+	notATool := writeFake(t, t.TempDir(), "not-a-tool", "plain text, mode 0600") // execve: EACCES
+	spec := sandboxSpec{InputDir: dir, Tool: notATool, MemoryLimit: toolMemoryLimit, AllowUnsandboxed: true}
+	want := fmt.Sprintf("media sandbox: execve %s failed: errno %d\n", notATool, int(unix.EACCES))
+	for i := range 50 {
+		cmd := exec.Command(exe, mediaSandboxArg, spec.String(), "--", notATool) // #nosec G204 -- the test binary
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+		cmd.Dir = dir
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		var exitErr *exec.ExitError
+		require.ErrorAs(t, err, &exitErr, "run %d", i)
+		require.Equal(t, sandboxExitCode, exitErr.ExitCode(), "run %d: %q", i, stderr.String())
+		require.Equal(t, want, stderr.String(), "run %d", i)
+	}
+}
+
 // When the bot dies, the sandboxed tool dies with it: the helper re-arms
 // Pdeathsig on the thread that execs (Ruling 14 note 2).
 func TestMediaSandbox_ParentDeath(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names

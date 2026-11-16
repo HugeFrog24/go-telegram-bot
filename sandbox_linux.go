@@ -174,7 +174,7 @@ func within(dir, p string) bool {
 
 // runMediaSandbox is the helper. It applies the sandbox to itself and execs
 // the tool, so on success it never returns; a check run prints its report and
-// returns 0. Any failure is a line on stderr (the bot logs the tail) and
+// exits 0. Any failure is a line on stderr (the bot logs the tail) and
 // sandboxExitCode, and the tool never runs.
 func runMediaSandbox(args []string) int {
 	ppid := unix.Getppid()
@@ -210,9 +210,15 @@ func mediaSandbox(args []string, ppid int) error {
 		if err != nil {
 			return err
 		}
-		return underMemoryLimit(inv.spec.MemoryLimit, func() unix.Errno {
-			_, _, errno := unix.RawSyscall(unix.SYS_WRITE, 1, uintptr(unsafe.Pointer(&out[0])), uintptr(len(out))) // #nosec G103 -- write(2) of the report
-			return errno
+		// The run ends right after the report, under the limit, on this
+		// thread: handing back to the main thread could need a new one, and
+		// no thread can be made under the limit.
+		return underMemoryLimit(inv.spec.MemoryLimit, []byte("media sandbox: writing the report failed: errno "), func() unix.Errno {
+			if errno := rawWrite(1, out); errno != 0 {
+				return errno
+			}
+			exitNow(0)
+			return 0
 		})
 	}
 	return execTool(inv.spec, inv.argv, os.Environ())
@@ -307,17 +313,54 @@ func setToolLimits(memory uint64) error {
 // than toolMemoryLimit on glibc (about 1.6 GiB measured on Ubuntu 24.04, 1.2
 // GiB on Alpine), and the kernel refuses every new mapping to a process over
 // its limit, so the helper would die at its next heap growth. The tool gets
-// the limit all the same: execve keeps it.
-func underMemoryLimit(memory uint64, last func() unix.Errno) error {
+// the limit all the same: execve keeps it. If last fails, nothing may
+// allocate any more either: failUnderLimit reports failMsg, made before the
+// limit, and the errno, and ends the helper (review Minor 7).
+func underMemoryLimit(memory uint64, failMsg []byte, last func() unix.Errno) error {
 	limit := unix.Rlimit{Cur: memory, Max: memory}
 	if _, _, errno := unix.RawSyscall6(unix.SYS_PRLIMIT64, 0, unix.RLIMIT_AS,
 		uintptr(unsafe.Pointer(&limit)), 0, 0, 0); errno != 0 { // #nosec G103 -- prlimit(2) of this process
-		return fmt.Errorf("setrlimit RLIMIT_AS: %w", errno)
+		return fmt.Errorf("setrlimit RLIMIT_AS: %w", errno) // the limit is not set: allocating is still fine
 	}
 	if errno := last(); errno != 0 {
-		return errno
+		failUnderLimit(failMsg, errno)
 	}
 	return nil
+}
+
+// failUnderLimit writes msg and errno, in decimal, to stderr and exits with
+// sandboxExitCode, all through raw system calls: the digits go into an array
+// on the stack, and with the collector off no stack has shrunk since the
+// helper's deeper calls, so nothing here allocates. It never returns.
+func failUnderLimit(msg []byte, errno unix.Errno) {
+	var num [24]byte
+	i := len(num) - 1
+	num[i] = '\n'
+	for n := uint64(errno); ; n /= 10 {
+		i--
+		num[i] = byte('0' + n%10)
+		if n < 10 {
+			break
+		}
+	}
+	rawWrite(2, msg)
+	rawWrite(2, num[i:])
+	exitNow(sandboxExitCode)
+}
+
+// exitNow ends the helper with the exit_group system call: no deferred call,
+// no runtime exit path, nothing that might allocate or need another thread.
+func exitNow(code int) {
+	_, _, _ = unix.RawSyscall(unix.SYS_EXIT_GROUP, uintptr(code), 0, 0)
+}
+
+// rawWrite is write(2) of b to fd, with no allocation.
+func rawWrite(fd int, b []byte) unix.Errno {
+	if len(b) == 0 {
+		return 0
+	}
+	_, _, errno := unix.RawSyscall(unix.SYS_WRITE, uintptr(fd), uintptr(unsafe.Pointer(&b[0])), uintptr(len(b))) // #nosec G103 -- write(2)
+	return errno
 }
 
 // execTool execs the tool in place, under the address-space limit. Its argv
@@ -338,12 +381,12 @@ func execTool(spec sandboxSpec, argv, env []string) error {
 	if err != nil {
 		return err
 	}
-	err = underMemoryLimit(spec.MemoryLimit, func() unix.Errno {
+	failMsg := []byte("media sandbox: execve " + spec.Tool + " failed: errno ")
+	return underMemoryLimit(spec.MemoryLimit, failMsg, func() unix.Errno {
 		// execve(2) of the bot's own tool path, checked against the spec.
 		_, _, errno := unix.RawSyscall(unix.SYS_EXECVE, uintptr(unsafe.Pointer(path)), uintptr(unsafe.Pointer(&argvp[0])), uintptr(unsafe.Pointer(&envp[0]))) // #nosec G103 G204
 		return errno
 	})
-	return fmt.Errorf("exec %s: %w", spec.Tool, err)
 }
 
 // setOOMScoreAdj makes this process, and the tool after the exec, the OOM
