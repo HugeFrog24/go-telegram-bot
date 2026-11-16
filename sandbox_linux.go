@@ -113,7 +113,41 @@ func newSandboxSpec(dir, font, tool string, cpu int) (sandboxSpec, error) {
 	if err := sandboxUsable(sandboxAvailable()); err != nil && !spec.AllowUnsandboxed {
 		return spec, fmt.Errorf("%w: %w", errNoSandbox, err)
 	}
-	return spec, spec.validate()
+	if err := spec.validate(); err != nil {
+		return spec, err
+	}
+	return spec, inputDirSafe(dir)
+}
+
+// inputDirSafe says why dir cannot be a run's input directory, which the
+// sandbox lets the tool read, or returns nil (Ruling 16 item 4). It must not
+// be one of the bot's own directories, hold one or lie beneath one (links
+// followed), and it must hold exactly one entry: the input. A bot whose
+// working directory is / still has its config/ and data/ checked; everything
+// lies beneath /, so / itself cannot count.
+func inputDirSafe(dir string) error {
+	dirs, err := botDirs()
+	if err != nil {
+		return fmt.Errorf("cannot find the bot's directories: %w", err)
+	}
+	in := realPath(dir)
+	for _, d := range dirs {
+		bot := realPath(d)
+		if bot == "/" {
+			continue
+		}
+		if within(bot, in) || within(in, bot) {
+			return fmt.Errorf("the input directory %s is, holds or lies beneath the bot's directory %s", dir, d)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("the input directory: %w", err)
+	}
+	if len(entries) != 1 {
+		return fmt.Errorf("the input directory %s holds %d entries, not only the input", dir, len(entries))
+	}
+	return nil
 }
 
 // sandboxInvocation is a parsed helper command line.

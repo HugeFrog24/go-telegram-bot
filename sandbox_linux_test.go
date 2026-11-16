@@ -138,19 +138,26 @@ func requireDenied(t *testing.T, out []byte, err error, what string) {
 // The sandbox lets a tool read inside its input directory and nothing else
 // of the bot's: not another video, not another chat's, not the database, not
 // config/. It can create, change or delete nothing. Everything here is a fake
-// repository in a temp dir; the real config/ is never touched.
+// repository in a temp dir; the real config/ is never touched. The input is
+// a download in a directory of its own: the input directory guard refuses
+// anything beneath the bot's own directories (Ruling 16 item 4).
 func TestMediaSandbox_FileAccess(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	requireLandlock(t)
 	root := t.TempDir() // stands in for the bot's working directory
 	token := writeFake(t, root, "config/bot.json", `{"telegram_token":"fake-token-for-the-sandbox-test"}`)
 	db := writeFake(t, root, "data/bot.db", "fake chat history")
-	video := writeFake(t, root, "data/videos/1/42/v1/video", "this chat's video")
 	sibling := writeFake(t, root, "data/videos/1/42/v2/video", "another video of this chat")
 	otherChat := writeFake(t, root, "data/videos/1/43/v1/video", "another chat's video")
 	otherBot := writeFake(t, root, "data/videos/2/42/v1/video", "another bot's video")
+	video := writeFake(t, t.TempDir(), "video", "this chat's video")
 	in := filepath.Dir(video)
 	t.Chdir(root)
 	ctx := context.Background()
+	relative := func(p string) string {
+		r, err := filepath.Rel(in, p)
+		require.NoError(t, err)
+		return r
+	}
 
 	out, err := runTool(ctx, "cat", in, "", []string{video})
 	require.NoError(t, err, "%q", toolStderr(err))
@@ -159,7 +166,7 @@ func TestMediaSandbox_FileAccess(t *testing.T) { //NOSONAR go:S100 -- underscore
 	require.NoError(t, err, "relative to the tool's working directory, the input directory")
 	assert.Equal(t, "this chat's video", string(out))
 
-	for _, p := range []string{sibling, otherChat, otherBot, db, token, "../v2/video", "../../../../../config/bot.json"} {
+	for _, p := range []string{sibling, otherChat, otherBot, db, token, relative(sibling), relative(token)} {
 		control := exec.Command("cat", p) // #nosec G204 -- a test fixture path
 		control.Dir = in
 		got, err := control.Output()
@@ -271,7 +278,7 @@ func TestMediaSandbox_NoTCP(t *testing.T) { //NOSONAR go:S100 -- underscore sepa
 	require.NoError(t, exec.Command(standIn, addr).Run(), "outside the sandbox the stand-in connects") // #nosec G204 -- the test binary
 	require.Eventually(t, func() bool { return accepted.Load() == 1 }, 2*time.Second, 10*time.Millisecond)
 
-	out, err := runTool(context.Background(), "tcp-dial", t.TempDir(), "", []string{addr})
+	out, err := runTool(context.Background(), "tcp-dial", inputDir(t), "", []string{addr})
 	requireDenied(t, out, err, "TCP connect")
 	time.Sleep(100 * time.Millisecond)
 	assert.EqualValues(t, 1, accepted.Load(), "no connection from inside the sandbox reached the listener")
@@ -289,7 +296,7 @@ func procFile(t *testing.T, pid int, name string) string {
 // and waits until the helper has exec'd it.
 func startSandboxed(t *testing.T, tool string, args ...string) *exec.Cmd {
 	t.Helper()
-	cmd, err := newToolCmd(context.Background(), tool, t.TempDir(), "", args)
+	cmd, err := newToolCmd(context.Background(), tool, inputDir(t), "", args)
 	require.NoError(t, err)
 	require.NoError(t, cmd.Start())
 	t.Cleanup(func() {
@@ -398,7 +405,7 @@ func TestMediaSandbox_ParentDeath(t *testing.T) { //NOSONAR go:S100 -- underscor
 	require.NoError(t, err)
 	exe, err := os.Executable()
 	require.NoError(t, err)
-	parent := exec.Command(exe, sleep, t.TempDir(), "300") // #nosec G204 -- the test binary
+	parent := exec.Command(exe, sleep, inputDir(t), "300") // #nosec G204 -- the test binary
 	parent.Args[0] = "sandbox-parent"
 	parent.Env = []string{"PATH=" + os.Getenv("PATH")}
 	stdout, err := parent.StdoutPipe()
@@ -516,6 +523,53 @@ func TestSandboxSparesBot(t *testing.T) {
 		assert.Contains(t, logged.String(), "[video_gate_bot] video: the bot's directory /usr/src/app is beneath /usr, "+
 			"which the ffmpeg sandbox lets every tool read; video watching is off")
 	})
+}
+
+// The input directory a run grants is never the bot's own: not its working
+// directory, a link to it, config/ or data/, nor anything above or below
+// them; and it holds exactly one entry, the input (Ruling 16 item 4). A fake
+// repository stands in for the bot; the real config/ is never touched.
+func TestNewSandboxSpec_InputDirGuard(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	allowUnsandboxedWhereNeeded(t)
+	root := t.TempDir()
+	writeFake(t, root, "config/bot.json", `{"telegram_token":"fake"}`)
+	writeFake(t, root, "data/bot.db", "fake")
+	video := writeFake(t, root, "data/videos/1/42/v1/video", "a stored video")
+	prev := botDirs
+	botDirs = func() ([]string, error) {
+		return []string{root, filepath.Join(root, "config"), filepath.Join(root, "data")}, nil
+	}
+	t.Cleanup(func() { botDirs = prev })
+	link := filepath.Join(t.TempDir(), "repo")
+	require.NoError(t, os.Symlink(root, link))
+	spec := func(dir string) error {
+		_, err := newSandboxSpec(dir, "", "/usr/bin/ffprobe", 20)
+		return err
+	}
+
+	for name, dir := range map[string]string{
+		"the working directory":   root,
+		"a link to it":            link,
+		"config/":                 filepath.Join(root, "config"),
+		"data/":                   filepath.Join(root, "data"),
+		"beneath data/":           filepath.Dir(video),
+		"beneath the link":        filepath.Join(link, "data", "videos"),
+		"above the bot":           filepath.Dir(root),
+		"two levels above it":     filepath.Dir(filepath.Dir(root)),
+		"beneath the working dir": filepath.Join(root, "config"),
+	} {
+		assert.ErrorContains(t, spec(dir), "the bot's directory", name)
+	}
+
+	empty := t.TempDir()
+	assert.ErrorContains(t, spec(empty), "0 entries", "an empty directory")
+	two := t.TempDir()
+	writeFake(t, two, "media", "the input")
+	writeFake(t, two, "other", "something else")
+	assert.ErrorContains(t, spec(two), "2 entries")
+	one := t.TempDir()
+	writeFake(t, one, "media", "the input")
+	assert.NoError(t, spec(one), "one input, nowhere near the bot")
 }
 
 // The spec is strict: anything malformed is refused before any exec.
@@ -721,7 +775,7 @@ func TestSandboxSelfCheck_Report(t *testing.T) { //NOSONAR go:S100 -- underscore
 // process group, and a timeout kills that group.
 func TestNewToolCmd_Linux(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	allowUnsandboxedWhereNeeded(t)
-	dir := t.TempDir()
+	dir := inputDir(t)
 	cmd, err := newToolCmd(context.Background(), "/abs/ffmpeg", dir, "/fonts/f.ttf", []string{"-version"})
 	require.NoError(t, err)
 	assert.True(t, toolMemoryCapped)

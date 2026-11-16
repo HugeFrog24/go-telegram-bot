@@ -803,8 +803,9 @@ const (
 var ffmpegVersionLine = regexp.MustCompile(`^ffmpeg version n?(\d{1,4})\.`)
 
 // toolVersion runs `ffmpeg -hide_banner -version` once through runTool,
-// within versionTimeout and in an empty directory, and returns the first line
-// of its output, cut to maxVersionLine bytes.
+// within versionTimeout and in a fresh directory holding one empty file (the
+// shape every run's input directory must have, Ruling 16 item 4), and
+// returns the first line of its output, cut to maxVersionLine bytes.
 func toolVersion(ctx context.Context) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, versionTimeout)
 	defer cancel()
@@ -813,6 +814,9 @@ func toolVersion(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
+	if err := os.WriteFile(filepath.Join(dir, "none"), nil, 0o600); err != nil {
+		return "", err
+	}
 	out, err := runTool(ctx, "ffmpeg", dir, "", []string{"-hide_banner", "-version"})
 	if err != nil {
 		return "", err

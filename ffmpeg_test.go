@@ -80,6 +80,16 @@ func makeFixture(t *testing.T, args []string) (string, []byte, error) {
 	return out, msg, err
 }
 
+// inputDir is a new directory holding one empty file: the shape every run's
+// input directory must have on Linux (Ruling 16 item 4), for runs whose real
+// input is not a file.
+func inputDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "none"), nil, 0o600))
+	return dir
+}
+
 // textFixture writes content to name in its own new directory.
 func textFixture(t *testing.T, name, content string) string {
 	t.Helper()
@@ -144,7 +154,6 @@ func TestProbeMedia_RejectsOthers(t *testing.T) { //NOSONAR go:S100 -- underscor
 		"audio-only":    ffmpegFixture(t, "-f", "lavfi", "-i", "sine=duration=1", "-f", "wav"),
 		"hls playlist":  textFixture(t, "list.m3u8", "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n"+target+"\n#EXT-X-ENDLIST\n"),
 		"empty file":    textFixture(t, "media", ""),
-		"missing file":  filepath.Join(t.TempDir(), "media"),
 		"truncated mp4": truncatedFixture(t, ffmpegFixture(t, mp4Args...)),
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -152,6 +161,11 @@ func TestProbeMedia_RejectsOthers(t *testing.T) { //NOSONAR go:S100 -- underscor
 			assert.ErrorIs(t, err, errUnsupportedMedia)
 		})
 	}
+
+	// A missing file fails too: on Linux before ffprobe runs, since its
+	// directory holds no input for the sandbox to grant (Ruling 16 item 4).
+	_, err := probeMedia(context.Background(), filepath.Join(t.TempDir(), "media"), "document")
+	assert.Error(t, err)
 }
 
 // truncatedFixture copies the first 2 KiB of src into a new directory.
@@ -609,7 +623,7 @@ func TestToolConcurrency(t *testing.T) {
 
 func TestNewToolCmd(t *testing.T) {
 	allowUnsandboxedWhereNeeded(t)
-	dir := t.TempDir()
+	dir := inputDir(t)
 	cmd, err := newToolCmd(context.Background(), "/abs/ffmpeg", dir, "", []string{"-version"})
 	require.NoError(t, err)
 	assert.Equal(t, dir, cmd.Dir)
@@ -637,13 +651,13 @@ func TestRunTool_NeedsASandbox(t *testing.T) { //NOSONAR go:S100 -- underscore s
 	prev := unsandboxedGrants.Load()
 	unsandboxedGrants.Store(0)
 	t.Cleanup(func() { unsandboxedGrants.Store(prev) })
-	_, err := runTool(context.Background(), "ffmpeg", t.TempDir(), "", []string{"-hide_banner", "-version"})
+	_, err := runTool(context.Background(), "ffmpeg", inputDir(t), "", []string{"-hide_banner", "-version"})
 	if sandboxUsable(sandboxAvailable()) == nil {
 		assert.NoError(t, err, "inside Landlock")
 		return
 	}
 	assert.ErrorIs(t, err, errNoSandbox)
-	_, err = newToolCmd(context.Background(), "/abs/ffmpeg", t.TempDir(), "", nil)
+	_, err = newToolCmd(context.Background(), "/abs/ffmpeg", inputDir(t), "", nil)
 	assert.ErrorIs(t, err, errNoSandbox)
 }
 
@@ -718,7 +732,7 @@ wait`)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	cmd, err := newToolCmd(ctx, bin, t.TempDir(), "", nil)
+	cmd, err := newToolCmd(ctx, bin, inputDir(t), "", nil)
 	require.NoError(t, err)
 	lines := make(chan string, 1)
 	cmd.Stdout = &firstLine{line: lines}
@@ -755,7 +769,7 @@ func TestRunTool_KillsGroupAfterExit(t *testing.T) { //NOSONAR go:S100 -- unders
 	fakeTool(t, "noseccomp-forker", `sleep 300 &
 echo $!`)
 	start := time.Now()
-	out, err := runTool(context.Background(), "noseccomp-forker", t.TempDir(), "", nil)
+	out, err := runTool(context.Background(), "noseccomp-forker", inputDir(t), "", nil)
 	elapsed := time.Since(start)
 	require.NoError(t, err, "%q", toolStderr(err))
 	child := strings.TrimSpace(string(out))
@@ -890,12 +904,12 @@ func TestRunTool_StdoutBound(t *testing.T) { //NOSONAR go:S100 -- underscore sep
 		return []string{"-hide_banner", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=4096x2048:rate=1",
 			"-frames:v", frames, "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"}
 	}
-	out, err := runTool(context.Background(), "ffmpeg", t.TempDir(), "", raw("1"))
+	out, err := runTool(context.Background(), "ffmpeg", inputDir(t), "", raw("1"))
 	require.NoError(t, err, "exactly 8 MiB passes")
 	assert.Len(t, out, toolOutputLimit)
 
 	start := time.Now()
-	out, err = runTool(context.Background(), "ffmpeg", t.TempDir(), "", raw("5"))
+	out, err = runTool(context.Background(), "ffmpeg", inputDir(t), "", raw("5"))
 	assert.ErrorIs(t, err, errToolOutputTooLarge)
 	assert.Nil(t, out)
 	assert.Less(t, time.Since(start), 10*time.Second, "the process is killed, not drained")
@@ -917,7 +931,7 @@ func TestRunTool_FailureIsExitStatus(t *testing.T) { //NOSONAR go:S100 -- unders
 	assert.NoError(t, err, "stderr content alone is never a failure")
 
 	// A failing run with nothing on stderr is still a failure.
-	_, err = runTool(context.Background(), "ffmpeg", t.TempDir(), "", []string{"-hide_banner", "-nostdin", "-loglevel", "quiet", "-i", "file:" + filepath.Join(t.TempDir(), "missing"), "-f", "null", "-"})
+	_, err = runTool(context.Background(), "ffmpeg", inputDir(t), "", []string{"-hide_banner", "-nostdin", "-loglevel", "quiet", "-i", "file:" + filepath.Join(t.TempDir(), "missing"), "-f", "null", "-"})
 	var te *toolError
 	require.ErrorAs(t, err, &te)
 	assert.Empty(t, te.Stderr())
@@ -982,17 +996,17 @@ func TestRunTool_Semaphore(t *testing.T) { //NOSONAR go:S100 -- underscore separ
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := runTool(ctx, "ffmpeg", t.TempDir(), "", []string{"-hide_banner", "-version"})
+	_, err := runTool(ctx, "ffmpeg", inputDir(t), "", []string{"-hide_banner", "-version"})
 	assert.ErrorIs(t, err, context.DeadlineExceeded, "the extra run waits for a slot, within its own timeout")
 	assert.Less(t, time.Since(start), 3*time.Second)
 
 	cancelled, cancel2 := context.WithCancel(context.Background())
 	cancel2()
-	_, err = runTool(cancelled, "ffmpeg", t.TempDir(), "", []string{"-hide_banner", "-version"})
+	_, err = runTool(cancelled, "ffmpeg", inputDir(t), "", []string{"-hide_banner", "-version"})
 	assert.ErrorIs(t, err, context.Canceled)
 
 	<-toolSlots // one slot free: a run takes it and gives it back
-	_, err = runTool(context.Background(), "ffmpeg", t.TempDir(), "", []string{"-hide_banner", "-version"})
+	_, err = runTool(context.Background(), "ffmpeg", inputDir(t), "", []string{"-hide_banner", "-version"})
 	assert.NoError(t, err)
 	assert.Equal(t, cap(toolSlots)-1, len(toolSlots))
 }
