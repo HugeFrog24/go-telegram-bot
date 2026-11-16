@@ -12,13 +12,16 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,20 +50,38 @@ func init() {
 	// The test binary as a stand-in tool is a Go program: on glibc its
 	// runtime alone takes about 1.6 GiB of address space, more than
 	// toolMemoryLimit, so it gets room. Real tools keep the cap.
+	// "noseccomp-" in front of a stand-in's name runs it without the seccomp
+	// filter, for tests whose stand-ins must fork; "abi4-" holds Landlock to
+	// ABI 4, before it scoped signals.
 	sandboxTestVariant = func(tool string) sandboxVariant {
 		var v sandboxVariant
-		if testStandIns[filepath.Base(tool)] != nil {
+		name := filepath.Base(tool)
+		if testStandIns[name] != nil {
 			v.memory = 4 << 30
 		}
-		return v
+		for {
+			switch {
+			case strings.HasPrefix(name, "noseccomp-"):
+				v.noSeccomp, name = true, strings.TrimPrefix(name, "noseccomp-")
+			case strings.HasPrefix(name, "abi4-"):
+				v.maxABI, name = 4, strings.TrimPrefix(name, "abi4-")
+			default:
+				return v
+			}
+		}
 	}
 	// Every helper the tests start works on a thread that did not inherit
 	// Pdeathsig, so the parent-death test proves the re-arm (review Minor 3).
 	sandboxFreshThread = true
 	testStandIns["tcp-dial"] = tcpDialStandIn
+	testStandIns["noseccomp-tcp-dial"] = tcpDialStandIn
 	testStandIns["sandbox-parent"] = sandboxParentStandIn
 	testStandIns["truncate-path"] = truncatePathStandIn
-	testStandIns["sandbox-probe"] = sandboxProbeStandIn
+	// The probe also answers to its variants' names: "noseccomp-" runs it
+	// without the seccomp filter, "abi4-" with Landlock held to ABI 4.
+	for _, variant := range []string{"", "noseccomp-", "abi4-", "noseccomp-abi4-"} {
+		testStandIns[variant+"sandbox-probe"] = sandboxProbeStandIn
+	}
 }
 
 // requireLandlock skips the test where the kernel (or a seccomp profile)
@@ -110,6 +131,101 @@ var probeActions = map[string]func(args []string) error{
 	"exec": func(args []string) error {
 		return syscall.Exec(args[0], []string{args[0], "-version"}, []string{"PATH=/usr/bin:/bin"}) // #nosec G204 -- the test's own path
 	},
+	// udp <addr>: send a datagram.
+	"udp": func(args []string) error {
+		c, err := net.Dial("udp", args[0])
+		if err != nil {
+			return err
+		}
+		defer func() { _ = c.Close() }()
+		_, err = c.Write([]byte("leak"))
+		return err
+	},
+	// unix <path>: connect to a pathname unix socket.
+	"unix": func(args []string) error {
+		c, err := net.Dial("unix", args[0])
+		if err != nil {
+			return err
+		}
+		return c.Close()
+	},
+	// netlink: open a netlink socket.
+	"netlink": func([]string) error {
+		fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW, syscall.NETLINK_ROUTE)
+		if err != nil {
+			return err
+		}
+		return syscall.Close(fd)
+	},
+	// kill <pid>: SIGTERM another process of the same user.
+	"kill": func(args []string) error {
+		pid, err := strconv.Atoi(args[0])
+		if err != nil {
+			return err
+		}
+		return syscall.Kill(pid, syscall.SIGTERM)
+	},
+	// signal-parent: SIGUSR1 to the bot that ran this tool.
+	"signal-parent": func([]string) error { return syscall.Kill(os.Getppid(), syscall.SIGUSR1) },
+	// fork: a child process, which leaves at once.
+	"fork": func([]string) error { return rawFork(0) },
+	// userns: a child process in a new user namespace.
+	"userns": func([]string) error { return rawFork(syscall.CLONE_NEWUSER) },
+	// setsid and setpgid: a session or group of its own, out of the group kill.
+	"setsid": func([]string) error {
+		_, err := syscall.Setsid()
+		return err
+	},
+	"setpgid": func([]string) error { return syscall.Setpgid(0, 0) },
+	// io_uring: set up an io_uring.
+	"io_uring": func([]string) error {
+		var params [120]byte
+		fd, _, errno := syscall.Syscall(unix.SYS_IO_URING_SETUP, 1, uintptr(unsafe.Pointer(&params[0])), 0) // #nosec G103 -- io_uring_setup(2)
+		if errno != 0 {
+			return errno
+		}
+		return syscall.Close(int(fd))
+	},
+	// ptrace <pid>: attach to another process.
+	"ptrace": func(args []string) error {
+		pid, err := strconv.Atoi(args[0])
+		if err != nil {
+			return err
+		}
+		if err := syscall.PtraceAttach(pid); err != nil {
+			return err
+		}
+		return syscall.PtraceDetach(pid)
+	},
+	// raise: abort the way C code does, raise(SIGABRT) with tgkill on this
+	// thread and the default action. It must die of it.
+	"raise": func([]string) error {
+		act := struct{ handler, flags, restorer, mask uintptr }{} // SIG_DFL
+		if _, _, errno := syscall.RawSyscall6(syscall.SYS_RT_SIGACTION, uintptr(syscall.SIGABRT),
+			uintptr(unsafe.Pointer(&act)), 0, 8, 0, 0); errno != 0 { // #nosec G103 -- rt_sigaction(2)
+			return errno
+		}
+		runtime.LockOSThread()
+		if _, _, errno := syscall.RawSyscall(syscall.SYS_TGKILL, uintptr(os.Getpid()), uintptr(syscall.Gettid()), uintptr(syscall.SIGABRT)); errno != 0 {
+			return errno
+		}
+		time.Sleep(time.Second)
+		return errors.New("raise(SIGABRT) returned")
+	},
+}
+
+// rawFork makes a child with clone(2) and flags; the child exits at once.
+func rawFork(flags uintptr) error {
+	pid, _, errno := syscall.RawSyscall6(syscall.SYS_CLONE, flags|uintptr(syscall.SIGCHLD), 0, 0, 0, 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	if pid == 0 {
+		_, _, _ = syscall.RawSyscall(syscall.SYS_EXIT_GROUP, 0, 0, 0)
+	}
+	var ws syscall.WaitStatus
+	_, err := syscall.Wait4(int(pid), &ws, 0, nil)
+	return err
 }
 
 // sandboxProbeStandIn runs probeActions[args[0]] with the rest: exit 0 when
@@ -169,14 +285,17 @@ func writeFake(t *testing.T, root, rel, content string) string {
 	return p
 }
 
-// requireDenied checks that a sandboxed run failed with EACCES: a non-zero exit
-// whose stderr says "Permission denied", never "No such file".
+// requireDenied checks that a sandboxed run was refused: a non-zero exit
+// whose stderr says "Permission denied" (EACCES, Landlock) or "Operation not
+// permitted" (EPERM, the seccomp filter), never "No such file".
 func requireDenied(t *testing.T, out []byte, err error, what string) {
 	t.Helper()
 	var te *toolError
 	require.ErrorAs(t, err, &te, "%s: the run must fail", what)
 	assert.Empty(t, out, what)
-	assert.Contains(t, strings.ToLower(te.Stderr()), "permission denied", what)
+	stderr := strings.ToLower(te.Stderr())
+	assert.True(t, strings.Contains(stderr, "permission denied") || strings.Contains(stderr, "operation not permitted"),
+		"%s: refused by the sandbox, got %q", what, te.Stderr())
 }
 
 // The sandbox lets a tool read inside its input directory and nothing else
@@ -257,6 +376,115 @@ func TestMediaSandbox_FileAccess(t *testing.T) { //NOSONAR go:S100 -- underscore
 	assert.FileExists(t, token, "the fake config is still there")
 }
 
+// The seccomp filter (Ruling 16 item 1) stops what Landlock leaves open. Each
+// thing is tried by the probe stand-in through the real helper and runTool,
+// and must fail with EPERM. Where the container allows it, the same try
+// without the filter ("noseccomp-") works, so the failure is the filter's.
+// Signals are tried at ABI 4 too, where Landlock does not scope them, so
+// the filter alone keeps the bot and other processes safe.
+func TestMediaSandbox_Seccomp(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireLandlock(t)
+	for _, name := range []string{"sandbox-probe", "noseccomp-sandbox-probe", "abi4-sandbox-probe", "noseccomp-abi4-sandbox-probe"} {
+		standInTool(t, name)
+	}
+	ctx := context.Background()
+	denied := func(what, tool string, args ...string) {
+		t.Helper()
+		out, err := runTool(ctx, tool, inputDir(t), "", args)
+		var te *toolError
+		if assert.ErrorAs(t, err, &te, "%s: the run must fail", what) {
+			assert.Contains(t, te.Stderr(), "operation not permitted", what)
+		}
+		assert.Empty(t, out, what)
+	}
+	works := func(what, tool string, args ...string) {
+		t.Helper()
+		_, err := runTool(ctx, tool, inputDir(t), "", args)
+		assert.NoError(t, err, "%s without the filter: %q", what, toolStderr(err))
+	}
+
+	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = udp.Close() })
+	var datagrams atomic.Int32
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			if _, _, err := udp.ReadFrom(buf); err != nil {
+				return
+			}
+			datagrams.Add(1)
+		}
+	}()
+	denied("UDP", "sandbox-probe", "udp", udp.LocalAddr().String())
+	works("UDP", "noseccomp-sandbox-probe", "udp", udp.LocalAddr().String())
+	assert.Eventually(t, func() bool { return datagrams.Load() == 1 }, 2*time.Second, 10*time.Millisecond, "only the unfiltered datagram arrived")
+
+	sock := filepath.Join(t.TempDir(), "bus")
+	ln, err := net.Listen("unix", sock)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	var connections atomic.Int32
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			connections.Add(1)
+			_ = c.Close()
+		}
+	}()
+	denied("pathname unix connect", "sandbox-probe", "unix", sock)
+	works("pathname unix connect", "noseccomp-sandbox-probe", "unix", sock)
+	assert.Eventually(t, func() bool { return connections.Load() == 1 }, 2*time.Second, 10*time.Millisecond, "only the unfiltered connection arrived")
+
+	for _, action := range []string{"netlink", "fork", "setpgid"} {
+		denied(action, "sandbox-probe", action)
+		works(action, "noseccomp-sandbox-probe", action)
+	}
+	// No control for these: the tool leads its group, so setsid fails anyway,
+	// and Docker's own profile already refuses the next two; ptrace of
+	// another domain is Landlock's too.
+	denied("setsid", "sandbox-probe", "setsid")
+	denied("clone(CLONE_NEWUSER)", "sandbox-probe", "userns")
+	denied("io_uring_setup", "sandbox-probe", "io_uring")
+
+	other := exec.Command("sleep", "30") // another process of the same user
+	require.NoError(t, other.Start())
+	t.Cleanup(func() { _ = other.Process.Kill(); _ = other.Wait() })
+	pid := strconv.Itoa(other.Process.Pid)
+	denied("ptrace", "sandbox-probe", "ptrace", pid)
+	denied("kill another process", "sandbox-probe", "kill", pid)
+	denied("kill another process at ABI 4", "abi4-sandbox-probe", "kill", pid)
+	assert.False(t, processGone(pid), "the other process lives")
+
+	usr1 := make(chan os.Signal, 4)
+	signal.Notify(usr1, syscall.SIGUSR1)
+	t.Cleanup(func() { signal.Stop(usr1) })
+	denied("signal the bot", "sandbox-probe", "signal-parent")
+	denied("signal the bot at ABI 4", "abi4-sandbox-probe", "signal-parent")
+	select {
+	case <-usr1:
+		t.Error("a filtered tool signalled the bot")
+	case <-time.After(300 * time.Millisecond):
+	}
+	works("signal the bot at ABI 4", "noseccomp-abi4-sandbox-probe", "signal-parent")
+	select {
+	case <-usr1:
+	case <-time.After(2 * time.Second):
+		t.Error("without the filter, at ABI 4, the signal should have arrived")
+	}
+
+	// A tool's own raise(SIGABRT) still works: it dies of the signal, not of EPERM.
+	_, err = runTool(ctx, "sandbox-probe", inputDir(t), "", []string{"raise"})
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr, "%q", toolStderr(err))
+	ws, ok := exitErr.Sys().(syscall.WaitStatus)
+	require.True(t, ok)
+	assert.True(t, ws.Signaled() && ws.Signal() == syscall.SIGABRT, "died of SIGABRT: %v, %q", exitErr, toolStderr(err))
+}
+
 // A tool may execute only itself and its ELF interpreter, and read only the
 // library, font and fontconfig directories and the loader files: no longer
 // the rest of /usr, such as another program (Ruling 16 item 6).
@@ -316,7 +544,9 @@ func TestMediaSandbox_RenderSameAsUnsandboxed(t *testing.T) { //NOSONAR go:S100 
 }
 
 // On ABI 4 and later a sandboxed tool cannot open a TCP connection, not even
-// to the loopback; the same stand-in connects fine outside the sandbox.
+// to the loopback; the same stand-in connects fine outside the sandbox. The
+// seccomp filter refuses the socket itself; without it ("noseccomp-")
+// Landlock still refuses the connect.
 func TestMediaSandbox_NoTCP(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	abi := requireLandlock(t)
 	if abi < 4 {
@@ -338,12 +568,16 @@ func TestMediaSandbox_NoTCP(t *testing.T) { //NOSONAR go:S100 -- underscore sepa
 	}()
 	addr := ln.Addr().String()
 	standIn := standInTool(t, "tcp-dial")
+	standInTool(t, "noseccomp-tcp-dial")
 
 	require.NoError(t, exec.Command(standIn, addr).Run(), "outside the sandbox the stand-in connects") // #nosec G204 -- the test binary
 	require.Eventually(t, func() bool { return accepted.Load() == 1 }, 2*time.Second, 10*time.Millisecond)
 
 	out, err := runTool(context.Background(), "tcp-dial", inputDir(t), "", []string{addr})
 	requireDenied(t, out, err, "TCP connect")
+	out, err = runTool(context.Background(), "noseccomp-tcp-dial", inputDir(t), "", []string{addr})
+	requireDenied(t, out, err, "TCP connect, Landlock alone")
+	assert.Contains(t, toolStderr(err), "permission denied", "Landlock's EACCES")
 	time.Sleep(100 * time.Millisecond)
 	assert.EqualValues(t, 1, accepted.Load(), "no connection from inside the sandbox reached the listener")
 }
@@ -831,14 +1065,15 @@ func TestCheckSandboxed_ReportsNoSandbox(t *testing.T) { //NOSONAR go:S100 -- un
 	in := t.TempDir()
 	inside := writeFake(t, in, "media", "inside")
 	outside := writeFake(t, t.TempDir(), "file", "outside")
-	err := checkSandboxed(in, inside, outside, 4)
+	err := checkSandboxed(in, inside, outside, sandboxReport{ABI: 4, Seccomp: true})
 	require.Error(t, err)
-	for _, want := range []string{"read " + outside, "created a file in " + in, "created a file in " + filepath.Dir(outside), "TCP"} {
+	for _, want := range []string{"read " + outside, "created a file in " + in, "created a file in " + filepath.Dir(outside), "TCP",
+		"made a unix socket", "could signal the bot"} {
 		assert.Contains(t, err.Error(), want)
 	}
 	assert.NoFileExists(t, filepath.Join(in, sandboxProbeName()), "the check cleans up after itself")
 
-	missing := checkSandboxed(in, filepath.Join(in, "missing"), outside, 1)
+	missing := checkSandboxed(in, filepath.Join(in, "missing"), outside, sandboxReport{ABI: 1})
 	assert.ErrorContains(t, missing, "cannot read "+filepath.Join(in, "missing"))
 }
 
@@ -848,7 +1083,7 @@ func TestToolSelfTest_Sandboxed(t *testing.T) { //NOSONAR go:S100 -- underscore 
 	abi := requireLandlock(t)
 	report, err := toolSelfTest(context.Background(), "", true)
 	require.NoError(t, err, "%q", toolStderr(err))
-	assert.Equal(t, sandboxReport{ABI: abi, OOMScoreAdj: true}, report)
+	assert.Equal(t, sandboxReport{ABI: abi, OOMScoreAdj: true, Seccomp: true}, report)
 }
 
 // The helper's check mode fails, and with it the self-test, if Landlock does
@@ -859,12 +1094,13 @@ func TestSandboxSelfCheck_Report(t *testing.T) { //NOSONAR go:S100 -- underscore
 	inside := writeFake(t, in, "media", "inside")
 	report, err := sandboxSelfCheck(context.Background(), in, inside)
 	require.NoError(t, err, "%q", toolStderr(err))
-	abi, lerr := sandboxAvailable()
+	abi, lerr := landlockProbe()
 	if lerr != nil {
 		abi = 0
 	}
 	assert.Equal(t, abi, report.ABI)
 	assert.True(t, report.OOMScoreAdj)
+	assert.Equal(t, seccompProbe() == nil, report.Seccomp, "the filter is installed wherever the kernel can run it")
 }
 
 // On Linux, newToolCmd runs the tool through the helper: the bot's own binary
@@ -913,12 +1149,10 @@ func TestNewBot_VideoGateSandboxOn(t *testing.T) { //NOSONAR go:S100 -- undersco
 	t.Cleanup(func() { InfoLogger = prev })
 	b := videoGateBot(t, setupTestDB(t), &VideoConfig{})
 	assert.True(t, b.videoOn())
-	assert.Contains(t, logged.String(), fmt.Sprintf("[video_gate_bot] video: ffmpeg sandbox on (Landlock ABI %d)", abi))
-	if gaps := sandboxGaps(abi); gaps != "" {
-		assert.Contains(t, logged.String(), fmt.Sprintf("[video_gate_bot] video: Landlock ABI %d cannot deny %s\n", abi, gaps),
-			"what this ABI cannot deny is logged once")
-		assert.Equal(t, 1, strings.Count(logged.String(), "cannot deny"))
-	}
+	assert.Contains(t, logged.String(), fmt.Sprintf("[video_gate_bot] video: ffmpeg sandbox on (Landlock ABI %d, seccomp filter)", abi))
+	assert.Contains(t, logged.String(), "[video_gate_bot] video: the sandbox does not cover file metadata (stat: whether a path exists, sizes, times)\n",
+		"with the filter only what neither layer covers is named, once")
+	assert.Equal(t, 1, strings.Count(logged.String(), "does not cover"))
 	assert.NotContains(t, logged.String(), "oom_score_adj")
 }
 

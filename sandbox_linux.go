@@ -257,13 +257,17 @@ func onSandboxThread(f func() error) error {
 // sandboxVariant is how the tests may change the sandbox for one of their
 // stand-in tools (sandboxTestVariant).
 type sandboxVariant struct {
-	memory uint64 // RLIMIT_AS instead of the spec's; 0 keeps it
+	memory    uint64 // RLIMIT_AS instead of the spec's; 0 keeps it
+	maxABI    int    // Landlock at this ABI at most; 0 keeps the kernel's
+	noSeccomp bool   // no seccomp filter
 }
 
 // sandboxTestVariant, set only by sandbox_linux_test.go, picks a variant by
 // the tool's name: the test binary run as a stand-in tool needs more address
 // space than toolMemoryLimit, since on glibc the Go runtime alone takes about
-// 1.6 GiB. Production code never sets it.
+// 1.6 GiB; some stand-ins must fork, which the filter refuses; and the
+// signal tests hold Landlock to ABI 4, before it scoped signals. Production
+// code never sets it.
 var sandboxTestVariant func(tool string) sandboxVariant
 
 func mediaSandbox(args []string, ppid int) error {
@@ -271,18 +275,19 @@ func mediaSandbox(args []string, ppid int) error {
 	if err != nil {
 		return err
 	}
+	var v sandboxVariant
 	if sandboxTestVariant != nil {
-		if v := sandboxTestVariant(inv.spec.Tool); v.memory > 0 {
+		if v = sandboxTestVariant(inv.spec.Tool); v.memory > 0 {
 			inv.spec.MemoryLimit = v.memory
 		}
 	}
-	report, err := applySandbox(inv.spec, ppid)
+	report, err := applySandbox(inv.spec, ppid, v)
 	if err != nil {
 		return err
 	}
 	if inv.check {
-		if report.ABI > 0 {
-			if err := checkSandboxed(inv.spec.InputDir, inv.inside, inv.outside, report.ABI); err != nil {
+		if report.ABI > 0 || report.Seccomp {
+			if err := checkSandboxed(inv.spec.InputDir, inv.inside, inv.outside, report); err != nil {
 				return err
 			}
 		}
@@ -306,9 +311,10 @@ func mediaSandbox(args []string, ppid int) error {
 
 // applySandbox applies, in order: the rlimits (the address-space limit
 // itself comes last, see underMemoryLimit), oom_score_adj (best effort),
-// Pdeathsig re-armed on this thread, no_new_privs, then Landlock at the best
-// ABI the kernel has (see sandboxABI).
-func applySandbox(spec sandboxSpec, ppid int) (sandboxReport, error) {
+// Pdeathsig re-armed on this thread, no_new_privs, Landlock at the best ABI
+// the kernel has (see sandboxABI), and last the seccomp filter (see
+// sandboxSeccomp), all on this thread, which then execs the tool.
+func applySandbox(spec sandboxSpec, ppid int, v sandboxVariant) (sandboxReport, error) {
 	var report sandboxReport
 	if err := setToolLimits(spec.MemoryLimit, spec.CPUSeconds); err != nil {
 		return report, err
@@ -328,17 +334,45 @@ func applySandbox(spec sandboxSpec, ppid int) (sandboxReport, error) {
 	}
 	kernel, err := landlockABI()
 	abi, err := sandboxABI(kernel, err, spec.AllowUnsandboxed)
-	if err != nil || abi == 0 {
+	if err != nil {
 		return report, err
 	}
-	report.ABI = abi
-	// A tool that is no ELF file (a test's shell script) gets no interpreter
-	// rule; a dynamically linked tool without one could not start.
-	interp := ""
-	if spec.Tool != "" {
-		interp, _ = elfInterpreter(spec.Tool)
+	if v.maxABI > 0 {
+		abi = min(abi, v.maxABI)
 	}
-	return report, restrictSelf(abi, sandboxRules(spec, interp))
+	if abi > 0 {
+		report.ABI = abi
+		// A tool that is no ELF file (a test's shell script) gets no
+		// interpreter rule; a dynamically linked tool without one cannot start.
+		interp := ""
+		if spec.Tool != "" {
+			interp, _ = elfInterpreter(spec.Tool)
+		}
+		if err := restrictSelf(abi, sandboxRules(spec, interp)); err != nil {
+			return report, err
+		}
+	}
+	if !v.noSeccomp {
+		report.Seccomp, err = sandboxSeccomp(spec.AllowUnsandboxed)
+	}
+	return report, err
+}
+
+// errNoSeccomp means the kernel, or a container's own seccomp profile, offers
+// no seccomp filter the helper can install. That is no sandbox either.
+var errNoSeccomp = errors.New("no seccomp filter")
+
+// sandboxSeccomp installs the seccomp filter for this process, which becomes
+// the tool (Ruling 16 item 1), and reports whether it did. Without one it
+// fails unless the spec allows running without a sandbox.
+func sandboxSeccomp(allowUnsandboxed bool) (bool, error) {
+	if err := seccompAvailable(); err != nil {
+		if allowUnsandboxed && errors.Is(err, errNoSeccomp) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, installSeccomp(os.Getpid())
 }
 
 // sandboxABI is the Landlock ABI the helper applies, from the kernel's
@@ -498,8 +532,21 @@ func setOOMScoreAdj() error {
 // landlockProbe asks once per process.
 var landlockProbe = sync.OnceValues(landlockABI)
 
-// sandboxAvailable reports the kernel's Landlock ABI, or why there is none.
-func sandboxAvailable() (int, error) { return landlockProbe() }
+// seccompProbe asks once per process.
+var seccompProbe = sync.OnceValue(seccompAvailable)
+
+// sandboxAvailable reports the kernel's Landlock ABI, or why there is no
+// sandbox: no Landlock, or no seccomp filter (Ruling 16 item 1).
+func sandboxAvailable() (int, error) {
+	abi, err := landlockProbe()
+	if err != nil {
+		return 0, err
+	}
+	if err := seccompProbe(); err != nil {
+		return abi, err
+	}
+	return abi, nil
+}
 
 // sandboxSystemRules are what ffprobe and ffmpeg read of the system, as
 // traced on Alpine 3.24 (ffmpeg 8.1.3) and Ubuntu 24.04 (6.1.1): the library
@@ -585,11 +632,12 @@ func sandboxProbeName() string {
 	return ".media-sandbox-check-" + strconv.Itoa(os.Getpid())
 }
 
-// checkSandboxed is the check run's test of the sandbox it is in: inside
-// (in the input directory) reads, outside does not, no file can be created in
-// either directory, and from ABI 4 no TCP socket can bind. It returns every
-// failure at once.
-func checkSandboxed(inputDir, inside, outside string, abi int) error {
+// checkSandboxed is the check run's test of the sandbox it is in, as the
+// report says it is: inside (in the input directory) reads, outside does
+// not, no file can be created in either directory, from ABI 4 no TCP socket
+// can bind, and with the seccomp filter no socket can be made and the bot
+// cannot be signalled. It returns every failure at once.
+func checkSandboxed(inputDir, inside, outside string, report sandboxReport) error {
 	var failed []string
 	if _, err := os.ReadFile(inside); err != nil { // #nosec G304 -- the bot's own self-test file
 		failed = append(failed, fmt.Sprintf("cannot read %s: %v", inside, err))
@@ -609,15 +657,34 @@ func checkSandboxed(inputDir, inside, outside string, abi int) error {
 			failed = append(failed, fmt.Sprintf("creating a file in %s failed oddly: %v", dir, err))
 		}
 	}
-	if abi >= 4 {
+	if report.ABI >= 4 {
 		if err := tcpBindDenied(); err != nil {
 			failed = append(failed, err.Error())
 		}
+	}
+	if report.Seccomp {
+		failed = append(failed, seccompDenies()...)
 	}
 	if len(failed) > 0 {
 		return errors.New("sandbox check failed: " + strings.Join(failed, "; "))
 	}
 	return nil
+}
+
+// seccompDenies checks two things only the seccomp filter refuses at any
+// Landlock ABI: making a socket and signalling the bot (the parent).
+func seccompDenies() []string {
+	var failed []string
+	if fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0); err == nil {
+		_ = unix.Close(fd)
+		failed = append(failed, "made a unix socket")
+	} else if !errors.Is(err, unix.EPERM) {
+		failed = append(failed, fmt.Sprintf("making a socket failed oddly: %v", err))
+	}
+	if err := unix.Kill(unix.Getppid(), 0); !errors.Is(err, unix.EPERM) {
+		failed = append(failed, fmt.Sprintf("could signal the bot (%v)", err))
+	}
+	return failed
 }
 
 // tcpBindDenied checks that a TCP socket cannot bind, even on the loopback.

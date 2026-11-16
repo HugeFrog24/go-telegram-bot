@@ -295,12 +295,12 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 			// The stand-ins cannot pass a real self-test; this is about the version line.
 			stubGate(t, func() (int, error) { return 7, nil },
 				func(context.Context, string, bool) (sandboxReport, error) {
-					return sandboxReport{ABI: 7, OOMScoreAdj: true}, nil
+					return sandboxReport{ABI: 7, OOMScoreAdj: true, Seccomp: true}, nil
 				})
 			reset()
 			b := videoGateBot(t, db, &VideoConfig{})
 			assert.True(t, b.videoOn(), "never fatal")
-			assert.Contains(t, logged.String(), "[video_gate_bot] video: ffmpeg sandbox on (Landlock ABI 7)")
+			assert.Contains(t, logged.String(), "[video_gate_bot] video: ffmpeg sandbox on (Landlock ABI 7, seccomp filter)")
 			assert.Contains(t, logged.String(), tc.logs)
 			if tc.warns == "" {
 				assert.Empty(t, warned.String())
@@ -348,11 +348,16 @@ func TestSandboxUsable(t *testing.T) {
 	assert.Equal(t, probe, sandboxUsable(0, probe), "no Landlock stays the probe's own reason")
 }
 
-// What each ABI from 3 on cannot deny, each with the ABI that can.
+// What neither layer covers: each ABI's gaps without the seccomp filter,
+// and with it only what no layer hides, file metadata (Ruling 16 item 1).
 func TestSandboxGaps(t *testing.T) {
-	assert.Equal(t, "TCP (ABI 4), abstract unix sockets and signals (ABI 6), pathname unix sockets (ABI 9), UDP (ABI 10)", sandboxGaps(3))
-	assert.Equal(t, "abstract unix sockets and signals (ABI 6), pathname unix sockets (ABI 9), UDP (ABI 10)", sandboxGaps(4))
-	assert.Equal(t, "pathname unix sockets (ABI 9), UDP (ABI 10)", sandboxGaps(7))
-	assert.Equal(t, "UDP (ABI 10)", sandboxGaps(9))
-	assert.Empty(t, sandboxGaps(10))
+	const meta = "file metadata (stat: whether a path exists, sizes, times)"
+	assert.Equal(t, "TCP (ABI 4), abstract unix sockets and signals (ABI 6), pathname unix sockets (ABI 9), UDP (ABI 10), "+meta, sandboxGaps(3, false))
+	assert.Equal(t, "abstract unix sockets and signals (ABI 6), pathname unix sockets (ABI 9), UDP (ABI 10), "+meta, sandboxGaps(4, false))
+	assert.Equal(t, "pathname unix sockets (ABI 9), UDP (ABI 10), "+meta, sandboxGaps(7, false))
+	assert.Equal(t, "UDP (ABI 10), "+meta, sandboxGaps(9, false))
+	assert.Equal(t, meta, sandboxGaps(10, false))
+	for _, abi := range []int{3, 4, 7, 10} {
+		assert.Equal(t, meta, sandboxGaps(abi, true), "ABI %d with the filter", abi)
+	}
 }

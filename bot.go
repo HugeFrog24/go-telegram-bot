@@ -126,13 +126,13 @@ func videoRunnable() error {
 }
 
 // logSandbox logs the sandbox the self-test reported: when it counts as one,
-// its ABI and, once, what that ABI cannot deny (Ruling 15); and when
-// oom_score_adj could not be set.
+// its Landlock ABI and, once, what neither Landlock nor the seccomp filter
+// covers (Rulings 15 and 16); and when oom_score_adj could not be set.
 func logSandbox(botID string, sandboxed bool, report sandboxReport) {
 	if sandboxed {
-		InfoLogger.Printf("[%s] video: ffmpeg sandbox on (Landlock ABI %d)", botID, report.ABI)
-		if gaps := sandboxGaps(report.ABI); gaps != "" {
-			InfoLogger.Printf("[%s] video: Landlock ABI %d cannot deny %s", botID, report.ABI, gaps)
+		InfoLogger.Printf("[%s] video: ffmpeg sandbox on (Landlock ABI %d, seccomp filter)", botID, report.ABI)
+		if gaps := sandboxGaps(report.ABI, report.Seccomp); gaps != "" {
+			InfoLogger.Printf("[%s] video: the sandbox does not cover %s", botID, gaps)
 		}
 	}
 	if toolMemoryCapped && !report.OOMScoreAdj {

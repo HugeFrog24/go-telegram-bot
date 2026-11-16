@@ -50,8 +50,9 @@ var errNoSandbox = errors.New("no sandbox for ffmpeg")
 // config (Ruling 15).
 const minSandboxABI = 3
 
-// sandboxUsable turns a Landlock probe's answer into why there is no
-// sandbox, or nil: no Landlock at all, or an ABI before minSandboxABI.
+// sandboxUsable turns the sandbox probe's answer into why there is no
+// sandbox, or nil: no Landlock or no seccomp filter (the probe's error), or a
+// Landlock ABI before minSandboxABI.
 func sandboxUsable(abi int, err error) error {
 	if err != nil {
 		return err
@@ -62,25 +63,32 @@ func sandboxUsable(abi int, err error) error {
 	return nil
 }
 
-// landlockGaps are what a sandbox from minSandboxABI on may still be unable
-// to deny, with the ABI that adds each.
-var landlockGaps = []struct {
-	abi  int
-	what string
+// sandboxGapList is what the sandbox's two layers may leave open: what each
+// Landlock ABI cannot deny, and whether the seccomp filter does instead
+// (Ruling 16 item 1). Stat metadata neither layer hides.
+var sandboxGapList = []struct {
+	abi     int // the Landlock ABI that denies it; 0 for none
+	seccomp bool
+	what    string
 }{
-	{4, "TCP"},
-	{6, "abstract unix sockets and signals"},
-	{9, "pathname unix sockets"},
-	{10, "UDP"},
+	{4, true, "TCP"},
+	{6, true, "abstract unix sockets and signals"},
+	{9, true, "pathname unix sockets"},
+	{10, true, "UDP"},
+	{0, false, "file metadata (stat: whether a path exists, sizes, times)"},
 }
 
-// sandboxGaps lists what Landlock at abi cannot deny, or "" for nothing the
-// sandbox knows of.
-func sandboxGaps(abi int) string {
+// sandboxGaps lists what neither Landlock at abi nor, when seccomp is true,
+// the seccomp filter covers, each with the ABI that would; "" for nothing.
+func sandboxGaps(abi int, seccomp bool) string {
 	var gaps []string
-	for _, g := range landlockGaps {
-		if abi < g.abi {
+	for _, g := range sandboxGapList {
+		switch {
+		case seccomp && g.seccomp, g.abi > 0 && abi >= g.abi:
+		case g.abi > 0:
 			gaps = append(gaps, fmt.Sprintf("%s (ABI %d)", g.what, g.abi))
+		default:
+			gaps = append(gaps, g.what)
 		}
 	}
 	return strings.Join(gaps, ", ")
@@ -90,6 +98,7 @@ func sandboxGaps(abi int) string {
 type sandboxReport struct {
 	ABI         int  `json:"landlock_abi"`  // the Landlock ABI applied; 0 for none
 	OOMScoreAdj bool `json:"oom_score_adj"` // whether oom_score_adj was set to 1000
+	Seccomp     bool `json:"seccomp"`       // whether the seccomp filter was installed
 }
 
 // selfTestGIF is the gate's self-test input: a 16×16, four-frame GIF made
@@ -103,8 +112,9 @@ const selfTestTimeout = 30 * time.Second
 // toolSelfTest is the gate's self-test (Ruling 14 note 5). It writes the
 // embedded GIF to a fresh input directory and runs, through the production
 // runner: the helper's check run (where landlock is true it must apply
-// Landlock and pass the negative checks, a read outside the input directory
-// and creating a file both failing), then probeMedia and a one-frame
+// Landlock and the seccomp filter and pass the negative checks: a read
+// outside the input directory, creating a file, making a socket and
+// signalling the bot all failing), then probeMedia and a one-frame
 // renderSheet with font. That catches a blocked Landlock, a bad rlimit, a
 // broken ffmpeg and a missing font at once.
 func toolSelfTest(ctx context.Context, font string, landlock bool) (sandboxReport, error) {
@@ -123,8 +133,8 @@ func toolSelfTest(ctx context.Context, font string, landlock bool) (sandboxRepor
 	switch {
 	case err != nil:
 		return report, fmt.Errorf("sandbox check: %w", err)
-	case landlock && report.ABI < minSandboxABI:
-		return report, fmt.Errorf("sandbox check: Landlock ABI %d or later was not applied", minSandboxABI)
+	case landlock && (report.ABI < minSandboxABI || !report.Seccomp):
+		return report, fmt.Errorf("sandbox check: Landlock ABI %d or later and the seccomp filter were not both applied", minSandboxABI)
 	}
 	probe, err := probeMedia(ctx, path, "animation")
 	if err != nil {

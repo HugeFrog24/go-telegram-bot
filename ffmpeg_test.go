@@ -725,10 +725,10 @@ func (w *firstLine) Write(p []byte) (int, error) {
 // write no file. The child holds the same stdout, so if only the tool were
 // killed, Wait would wait for the child through toolWaitDelay.
 func TestRunTool_KillsProcessGroup(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
-	fakeTool(t, "spawner", `sleep 300 &
+	fakeTool(t, "noseccomp-spawner", `sleep 300 &
 echo $!
 wait`)
-	bin, err := lookupTool("spawner")
+	bin, err := lookupTool("noseccomp-spawner") // the filter would stop its fork
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
