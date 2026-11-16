@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf16"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
 	"github.com/go-telegram/bot"
@@ -528,16 +529,49 @@ var handledCommands = map[string]bool{
 // handledCommand is the first command in message the bot handles itself, or
 // "" when there is none.
 func handledCommand(message *models.Message) string {
+	var byteAt []int
 	for _, entity := range message.Entities {
-		end := entity.Offset + entity.Length
-		if entity.Type != "bot_command" || entity.Offset < 0 || entity.Length < 0 || end > len(message.Text) {
+		if entity.Type != "bot_command" {
 			continue
 		}
-		if command := strings.TrimSpace(message.Text[entity.Offset:end]); handledCommands[command] {
+		if byteAt == nil {
+			byteAt = utf16ByteOffsets(message.Text)
+		}
+		if command := entityText(message.Text, byteAt, entity.Offset, entity.Length); handledCommands[command] {
 			return command
 		}
 	}
 	return ""
+}
+
+// utf16ByteOffsets maps each UTF-16 code unit position in text, and its end,
+// to a byte offset: Telegram measures entities in UTF-16 code units. A
+// position inside a surrogate pair maps to -1.
+func utf16ByteOffsets(text string) []int {
+	byteAt := make([]int, 0, len(text)+1)
+	for i, r := range text {
+		byteAt = append(byteAt, i)
+		if utf16.RuneLen(r) == 2 {
+			byteAt = append(byteAt, -1)
+		}
+	}
+	return append(byteAt, len(text))
+}
+
+// entityText is the trimmed text of the entity at offset and length (UTF-16
+// units), or "" when the range is out of bounds or splits a character. The
+// check cannot overflow, however large the values Telegram, or anyone
+// posing as it, sends.
+func entityText(text string, byteAt []int, offset, length int) string {
+	n := len(byteAt) - 1
+	if offset < 0 || length <= 0 || offset > n || length > n-offset {
+		return ""
+	}
+	start, end := byteAt[offset], byteAt[offset+length]
+	if start < 0 || end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(text[start:end])
 }
 
 // unreadMedia reports whether message is media the bot does not read yet,
