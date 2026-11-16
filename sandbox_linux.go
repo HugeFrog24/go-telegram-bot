@@ -43,6 +43,10 @@ import (
 // even if the file on disk has been replaced since.
 const sandboxExe = "/proc/self/exe"
 
+// sandboxHelper is whether the sandbox helper runs the tools: on Linux, for
+// every run, whatever layers it can apply.
+const sandboxHelper = true
+
 // toolOpenFiles is RLIMIT_NOFILE inside the sandbox.
 const toolOpenFiles = 64
 
@@ -409,10 +413,6 @@ func applySandbox(spec sandboxSpec, ppid int, v sandboxVariant, check bool) (san
 	}
 	return report, limits, err
 }
-
-// errNoSeccomp means the kernel, or a container's own seccomp profile, offers
-// no seccomp filter the helper can install. That is no sandbox either.
-var errNoSeccomp = errors.New("no seccomp filter")
 
 // sandboxSeccomp installs the seccomp filter for this process, which becomes
 // the tool (Ruling 16 item 1), and reports whether it did. Without one it

@@ -65,9 +65,13 @@ func sandboxUsable(abi int, err error) error {
 
 // sandboxGapList is what the sandbox's two layers may leave open: what each
 // Landlock ABI cannot deny, and whether the seccomp allowlist denies it
-// instead (Ruling 18 items 1 and 4). Neither layer hides a file's metadata
-// from a read by path (stat, access, readlink, statfs), which the tools use,
-// nor keeps the parent-death signal (Ruling 19 item 1): the filter refuses
+// instead (Ruling 18 items 1 and 4, Ruling 19 item 8). Without Landlock the
+// tool reaches every file the bot's user may, the bot's own
+// /proc/<pid>/environ and, where Yama's ptrace_scope is 0, its
+// /proc/<pid>/mem. Neither layer hides a file's metadata from a read by
+// path (stat, access, readlink, statfs), which the tools use, nor whether a
+// process exists (a stat of /proc/<pid>), nor keeps the parent-death signal
+// (Ruling 19 item 1): the filter refuses
 // prctl(PR_SET_PDEATHSIG), but the signal is per task and a new thread has
 // none, so a thread the tool starts can exec it again without one, and
 // de_thread keeps its PID. That orphan keeps Landlock, the filter, the
@@ -79,7 +83,8 @@ var sandboxGapList = []struct {
 	seccomp bool // whether the seccomp filter denies it
 	what    string
 }{
-	{1, false, "files (reading, writing and running any the user may)"},
+	{1, false, "files: reading, writing and running any the bot's user may, /proc/<bot>/environ (any token in the bot's environment) " +
+		"among them, and /proc/<bot>/mem where Yama's ptrace_scope is 0"},
 	{3, false, "file truncation"},
 	{4, true, "TCP"},
 	{6, true, "abstract unix sockets and signals"},
@@ -88,25 +93,42 @@ var sandboxGapList = []struct {
 	{0, true, "other processes' resource limits, priority and CPU affinity"},
 	{0, true, "file metadata changes (mode, owner, times, extended attributes)"},
 	{0, true, "SysV IPC, inotify and fanotify"},
-	{0, true, "every other system call (new processes, namespaces, io_uring, bpf)"},
-	{0, false, "file metadata (stat: whether a path exists, sizes, times)"},
+	{0, true, "ioctl requests (TIOCSTI among them), priority-inheriting futexes and other prctl options"},
+	{0, true, "every other system call (new processes, ptrace, namespaces, io_uring, bpf)"},
+	{0, false, "file and process metadata (stat: whether a path exists, its size and times, and through /proc/<pid> whether a process does)"},
+	{0, false, "readlink targets and statfs"},
 	{0, false, "the parent-death signal, which a thread the tool starts drops by exec: while the bot lives a timeout still kills the tool's group, " +
 		"but a tool that outlives a dead bot, still sandboxed, ends only with Docker's PID namespace or a systemd unit's control-group kill"},
 }
 
-// sandboxGaps lists what neither Landlock at abi nor, when seccomp is true,
-// the seccomp filter covers, each with the ABI that would, separated by
-// semicolons; "" for nothing.
-func sandboxGaps(abi int, seccomp bool) string {
+// The task cap's gap (Ruling 19 items 2 and 4): RLIMIT_NPROC is per user, so
+// where it binds, the headroom is a pool every concurrent run shares, and
+// where it binds no one (root), there is no cap at all.
+const (
+	sandboxGapTaskPool = "the user's task pool: RLIMIT_NPROC counts every task of the bot's user, so a compromised tool can take what is left of it " +
+		"and make other chats' concurrent runs fail while it runs"
+	sandboxGapNoTaskCap = "threads: RLIMIT_NPROC does not bind the bot's user (root), so a tool can start them until the host, " +
+		"or a container's pids limit, runs out"
+)
+
+// sandboxGaps lists what the layers in r leave open: what neither Landlock
+// at r.ABI nor, when r.Seccomp, the seccomp filter covers, each with the ABI
+// that would, and what the task cap leaves, separated by semicolons.
+func sandboxGaps(r sandboxReport) string {
 	var gaps []string
 	for _, g := range sandboxGapList {
 		switch {
-		case seccomp && g.seccomp, g.abi > 0 && abi >= g.abi:
+		case r.Seccomp && g.seccomp, g.abi > 0 && r.ABI >= g.abi:
 		case g.abi > 0:
 			gaps = append(gaps, fmt.Sprintf("%s (ABI %d)", g.what, g.abi))
 		default:
 			gaps = append(gaps, g.what)
 		}
+	}
+	if r.TaskCap {
+		gaps = append(gaps, sandboxGapTaskPool)
+	} else {
+		gaps = append(gaps, sandboxGapNoTaskCap)
 	}
 	return strings.Join(gaps, "; ")
 }
@@ -119,6 +141,42 @@ type sandboxReport struct {
 	TaskCap        bool `json:"task_cap"`        // whether RLIMIT_NPROC binds the user (root is exempt)
 	NoCapabilities bool `json:"no_capabilities"` // whether every capability set was empty after the drop
 }
+
+// sandboxSummary is what the gate logs, line by line, about the sandbox a
+// passing self-test reported, in every mode that runs video (Ruling 19 item
+// 8): the layers in place, then what they leave open. helper is whether the
+// sandbox helper runs the tools at all (Linux; elsewhere there is no
+// sandbox), full whether the gate found the whole sandbox; a partial one
+// runs only under video.allow_unsandboxed.
+func sandboxSummary(helper, full bool, r sandboxReport) []string {
+	if !helper {
+		return []string{"there is no sandbox on this OS: ffmpeg can do anything the bot's user can, reading, writing and running any file and using the network"}
+	}
+	layers := fmt.Sprintf("ffmpeg sandbox on (Landlock ABI %d, seccomp filter)", r.ABI)
+	if !full {
+		layers = "ffmpeg partial sandbox (" + sandboxLayers(r) + ")"
+	}
+	return []string{layers, "the sandbox does not cover " + sandboxGaps(r)}
+}
+
+// sandboxLayers names the layers r reports, and the missing ones.
+func sandboxLayers(r sandboxReport) string {
+	landlock, filter, taskCap := "no Landlock", "no seccomp filter", "no task cap: run the bot as a non-root user"
+	if r.ABI > 0 {
+		landlock = fmt.Sprintf("Landlock ABI %d", r.ABI)
+	}
+	if r.Seccomp {
+		filter = "seccomp filter"
+	}
+	if r.TaskCap {
+		taskCap = "task cap"
+	}
+	return landlock + ", " + filter + ", " + taskCap
+}
+
+// errNoSeccomp means the kernel, or a container's own seccomp profile, offers
+// no seccomp filter the helper can install. That is no sandbox either.
+var errNoSeccomp = errors.New("no seccomp filter")
 
 // errTaskCapUnbound means RLIMIT_NPROC binds no user here, as for root in the
 // initial user namespace even without capabilities: a tool could start

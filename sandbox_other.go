@@ -13,6 +13,9 @@ import (
 // oom_score_adj and Pdeathsig have no counterpart here. Other OSes are for
 // development, where video.allow_unsandboxed runs the tools directly.
 
+// sandboxHelper is whether the sandbox helper runs the tools: never here.
+const sandboxHelper = false
+
 // runMediaSandbox refuses: nothing here re-execs the bot as a helper.
 func runMediaSandbox([]string) int {
 	fmt.Fprintln(os.Stderr, "media sandbox: Linux only")

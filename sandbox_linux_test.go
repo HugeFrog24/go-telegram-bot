@@ -831,7 +831,7 @@ func TestMediaSandbox_NoCapabilities(t *testing.T) { //NOSONAR go:S100 -- unders
 // runs. Run as uid 0 to test; a user the cap binds skips.
 func TestNewBot_VideoGate_TaskCapUnbound(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	requireFFmpeg(t)
-	requireLandlock(t)
+	abi := requireLandlock(t)
 	if !taskCapUnbound(t) {
 		t.Skip("the task cap binds this user: run as root (uid 0) to test")
 	}
@@ -844,6 +844,7 @@ func TestNewBot_VideoGate_TaskCapUnbound(t *testing.T) { //NOSONAR go:S100 -- un
 	assert.False(t, b.videoOn(), "no whole sandbox, no video")
 	assert.Contains(t, logged.String(), "run the bot as a non-root user")
 	assert.Contains(t, logged.String(), "video watching is off")
+	assert.NotContains(t, logged.String(), "the sandbox does not cover")
 
 	logged.Reset()
 	before := unsandboxedGrants.Load()
@@ -852,6 +853,9 @@ func TestNewBot_VideoGate_TaskCapUnbound(t *testing.T) { //NOSONAR go:S100 -- un
 	assert.True(t, b.videoOn(), "the opt-out restores video: %s", logged.String())
 	assert.Contains(t, logged.String(), "Warning: video: ffmpeg runs WITHOUT a full sandbox")
 	assert.Contains(t, logged.String(), "run the bot as a non-root user")
+	assert.Contains(t, logged.String(), fmt.Sprintf("[video_gate_bot] video: ffmpeg partial sandbox (Landlock ABI %d, seccomp filter, "+
+		"no task cap: run the bot as a non-root user)\n", abi), "the opt-out's layers, as root in Docker")
+	assert.Contains(t, logged.String(), "[video_gate_bot] video: the sandbox does not cover "+gapAlways+"; "+gapThreads+"\n")
 }
 
 // The task count is probed in a child of its own: the caller's RLIMIT_NPROC
@@ -1726,11 +1730,10 @@ func TestNewBot_VideoGateSandboxOn(t *testing.T) { //NOSONAR go:S100 -- undersco
 	b := videoGateBot(t, setupTestDB(t), &VideoConfig{})
 	assert.True(t, b.videoOn())
 	assert.Contains(t, logged.String(), fmt.Sprintf("[video_gate_bot] video: ffmpeg sandbox on (Landlock ABI %d, seccomp filter)", abi))
-	assert.Contains(t, logged.String(), "[video_gate_bot] video: the sandbox does not cover "+sandboxGaps(abi, true)+"\n",
+	assert.Contains(t, logged.String(), "[video_gate_bot] video: the sandbox does not cover "+sandboxGaps(sandboxReport{ABI: abi, Seccomp: true, TaskCap: true})+"\n",
 		"with the filter only what neither layer covers is named, once")
-	assert.Contains(t, logged.String(), "file metadata (stat: whether a path exists, sizes, times); the parent-death signal, which a thread the tool starts drops by exec",
-		"the thread-exec residual (Ruling 19 item 1)")
-	assert.Contains(t, logged.String(), "ends only with Docker's PID namespace or a systemd unit's control-group kill\n", "and its backstop")
+	assert.Contains(t, logged.String(), "[video_gate_bot] video: the sandbox does not cover "+gapAlways+"; "+gapPool+"\n",
+		"metadata, process existence, readlink and statfs, the thread-exec residual and its backstop, the shared task pool (Ruling 19 items 1, 2 and 8)")
 	assert.Equal(t, 1, strings.Count(logged.String(), "does not cover"))
 	assert.NotContains(t, logged.String(), "oom_score_adj")
 }

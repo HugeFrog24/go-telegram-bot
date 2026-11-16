@@ -87,7 +87,8 @@ func resolveVideo(config *BotConfig) *VideoConfig {
 		return nil
 	}
 	// Landlock before ABI 3 cannot deny truncation: no sandbox (Ruling 15).
-	noSandbox := sandboxUsable(gateSandbox())
+	abi, probeErr := gateSandbox()
+	noSandbox := sandboxUsable(abi, probeErr)
 	granted := false
 	// A sandbox that is not whole turns video off, unless the block's
 	// video.allow_unsandboxed accepts it, with a loud warning.
@@ -98,7 +99,7 @@ func resolveVideo(config *BotConfig) *VideoConfig {
 			return false
 		}
 		ErrorLogger.Printf("[%s] Warning: video: ffmpeg runs WITHOUT a full sandbox (%v) because video.allow_unsandboxed is set: "+
-			"a video that exploits ffmpeg could %s", config.ID, why, unsandboxedHarm(why))
+			"a video that exploits ffmpeg could %s", config.ID, why, unsandboxedHarm(sandboxHelper, abi, why))
 		unsandboxedGrants.Add(1)
 		granted = true
 		return true
@@ -143,23 +144,39 @@ func videoRunnable() error {
 }
 
 // unsandboxedHarm is what a video that exploits ffmpeg could do for want of
-// the layer why names.
-func unsandboxedHarm(why error) string {
-	if errors.Is(why, errTaskCapUnbound) {
-		return "start threads until the bot's user or the host runs out of them"
+// the layer why names, for the opt-out's warning (Ruling 19 item 8): helper
+// is whether the sandbox helper runs the tools (sandboxHelper), abi the
+// kernel's Landlock ABI. The gaps line, once the self-test passes, lists
+// the rest.
+func unsandboxedHarm(helper bool, abi int, why error) string {
+	switch {
+	case errors.Is(why, errTaskCapUnbound):
+		return "start threads until the host, or a container's pids limit, runs out of them"
+	case !helper:
+		return "do anything the bot's user can: read, write and run any file (every bot's token, the chat database, other chats' media) " +
+			"and use the network"
 	}
-	return "read every bot's tokens, the chat database and other chats' media"
+	var harms []string
+	switch {
+	case abi == 0:
+		harms = append(harms, "read, write and run any file the bot's user can (every bot's token, the chat database, other chats' media)")
+	case abi < minSandboxABI:
+		harms = append(harms, "empty any file the bot's user can write (the chat database, stored videos, a writable config)")
+	}
+	if errors.Is(why, errNoSeccomp) {
+		harms = append(harms, "use what only the seccomp filter closes, as the gaps line lists (other processes, SysV IPC, ptrace, "+
+			"the sockets its Landlock ABI allows)")
+	}
+	return strings.Join(harms, "; and ")
 }
 
-// logSandbox logs the sandbox the self-test reported: when it counts as one,
-// its Landlock ABI and, once, what neither Landlock nor the seccomp filter
-// covers (Rulings 15 and 16); and when oom_score_adj could not be set.
+// logSandbox logs the sandbox the self-test reported, in every mode that runs
+// video (sandboxSummary): its layers, a partial sandbox's too, and, once,
+// what they leave open (Rulings 15, 16 and 19); and when oom_score_adj
+// could not be set.
 func logSandbox(botID string, sandboxed bool, report sandboxReport) {
-	if sandboxed {
-		InfoLogger.Printf("[%s] video: ffmpeg sandbox on (Landlock ABI %d, seccomp filter)", botID, report.ABI)
-		if gaps := sandboxGaps(report.ABI, report.Seccomp); gaps != "" {
-			InfoLogger.Printf("[%s] video: the sandbox does not cover %s", botID, gaps)
-		}
+	for _, line := range sandboxSummary(sandboxHelper, sandboxed, report) {
+		InfoLogger.Printf("[%s] video: %s", botID, line)
 	}
 	if toolMemoryCapped && !report.OOMScoreAdj {
 		InfoLogger.Printf("[%s] video: oom_score_adj could not be set; under memory pressure the OOM killer may pick the bot before ffmpeg", botID)

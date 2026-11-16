@@ -148,6 +148,19 @@ func stubGate(t *testing.T, probe func() (int, error), selfTest func(context.Con
 	}
 }
 
+// assertSandboxLines checks that a gate which turned video on logged the
+// sandbox's layers (layers, a prefix of that line) and its gaps; off Linux,
+// that there is no sandbox (Ruling 19 item 8).
+func assertSandboxLines(t *testing.T, logged, layers string) {
+	t.Helper()
+	if !sandboxHelper {
+		assert.Contains(t, logged, "[video_gate_bot] video: there is no sandbox on this OS: ffmpeg can do anything the bot's user can")
+		return
+	}
+	assert.Contains(t, logged, layers)
+	assert.Contains(t, logged, "[video_gate_bot] video: the sandbox does not cover ")
+}
+
 // onPath skips the test unless ffmpeg and ffprobe are on PATH. Unlike
 // requireFFmpeg it leaves the unsandboxed switch alone: the gate sets it.
 func onPath(t *testing.T) {
@@ -218,10 +231,12 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		assert.True(t, b.videoOn(), "the opt-out runs ffmpeg without the sandbox")
 		assert.True(t, unsandboxedAllowed())
 		assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a full sandbox (simulated: no Landlock)")
+		assert.Contains(t, warned.String(), "read, write and run any file", "not only read (Ruling 19 item 8)")
 		// Only the gate's probe is simulated: on a host with Landlock the
 		// helper still applies it, but the gate says "sandbox on" only when it
-		// found a sandbox.
+		// found a sandbox. Its layers and gaps are logged all the same.
 		assert.NotContains(t, logged.String(), "ffmpeg sandbox on")
+		assertSandboxLines(t, logged.String(), "[video_gate_bot] video: ffmpeg partial sandbox (")
 	})
 
 	// Ruling 15: Landlock below ABI 3 cannot deny truncation, so it counts as
@@ -241,7 +256,38 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		b = videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
 		assert.True(t, b.videoOn())
 		assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a full sandbox (the kernel's Landlock ABI 2 cannot deny file truncation")
+		if sandboxHelper {
+			assert.Contains(t, warned.String(), "could empty any file the bot's user can write")
+		}
 		assert.NotContains(t, logged.String(), "ffmpeg sandbox on")
+		assertSandboxLines(t, logged.String(), "[video_gate_bot] video: ffmpeg partial sandbox (")
+	})
+
+	// Landlock without the seccomp filter (a kernel or container profile
+	// without seccomp) is no sandbox either; the opt-out logs what only the
+	// filter would close.
+	t.Run("no seccomp filter: off without allow_unsandboxed, on with it", func(t *testing.T) {
+		onPath(t)
+		stubGate(t, func() (int, error) { return 7, fmt.Errorf("%w: seccomp: invalid argument", errNoSeccomp) },
+			func(context.Context, string, bool) (sandboxReport, error) {
+				return sandboxReport{ABI: 7, OOMScoreAdj: true, TaskCap: true, NoCapabilities: true}, nil
+			})
+		reset()
+		b := videoGateBot(t, setupTestDB(t), &VideoConfig{})
+		assert.False(t, b.videoOn())
+		assert.Contains(t, logged.String(), "[video_gate_bot] video: no sandbox for ffmpeg (no seccomp filter: seccomp: invalid argument); video watching is off")
+
+		reset()
+		b = videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
+		assert.True(t, b.videoOn())
+		assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a full sandbox (no seccomp filter")
+		if sandboxHelper {
+			assert.Contains(t, warned.String(), "could use what only the seccomp filter closes")
+			assert.Contains(t, logged.String(), "[video_gate_bot] video: ffmpeg partial sandbox (Landlock ABI 7, no seccomp filter, task cap)\n")
+			assert.Contains(t, logged.String(), "[video_gate_bot] video: the sandbox does not cover pathname unix sockets (ABI 9); UDP (ABI 10); "+gapFilterOnly)
+		}
+		assertSandboxLines(t, logged.String(), "[video_gate_bot] video: ffmpeg partial sandbox (")
+		unsandboxedGrants.Add(-1)
 	})
 
 	// Any self-test failure turns video off, and the log carries the tool's
@@ -312,8 +358,14 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		assert.True(t, b.videoOn())
 		assert.Equal(t, []bool{true, false}, demanded, "the full self-test, then the one without the demand")
 		assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a full sandbox (sandbox check: the task cap")
-		assert.Contains(t, warned.String(), "start threads until the bot's user or the host runs out of them")
+		assert.Contains(t, warned.String(), "start threads until the host, or a container's pids limit, runs out of them")
 		assert.NotContains(t, logged.String(), "ffmpeg sandbox on")
+		if sandboxHelper {
+			assert.Contains(t, logged.String(),
+				"[video_gate_bot] video: ffmpeg partial sandbox (Landlock ABI 7, seccomp filter, no task cap: run the bot as a non-root user)\n")
+			assert.Contains(t, logged.String(), "[video_gate_bot] video: the sandbox does not cover "+gapAlways+"; "+gapThreads+"\n")
+		}
+		assertSandboxLines(t, logged.String(), "[video_gate_bot] video: ffmpeg partial sandbox (")
 		assert.Equal(t, before+1, unsandboxedGrants.Load(), "the opt-out's grant")
 		unsandboxedGrants.Add(-1)
 	})
@@ -388,32 +440,106 @@ func TestSandboxUsable(t *testing.T) {
 	assert.Equal(t, probe, sandboxUsable(0, probe), "no Landlock stays the probe's own reason")
 }
 
-// What neither layer covers (Ruling 18 item 4): each ABI's gaps without the
-// seccomp filter, with what only the filter could deny; with it, from ABI
-// 3, only what no layer covers: file metadata, and the parent-death signal,
-// which a tool can drop by exec from a new thread whatever the filter
-// allows (Ruling 19 item 1); and without Landlock, files.
-func TestSandboxGaps(t *testing.T) {
-	const always = "file metadata (stat: whether a path exists, sizes, times); " +
+// The gaps, by text, so that a change to the list shows here. Each part is
+// what one layer, or none, leaves open (Rulings 18 item 4, 19 items 1, 2
+// and 8).
+const (
+	gapFiles = "files: reading, writing and running any the bot's user may, /proc/<bot>/environ (any token in the bot's environment) " +
+		"among them, and /proc/<bot>/mem where Yama's ptrace_scope is 0 (ABI 1)"
+	gapFilterOnly = "other processes' resource limits, priority and CPU affinity; " +
+		"file metadata changes (mode, owner, times, extended attributes); SysV IPC, inotify and fanotify; " +
+		"ioctl requests (TIOCSTI among them), priority-inheriting futexes and other prctl options; " +
+		"every other system call (new processes, ptrace, namespaces, io_uring, bpf); "
+	gapAlways = "file and process metadata (stat: whether a path exists, its size and times, and through /proc/<pid> whether a process does); " +
+		"readlink targets and statfs; " +
 		"the parent-death signal, which a thread the tool starts drops by exec: while the bot lives a timeout still kills the tool's group, " +
 		"but a tool that outlives a dead bot, still sandboxed, ends only with Docker's PID namespace or a systemd unit's control-group kill"
-	const filterOnly = "other processes' resource limits, priority and CPU affinity; " +
-		"file metadata changes (mode, owner, times, extended attributes); SysV IPC, inotify and fanotify; " +
-		"every other system call (new processes, namespaces, io_uring, bpf); "
-	assert.Equal(t, "TCP (ABI 4); abstract unix sockets and signals (ABI 6); pathname unix sockets (ABI 9); UDP (ABI 10); "+
-		filterOnly+always, sandboxGaps(3, false))
-	assert.Equal(t, "abstract unix sockets and signals (ABI 6); pathname unix sockets (ABI 9); UDP (ABI 10); "+filterOnly+always,
-		sandboxGaps(4, false))
-	assert.Equal(t, "pathname unix sockets (ABI 9); UDP (ABI 10); "+filterOnly+always, sandboxGaps(7, false))
-	assert.Equal(t, "UDP (ABI 10); "+filterOnly+always, sandboxGaps(9, false))
-	assert.Equal(t, filterOnly+always, sandboxGaps(10, false))
+	gapPool = "the user's task pool: RLIMIT_NPROC counts every task of the bot's user, so a compromised tool can take what is left of it " +
+		"and make other chats' concurrent runs fail while it runs"
+	gapThreads = "threads: RLIMIT_NPROC does not bind the bot's user (root), so a tool can start them until the host, " +
+		"or a container's pids limit, runs out"
+)
+
+// What the layers leave open, in every mode that runs video: the full
+// sandbox names only what no layer covers, the shared task pool among them;
+// each partial one adds what its missing layer would close.
+func TestSandboxGaps(t *testing.T) {
+	full := gapAlways + "; " + gapPool
 	for _, abi := range []int{3, 4, 7, 10} {
-		assert.Equal(t, always, sandboxGaps(abi, true), "ABI %d with the filter", abi)
+		assert.Equal(t, full, sandboxGaps(sandboxReport{ABI: abi, Seccomp: true, TaskCap: true}), "ABI %d with the filter", abi)
 	}
-	assert.Equal(t, "file truncation (ABI 3); "+always, sandboxGaps(2, true))
-	assert.Equal(t, "files (reading, writing and running any the user may) (ABI 1); file truncation (ABI 3); "+always,
-		sandboxGaps(0, true), "the filter alone, under video.allow_unsandboxed")
-	for _, gaps := range []string{sandboxGaps(3, true), sandboxGaps(0, true)} {
+	// Without the filter (Landlock from ABI 3, under the opt-out).
+	assert.Equal(t, "TCP (ABI 4); abstract unix sockets and signals (ABI 6); pathname unix sockets (ABI 9); UDP (ABI 10); "+
+		gapFilterOnly+full, sandboxGaps(sandboxReport{ABI: 3, TaskCap: true}))
+	assert.Equal(t, "abstract unix sockets and signals (ABI 6); pathname unix sockets (ABI 9); UDP (ABI 10); "+gapFilterOnly+full,
+		sandboxGaps(sandboxReport{ABI: 4, TaskCap: true}))
+	assert.Equal(t, "pathname unix sockets (ABI 9); UDP (ABI 10); "+gapFilterOnly+full, sandboxGaps(sandboxReport{ABI: 7, TaskCap: true}))
+	assert.Equal(t, "UDP (ABI 10); "+gapFilterOnly+full, sandboxGaps(sandboxReport{ABI: 9, TaskCap: true}))
+	assert.Equal(t, gapFilterOnly+full, sandboxGaps(sandboxReport{ABI: 10, TaskCap: true}))
+	// Landlock below ABI 3, with the filter.
+	assert.Equal(t, "file truncation (ABI 3); "+full, sandboxGaps(sandboxReport{ABI: 2, Seccomp: true, TaskCap: true}))
+	// Without Landlock: the filter alone, then nothing but the limits.
+	assert.Equal(t, gapFiles+"; file truncation (ABI 3); "+full, sandboxGaps(sandboxReport{Seccomp: true, TaskCap: true}),
+		"the filter alone, under video.allow_unsandboxed")
+	assert.Equal(t, gapFiles+"; file truncation (ABI 3); TCP (ABI 4); abstract unix sockets and signals (ABI 6); "+
+		"pathname unix sockets (ABI 9); UDP (ABI 10); "+gapFilterOnly+full, sandboxGaps(sandboxReport{TaskCap: true}))
+	// A task cap that binds no user (root, under the opt-out).
+	assert.Equal(t, gapAlways+"; "+gapThreads, sandboxGaps(sandboxReport{ABI: 7, Seccomp: true}))
+	for _, gaps := range []string{sandboxGaps(sandboxReport{ABI: 3, Seccomp: true}), sandboxGaps(sandboxReport{Seccomp: true})} {
 		assert.NotContains(t, gaps, "signals;")
+	}
+}
+
+// The gate's log lines about the sandbox, in every mode that runs video
+// (Ruling 19 item 8): the layers in place, then what they leave open; off
+// Linux, that there is none.
+func TestSandboxSummary(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		helper, full bool
+		report       sandboxReport
+		first        string
+	}{
+		{"full", true, true, sandboxReport{ABI: 7, Seccomp: true, TaskCap: true}, "ffmpeg sandbox on (Landlock ABI 7, seccomp filter)"},
+		{"no Landlock", true, false, sandboxReport{Seccomp: true, TaskCap: true}, "ffmpeg partial sandbox (no Landlock, seccomp filter, task cap)"},
+		{"Landlock ABI 2", true, false, sandboxReport{ABI: 2, Seccomp: true, TaskCap: true},
+			"ffmpeg partial sandbox (Landlock ABI 2, seccomp filter, task cap)"},
+		{"no filter", true, false, sandboxReport{ABI: 7, TaskCap: true}, "ffmpeg partial sandbox (Landlock ABI 7, no seccomp filter, task cap)"},
+		{"neither", true, false, sandboxReport{TaskCap: true}, "ffmpeg partial sandbox (no Landlock, no seccomp filter, task cap)"},
+		{"root", true, false, sandboxReport{ABI: 7, Seccomp: true},
+			"ffmpeg partial sandbox (Landlock ABI 7, seccomp filter, no task cap: run the bot as a non-root user)"},
+	} {
+		assert.Equal(t, []string{tc.first, "the sandbox does not cover " + sandboxGaps(tc.report)},
+			sandboxSummary(tc.helper, tc.full, tc.report), tc.name)
+	}
+	assert.Equal(t, []string{"there is no sandbox on this OS: ffmpeg can do anything the bot's user can, reading, writing and running any file and using the network"},
+		sandboxSummary(false, false, sandboxReport{}), "off Linux, under the opt-out")
+}
+
+// The opt-out's warning says what a video that exploits ffmpeg could do for
+// want of the missing layer: without Landlock, read, write and run files,
+// not only read them (Ruling 19 item 8).
+func TestUnsandboxedHarm(t *testing.T) {
+	const files = "read, write and run any file the bot's user can (every bot's token, the chat database, other chats' media)"
+	const truncate = "empty any file the bot's user can write (the chat database, stored videos, a writable config)"
+	const filter = "use what only the seccomp filter closes, as the gaps line lists (other processes, SysV IPC, ptrace, " +
+		"the sockets its Landlock ABI allows)"
+	noFilter := fmt.Errorf("%w: seccomp: invalid argument", errNoSeccomp)
+	for _, tc := range []struct {
+		name   string
+		helper bool
+		abi    int
+		why    error
+		want   string
+	}{
+		{"off Linux", false, 0, errors.New("no Landlock: it is Linux-only"),
+			"do anything the bot's user can: read, write and run any file (every bot's token, the chat database, other chats' media) and use the network"},
+		{"no Landlock", true, 0, errors.New("no Landlock: landlock_create_ruleset: function not implemented"), files},
+		{"Landlock ABI 2", true, 2, sandboxUsable(2, nil), truncate},
+		{"no filter", true, 7, noFilter, filter},
+		{"Landlock ABI 2, no filter", true, 2, noFilter, truncate + "; and " + filter},
+		{"root", true, 7, fmt.Errorf("sandbox check: %w", errTaskCapUnbound), "start threads until the host, or a container's pids limit, runs out of them"},
+	} {
+		assert.Equal(t, tc.want, unsandboxedHarm(tc.helper, tc.abi, tc.why), tc.name)
 	}
 }
