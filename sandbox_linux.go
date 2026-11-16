@@ -766,7 +766,9 @@ var botDirs = func() ([]string, error) {
 
 // sandboxSparesBot says why the sandbox would let a tool read the bot's own
 // files, or returns nil: a bot directory beneath a directory the system rules
-// grant to every tool (/usr, /lib, /lib64) would be open to all of them, the
+// grant to every tool (the library, font and fontconfig directories:
+// /lib, /lib64, /usr/lib, /usr/lib64, /usr/local/lib, /usr/share/fonts,
+// /usr/share/fontconfig, /etc/fonts) would be open to all of them, the
 // tokens and the chat database included (review Minor 5). Links are followed
 // on both sides, so /lib on a merged-/usr system counts as /usr/lib.
 func sandboxSparesBot() error {
