@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"io/fs"
 	"log"
 	"math"
 	"math/rand/v2"
@@ -324,6 +325,82 @@ func TestMagicDemuxer(t *testing.T) {
 	}
 }
 
+// The probe's own failures to read its input are not the media's
+// (Ruling 21 item 5): a missing file, a path that is not a regular file
+// (refused by Lstat before any open, so a FIFO cannot hang it), or a read
+// that fails is errMediaUnreadable, wrapping the cause. Only a file too
+// short for the magic, or a magic no listed format matches, is
+// errUnsupportedMedia. None of it runs a tool.
+func TestProbeDemuxer_ErrorClasses(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	formats := kindFormats["document"]
+	unreadable := map[string]string{
+		"missing":     filepath.Join(t.TempDir(), "media"),
+		"a directory": t.TempDir(),
+	}
+	if runtime.GOOS != "windows" {
+		target := textFixture(t, "media", "GIF89a\x10\x00\x10\x00\x00\x00")
+		link := filepath.Join(t.TempDir(), "media")
+		require.NoError(t, os.Symlink(target, link))
+		unreadable["a symlink to a GIF"] = link
+		unreadable["a character device"] = os.DevNull
+	}
+	for name, path := range unreadable {
+		_, err := probeDemuxer(path, formats)
+		assert.ErrorIs(t, err, errMediaUnreadable, name)
+		assert.NotErrorIs(t, err, errUnsupportedMedia, name)
+	}
+	_, err := probeDemuxer(filepath.Join(t.TempDir(), "media"), formats)
+	assert.ErrorIs(t, err, fs.ErrNotExist, "the cause is wrapped")
+
+	for name, content := range map[string]string{
+		"empty":            "",
+		"11 bytes":         "GIF89a\x10\x00\x10\x00\x00",
+		"no known magic":   "RIFF\x24\x00\x00\x00WAVEfmt ",
+		"gif for no gif":   "GIF89a\x10\x00\x10\x00\x00\x00",
+		"a matching magic": "GIF89a\x10\x00\x10\x00\x00\x00",
+	} {
+		formats := formats
+		if name == "gif for no gif" {
+			formats = kindFormats["video"]
+		}
+		demuxer, err := probeDemuxer(textFixture(t, "media", content), formats)
+		if name == "a matching magic" {
+			assert.NoError(t, err)
+			assert.Equal(t, "gif", demuxer)
+			continue
+		}
+		assert.ErrorIs(t, err, errUnsupportedMedia, name)
+		assert.NotErrorIs(t, err, errMediaUnreadable, name)
+	}
+}
+
+// A tool's exit status 125 is the sandbox helper's refusal, a bot-side
+// condition, wherever a helper runs (errSandboxRefused); neither ffmpeg nor
+// ffprobe exits with it (Ruling 21 item 5). Any other failure, and 125 where
+// the tool runs directly, is errToolFailed.
+func TestToolFailure_SandboxRefusal(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	exit := func(code int) error {
+		cmd := exec.Command("sh", "-c", fmt.Sprintf("exit %d", code))
+		if runtime.GOOS == "windows" {
+			cmd = exec.Command("cmd", "/c", fmt.Sprintf("exit %d", code))
+		}
+		err := cmd.Run()
+		require.Error(t, err)
+		return &toolError{tool: "ffprobe", err: err}
+	}
+	refused := toolFailure(exit(sandboxExitCode))
+	if sandboxHelper {
+		assert.ErrorIs(t, refused, errSandboxRefused, "the helper's own exit status")
+		assert.NotErrorIs(t, refused, errToolFailed, "not the tool's failure")
+	} else {
+		assert.ErrorIs(t, refused, errToolFailed, "no helper runs here: 125 is the tool's")
+	}
+	failed := toolFailure(exit(1))
+	assert.ErrorIs(t, failed, errToolFailed)
+	assert.NotErrorIs(t, failed, errSandboxRefused)
+	assert.NotErrorIs(t, failed, errUnsupportedMedia)
+}
+
 // MP4 and QuickTime files may start with other boxes than ftyp (Ruling 21
 // item 4): a uuid or junk box before a plain MP4, legacy QuickTime's pnot
 // and PICT preview, and, in fragmented MP4, styp and sidx. All still pin
@@ -455,8 +532,6 @@ func TestProbeMedia_RefusedByMagicWithoutARun(t *testing.T) { //NOSONAR go:S100 
 		{"mpegts", "video", ffmpegFixture(t, append(clip, "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-f", "mpegts")...)},
 		{"11 bytes of an mp4", "document", textFixture(t, "media", string(head[:probeMagicLen-1]))},
 		{"empty", "document", textFixture(t, "media", "")},
-		{"a directory", "document", t.TempDir()},
-		{"missing", "document", filepath.Join(t.TempDir(), "media")},
 		{"gif as sticker", "sticker", gif},
 		{"mp4 as sticker", "sticker", mp4},
 		{"gif as video", "video", gif},
@@ -1003,6 +1078,7 @@ func TestRunTool_NeedsASandbox(t *testing.T) { //NOSONAR go:S100 -- underscore s
 		if taskCapUnboundHere(t) {
 			assert.ErrorAs(t, err, new(*toolError), "the helper refuses the run")
 			assert.Contains(t, toolStderr(err), errTaskCapUnbound.Error(), "as root the sandbox is not whole")
+			assert.ErrorIs(t, toolFailure(err), errSandboxRefused, "a refusal, not the tool's failure (Ruling 21 item 5)")
 			return
 		}
 		assert.NoError(t, err, "inside Landlock")

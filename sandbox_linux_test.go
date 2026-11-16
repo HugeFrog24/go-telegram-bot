@@ -858,6 +858,56 @@ func TestNewBot_VideoGate_TaskCapUnbound(t *testing.T) { //NOSONAR go:S100 -- un
 	assert.Contains(t, logged.String(), "[video_gate_bot] video: the sandbox does not cover "+gapAlways+"; "+gapThreads+"\n")
 }
 
+// A FIFO at the probe's path is refused before any open, which would wait
+// for a writer that never comes, and a regular file whose read fails
+// (/proc/self/mem at address 0: EIO) is the bot's I/O failure, not the
+// media's (Ruling 21 item 5).
+func TestProbeDemuxer_FIFOAndReadError(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	fifo := filepath.Join(t.TempDir(), "media")
+	require.NoError(t, unix.Mkfifo(fifo, 0o600))
+	done := make(chan error, 1)
+	go func() {
+		_, err := probeDemuxer(fifo, kindFormats["document"])
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, errMediaUnreadable, "a FIFO is not a regular file")
+	case <-time.After(5 * time.Second):
+		// Unblock the open, so the goroutine ends.
+		if w, err := os.OpenFile(fifo, os.O_WRONLY|unix.O_NONBLOCK, 0); err == nil {
+			_ = w.Close()
+		}
+		t.Fatal("the probe hung opening a FIFO")
+	}
+
+	_, err := probeDemuxer("/proc/self/mem", kindFormats["document"])
+	assert.ErrorIs(t, err, errMediaUnreadable, "a failed read is the bot's")
+	assert.ErrorIs(t, err, unix.EIO, "and wraps the cause")
+	assert.NotErrorIs(t, err, errUnsupportedMedia)
+}
+
+// The real helper's refusal, its exit status 125, is errSandboxRefused: here
+// a spec the helper cannot parse (Ruling 21 item 5).
+func TestRunTool_HelperRefusal(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	allowUnsandboxedWhereNeeded(t)
+	sleep, err := lookupTool("sleep")
+	require.NoError(t, err)
+	_, err = runToolCmd(context.Background(), "sleep", func(ctx context.Context) (*exec.Cmd, error) {
+		cmd, err := newToolCmd(ctx, sleep, inputDir(t), "", []string{"1"})
+		if err == nil {
+			cmd.Args[2] = "{not a spec"
+		}
+		return cmd, err
+	})
+	var te *toolError
+	require.ErrorAs(t, err, &te)
+	assert.Contains(t, te.Stderr(), "media sandbox: ")
+	err = toolFailure(err)
+	assert.ErrorIs(t, err, errSandboxRefused)
+	assert.NotErrorIs(t, err, errToolFailed)
+}
+
 // The task count is probed in a child of its own: the caller's RLIMIT_NPROC
 // never drops to the user's count, where its Go runtime could not start a
 // thread. A limit of 1 never lets a probe fork (it is one of the user's

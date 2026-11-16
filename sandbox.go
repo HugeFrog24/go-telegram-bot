@@ -27,6 +27,20 @@ const mediaSandboxArg = "__media_sandbox"
 // the tool.
 const sandboxExitCode = 125
 
+// errSandboxRefused means the sandbox helper refused or failed to run the
+// tool, exiting with sandboxExitCode (Ruling 21 item 5): a bot-side
+// condition, such as a layer it was told to apply and could not, a task cap
+// that binds no user without the opt-out, or the bot gone, and never the
+// media's. Callers must not hold it against the file, and a retry helps
+// only once the bot's environment has changed.
+//
+// The exit status is the helper's alone. ffprobe exits 0 or 1. ffmpeg exits
+// 0, 1, 69, 123, 255 or the low byte of the AVERROR main returns, which is
+// 125 only for AVERROR(ENOTRECOVERABLE); in the 8.1.3 and 6.1.1 sources only
+// the libcelt decoder returns that, and neither the Alpine nor the Ubuntu
+// build has it, nor does any whitelist list it.
+var errSandboxRefused = errors.New("the sandbox refused the run")
+
 // unsandboxedGrants counts the bots whose gate lets tools run without the
 // Landlock sandbox: video.allow_unsandboxed where the kernel or OS has none.
 // While it is 0 no tool runs without the sandbox (errNoSandbox). A gate whose

@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -125,8 +126,16 @@ var (
 	// or the run, which a retry can get past: a thread it could not start
 	// while other runs held the user's shared task cap (Ruling 19 item 2).
 	// The exit status alone cannot tell them apart, and stderr is never
-	// parsed.
+	// parsed. So callers must never cache it as the file being unsupported,
+	// since a good file fails the same way when a run is starved, and must
+	// never retry it unboundedly, since a file can make every run fail
+	// (Ruling 21 item 5). The helper's own refusal is errSandboxRefused.
 	errToolFailed = errors.New("the tool failed")
+	// errMediaUnreadable means the probe could not stat, open or read its
+	// own input (a missing download, EMFILE, EIO), or the path is not a
+	// regular file: a bot-side condition, never the media's (Ruling 21 item
+	// 5). It wraps the cause.
+	errMediaUnreadable = errors.New("cannot read the media file")
 	// errToolOutputTooLarge means a run wrote more than toolOutputLimit to stdout.
 	errToolOutputTooLarge = errors.New("output over the limit")
 )
@@ -167,9 +176,10 @@ func extForFormat(format string) string {
 // kind: "video", "animation", "video_note", "document" or "sticker"), with
 // -f pinned to the demuxer the file's first bytes name (probeDemuxer), then
 // checks the result in Go. Anything the checks refuse, the first bytes
-// included, is errUnsupportedMedia, an ffprobe failure (a whitelist refusal
-// among them) errToolFailed; a timeout or cancellation is the context's
-// error.
+// included, is errUnsupportedMedia; a path it cannot read
+// errMediaUnreadable; an ffprobe failure (a whitelist refusal among them)
+// errToolFailed; the sandbox helper's refusal errSandboxRefused; a timeout
+// or cancellation the context's error.
 func probeMedia(ctx context.Context, path, kind string) (mediaProbe, error) {
 	formats, ok := kindFormats[kind]
 	if !ok {
@@ -239,17 +249,35 @@ func magicDemuxer(head []byte) string {
 // bytes name (magicDemuxer), which must be on formats, the kind's
 // whitelist. Without -f, ffprobe would run every compiled-in demuxer's
 // read_probe on the untrusted bytes before the whitelist applies (Ruling 20
-// item 2). A file it cannot read that far, or whose bytes name no demuxer
-// the kind accepts, is errUnsupportedMedia, and no tool runs.
+// item 2). No tool runs when it fails. A file shorter than probeMagicLen,
+// or whose bytes name no demuxer the kind accepts, is errUnsupportedMedia.
+// A path that is not a regular file, refused by Lstat before any open so a
+// FIFO cannot hang it, and any failure to stat, open or read it, are
+// errMediaUnreadable (Ruling 21 item 5).
 func probeDemuxer(abs string, formats []string) (string, error) {
-	f, err := os.Open(abs) // #nosec G304 -- the bot's own download, the path ffprobe would get
+	info, err := os.Lstat(abs)
 	if err != nil {
-		return "", fmt.Errorf("%w: %w", errUnsupportedMedia, err)
+		return "", fmt.Errorf("%w: %w", errMediaUnreadable, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%w: not a regular file (%v)", errMediaUnreadable, info.Mode().Type())
+	}
+	// O_NONBLOCK: should the path turn into a FIFO after the Lstat, the open
+	// does not wait for a writer; the check after it refuses the swap.
+	f, err := os.OpenFile(abs, os.O_RDONLY|syscall.O_NONBLOCK, 0) // #nosec G304 -- the bot's own download, the path ffprobe would get
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", errMediaUnreadable, err)
 	}
 	defer func() { _ = f.Close() }()
+	if opened, err := f.Stat(); err != nil || !os.SameFile(info, opened) {
+		return "", fmt.Errorf("%w: the file changed as it was opened (%w)", errMediaUnreadable, err)
+	}
 	head := make([]byte, probeMagicLen)
-	if _, err := io.ReadFull(f, head); err != nil {
-		return "", fmt.Errorf("%w: reading its first %d bytes: %w", errUnsupportedMedia, probeMagicLen, err)
+	switch _, err := io.ReadFull(f, head); {
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "", fmt.Errorf("%w: shorter than %d bytes", errUnsupportedMedia, probeMagicLen)
+	case err != nil:
+		return "", fmt.Errorf("%w: reading its first %d bytes: %w", errMediaUnreadable, probeMagicLen, err)
 	}
 	demuxer := magicDemuxer(head)
 	switch {
@@ -427,15 +455,20 @@ func tagDuration(tag string) (float64, bool) {
 	return d, d > 0
 }
 
-// toolFailure turns a run that ffprobe/ffmpeg itself failed into
-// errToolFailed. Timeouts, cancellation, the output bound and a missing tool
-// stay what they are.
+// toolFailure turns a run that failed in the tool into errToolFailed, and
+// one the sandbox helper refused, its exit status sandboxExitCode wherever a
+// helper runs, into errSandboxRefused (Ruling 21 item 5). Timeouts,
+// cancellation, the output bound and a missing tool stay what they are.
 func toolFailure(err error) error {
 	var te *toolError
-	if errors.As(err, &te) {
-		return fmt.Errorf("%w: %w", errToolFailed, err)
+	if !errors.As(err, &te) {
+		return err
 	}
-	return err
+	var exit *exec.ExitError
+	if sandboxHelper && errors.As(te.err, &exit) && exit.ExitCode() == sandboxExitCode {
+		return fmt.Errorf("%w: %w", errSandboxRefused, err)
+	}
+	return fmt.Errorf("%w: %w", errToolFailed, err)
 }
 
 // toolRun is one ffprobe or ffmpeg invocation for toolArgs.
@@ -572,7 +605,8 @@ type sheetPlan struct {
 // passes its context as is, and a lookup passes one made with
 // context.WithTimeout(ctx, lookupTimeout).
 //
-// A failed run is errToolFailed, a clean one with no frame errNoFrame;
+// A failed run is errToolFailed (errSandboxRefused when the helper refused
+// it), a clean one with no frame errNoFrame;
 // out-of-range input is errInvalidSheet; a timeout is the context's error.
 func renderSheet(ctx context.Context, path string, probe mediaProbe, spec sheetSpec) (jpeg []byte, frameTimes []float64, err error) {
 	plan, err := planSheet(probe, spec)
