@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -34,6 +35,49 @@ var unsandboxedTools atomic.Bool
 // errNoSandbox means a tool was not run: there is no sandbox, and no bot
 // allowed running without one.
 var errNoSandbox = errors.New("no sandbox for ffmpeg")
+
+// minSandboxABI is the oldest Landlock ABI that counts as a sandbox. Before
+// ABI 3 Landlock cannot deny truncation (kernel docs: "File truncation could
+// not be denied before the third Landlock ABI"), so a tool there could empty
+// any file the bot's user can write: the database, stored videos, a writable
+// config (Ruling 15).
+const minSandboxABI = 3
+
+// sandboxUsable turns a Landlock probe's answer into why there is no
+// sandbox, or nil: no Landlock at all, or an ABI before minSandboxABI.
+func sandboxUsable(abi int, err error) error {
+	if err != nil {
+		return err
+	}
+	if abi < minSandboxABI {
+		return fmt.Errorf("the kernel's Landlock ABI %d cannot deny file truncation, which takes ABI %d", abi, minSandboxABI)
+	}
+	return nil
+}
+
+// landlockGaps are what a sandbox from minSandboxABI on may still be unable
+// to deny, with the ABI that adds each.
+var landlockGaps = []struct {
+	abi  int
+	what string
+}{
+	{4, "TCP"},
+	{6, "abstract unix sockets and signals"},
+	{9, "pathname unix sockets"},
+	{10, "UDP"},
+}
+
+// sandboxGaps lists what Landlock at abi cannot deny, or "" for nothing the
+// sandbox knows of.
+func sandboxGaps(abi int) string {
+	var gaps []string
+	for _, g := range landlockGaps {
+		if abi < g.abi {
+			gaps = append(gaps, fmt.Sprintf("%s (ABI %d)", g.what, g.abi))
+		}
+	}
+	return strings.Join(gaps, ", ")
+}
 
 // sandboxReport is what the helper's check run reports to the gate.
 type sandboxReport struct {
@@ -72,8 +116,8 @@ func toolSelfTest(ctx context.Context, font string, landlock bool) (sandboxRepor
 	switch {
 	case err != nil:
 		return report, fmt.Errorf("sandbox check: %w", err)
-	case landlock && report.ABI == 0:
-		return report, errors.New("sandbox check: Landlock was not applied")
+	case landlock && report.ABI < minSandboxABI:
+		return report, fmt.Errorf("sandbox check: Landlock ABI %d or later was not applied", minSandboxABI)
 	}
 	probe, err := probeMedia(ctx, path, "animation")
 	if err != nil {

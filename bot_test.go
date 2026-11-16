@@ -183,7 +183,7 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		reset()
 		b := videoGateBot(t, setupTestDB(t), &VideoConfig{SheetFrames: 8})
 		want := VideoConfig{MaxDurationSeconds: 600, SheetFrames: 8, MaxLookups: 6, MaxFramesPerLookup: 12, RetentionHours: 24}
-		if _, err := sandboxAvailable(); err != nil {
+		if sandboxUsable(sandboxAvailable()) != nil {
 			assert.False(t, b.videoOn(), "no sandbox and no opt-out: off")
 			assert.Nil(t, b.video)
 			assert.Contains(t, logged.String(), "[video_gate_bot] video: no sandbox for ffmpeg (")
@@ -218,7 +218,29 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		assert.True(t, unsandboxedTools.Load())
 		assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a sandbox (simulated: no Landlock)")
 		// Only the gate's probe is simulated: on a host with Landlock the
-		// helper still applies it, and the gate logs what the helper reported.
+		// helper still applies it, but the gate says "sandbox on" only when it
+		// found a sandbox.
+		assert.NotContains(t, logged.String(), "ffmpeg sandbox on")
+	})
+
+	// Ruling 15: Landlock below ABI 3 cannot deny truncation, so it counts as
+	// no sandbox. The opt-out still runs the tools, through the helper,
+	// which applies what the kernel's Landlock can deny.
+	t.Run("Landlock ABI 2: off without allow_unsandboxed, on with it", func(t *testing.T) {
+		onPath(t)
+		stubGate(t, func() (int, error) { return 2, nil }, nil)
+		reset()
+		b := videoGateBot(t, setupTestDB(t), &VideoConfig{})
+		assert.False(t, b.videoOn())
+		assert.Contains(t, logged.String(),
+			"[video_gate_bot] video: no sandbox for ffmpeg (the kernel's Landlock ABI 2 cannot deny file truncation, which takes ABI 3); video watching is off")
+		assert.Empty(t, warned.String())
+
+		reset()
+		b = videoGateBot(t, setupTestDB(t), &VideoConfig{AllowUnsandboxed: true})
+		assert.True(t, b.videoOn())
+		assert.Contains(t, warned.String(), "[video_gate_bot] Warning: video: ffmpeg runs WITHOUT a sandbox (the kernel's Landlock ABI 2 cannot deny file truncation")
+		assert.NotContains(t, logged.String(), "ffmpeg sandbox on")
 	})
 
 	// Any self-test failure turns video off, and the log carries the tool's
@@ -291,4 +313,25 @@ func TestNewBot_VideoGate(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 		assert.Nil(t, b.video)
 		assert.Contains(t, logged.String(), "[video_gate_bot] video: ffmpeg/ffprobe not found on PATH; video watching is off")
 	})
+}
+
+// Ruling 15: Landlock counts as a sandbox from ABI 3, the first that can deny
+// truncation.
+func TestSandboxUsable(t *testing.T) {
+	assert.NoError(t, sandboxUsable(3, nil))
+	assert.NoError(t, sandboxUsable(7, nil))
+	for _, abi := range []int{1, 2} {
+		assert.ErrorContains(t, sandboxUsable(abi, nil), "cannot deny file truncation", "ABI %d", abi)
+	}
+	probe := errors.New("no Landlock: it is Linux-only")
+	assert.Equal(t, probe, sandboxUsable(0, probe), "no Landlock stays the probe's own reason")
+}
+
+// What each ABI from 3 on cannot deny, each with the ABI that can.
+func TestSandboxGaps(t *testing.T) {
+	assert.Equal(t, "TCP (ABI 4), abstract unix sockets and signals (ABI 6), pathname unix sockets (ABI 9), UDP (ABI 10)", sandboxGaps(3))
+	assert.Equal(t, "abstract unix sockets and signals (ABI 6), pathname unix sockets (ABI 9), UDP (ABI 10)", sandboxGaps(4))
+	assert.Equal(t, "pathname unix sockets (ABI 9), UDP (ABI 10)", sandboxGaps(7))
+	assert.Equal(t, "UDP (ABI 10)", sandboxGaps(9))
+	assert.Empty(t, sandboxGaps(10))
 }

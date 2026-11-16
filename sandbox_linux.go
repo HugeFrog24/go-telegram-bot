@@ -103,7 +103,7 @@ func newSandboxSpec(dir, font, tool string) (sandboxSpec, error) {
 		font = filepath.Clean(font) // the same file; resolveFontFile already took it
 	}
 	spec := sandboxSpec{InputDir: dir, FontFile: font, Tool: tool, MemoryLimit: toolMemoryLimit, AllowUnsandboxed: unsandboxedTools.Load()}
-	if _, err := sandboxAvailable(); err != nil && !spec.AllowUnsandboxed {
+	if err := sandboxUsable(sandboxAvailable()); err != nil && !spec.AllowUnsandboxed {
 		return spec, fmt.Errorf("%w: %w", errNoSandbox, err)
 	}
 	return spec, spec.validate()
@@ -221,7 +221,7 @@ func mediaSandbox(args []string, ppid int) error {
 // applySandbox applies, in order: the rlimits (the address-space limit
 // itself comes last, see underMemoryLimit), oom_score_adj (best effort),
 // Pdeathsig re-armed on this thread, no_new_privs, then Landlock at the best
-// ABI the kernel has. Without Landlock it fails unless the spec allows that.
+// ABI the kernel has (see sandboxABI).
 func applySandbox(spec sandboxSpec, ppid int) (sandboxReport, error) {
 	var report sandboxReport
 	if err := setToolLimits(spec.MemoryLimit); err != nil {
@@ -240,15 +240,32 @@ func applySandbox(spec sandboxSpec, ppid int) (sandboxReport, error) {
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		return report, fmt.Errorf("PR_SET_NO_NEW_PRIVS: %w", err)
 	}
-	abi, err := landlockABI()
-	if err != nil {
-		if spec.AllowUnsandboxed && errors.Is(err, errNoLandlock) {
-			return report, nil
-		}
+	kernel, err := landlockABI()
+	abi, err := sandboxABI(kernel, err, spec.AllowUnsandboxed)
+	if err != nil || abi == 0 {
 		return report, err
 	}
 	report.ABI = abi
 	return report, restrictSelf(abi, sandboxRules(spec))
+}
+
+// sandboxABI is the Landlock ABI the helper applies, from the kernel's
+// answer: its own ABI, or 0 for none. No Landlock at all, or an ABI before
+// minSandboxABI, is no sandbox and fails unless the spec allows running
+// without one; with that allowance a weak ABI still applies what it can deny
+// (Ruling 15). A Landlock that fails in any other way is never skipped.
+func sandboxABI(kernel int, err error, allowUnsandboxed bool) (int, error) {
+	switch {
+	case err != nil && allowUnsandboxed && errors.Is(err, errNoLandlock):
+		return 0, nil
+	case err != nil:
+		return 0, err
+	case !allowUnsandboxed:
+		if err := sandboxUsable(kernel, nil); err != nil {
+			return 0, err
+		}
+	}
+	return kernel, nil
 }
 
 // setToolLimits sets core and file size to 0 and open files to

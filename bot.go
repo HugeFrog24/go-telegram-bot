@@ -81,17 +81,12 @@ func resolveVideo(config *BotConfig) *VideoConfig {
 	if config.Video == nil {
 		return nil
 	}
-	for _, tool := range []string{"ffmpeg", "ffprobe"} {
-		if _, err := lookupTool(tool); err != nil {
-			InfoLogger.Printf("[%s] video: ffmpeg/ffprobe not found on PATH; video watching is off", config.ID)
-			return nil
-		}
-	}
-	if err := toolLimitsUsable(); err != nil {
+	if err := videoRunnable(); err != nil {
 		InfoLogger.Printf("[%s] video: %v; video watching is off", config.ID, err)
 		return nil
 	}
-	_, noSandbox := gateSandbox()
+	// Landlock before ABI 3 cannot deny truncation: no sandbox (Ruling 15).
+	noSandbox := sandboxUsable(gateSandbox())
 	if noSandbox != nil {
 		if !config.Video.AllowUnsandboxed {
 			InfoLogger.Printf("[%s] video: no sandbox for ffmpeg (%v); video watching is off (video.allow_unsandboxed runs ffmpeg without one)",
@@ -107,15 +102,35 @@ func resolveVideo(config *BotConfig) *VideoConfig {
 		InfoLogger.Printf("[%s] video: the ffmpeg self-test failed: %v, stderr %q; video watching is off", config.ID, err, toolStderr(err))
 		return nil
 	}
-	if report.ABI > 0 {
-		InfoLogger.Printf("[%s] video: ffmpeg sandbox on (Landlock ABI %d)", config.ID, report.ABI)
-	}
-	if toolMemoryCapped && !report.OOMScoreAdj {
-		InfoLogger.Printf("[%s] video: oom_score_adj could not be set; under memory pressure the OOM killer may pick the bot before ffmpeg", config.ID)
-	}
+	logSandbox(config.ID, noSandbox == nil, report)
 	logToolVersion(config.ID)
 	video := config.Video.withDefaults()
 	return &video
+}
+
+// videoRunnable says why no tool can run for video at all, or returns nil.
+func videoRunnable() error {
+	for _, tool := range []string{"ffmpeg", "ffprobe"} {
+		if _, err := lookupTool(tool); err != nil {
+			return errors.New("ffmpeg/ffprobe not found on PATH")
+		}
+	}
+	return toolLimitsUsable()
+}
+
+// logSandbox logs the sandbox the self-test reported: when it counts as one,
+// its ABI and, once, what that ABI cannot deny (Ruling 15); and when
+// oom_score_adj could not be set.
+func logSandbox(botID string, sandboxed bool, report sandboxReport) {
+	if sandboxed {
+		InfoLogger.Printf("[%s] video: ffmpeg sandbox on (Landlock ABI %d)", botID, report.ABI)
+		if gaps := sandboxGaps(report.ABI); gaps != "" {
+			InfoLogger.Printf("[%s] video: Landlock ABI %d cannot deny %s", botID, report.ABI, gaps)
+		}
+	}
+	if toolMemoryCapped && !report.OOMScoreAdj {
+		InfoLogger.Printf("[%s] video: oom_score_adj could not be set; under memory pressure the OOM killer may pick the bot before ffmpeg", botID)
+	}
 }
 
 // logToolVersion logs the ffmpeg version line when the gate turns video on,

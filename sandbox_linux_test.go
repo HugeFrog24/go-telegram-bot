@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -34,15 +35,17 @@ func init() {
 	}
 	testStandIns["tcp-dial"] = tcpDialStandIn
 	testStandIns["sandbox-parent"] = sandboxParentStandIn
+	testStandIns["truncate-path"] = truncatePathStandIn
 }
 
 // requireLandlock skips the test where the kernel (or a seccomp profile)
-// offers no Landlock, and returns the ABI otherwise.
+// offers no Landlock that counts as a sandbox (ABI minSandboxABI or later),
+// and returns the ABI otherwise.
 func requireLandlock(t *testing.T) int {
 	t.Helper()
 	abi, err := sandboxAvailable()
-	if err != nil {
-		t.Skipf("no Landlock here: %v", err)
+	if err := sandboxUsable(abi, err); err != nil {
+		t.Skipf("no sandbox here: %v", err)
 	}
 	t.Logf("Landlock ABI %d", abi)
 	return abi
@@ -72,6 +75,20 @@ func tcpDialStandIn(args []string) int {
 		return 3
 	}
 	_ = c.Close()
+	return 0
+}
+
+// truncatePathStandIn empties the file args[0] with truncate(2): by path,
+// opening nothing, the call Landlock denies only from ABI 3 (Ruling 15).
+// Exit 0 when it can, 3 when it cannot.
+func truncatePathStandIn(args []string) int {
+	if len(args) != 1 {
+		return 2
+	}
+	if err := syscall.Truncate(args[0], 0); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 3
+	}
 	return 0
 }
 
@@ -165,7 +182,22 @@ func TestMediaSandbox_FileAccess(t *testing.T) { //NOSONAR go:S100 -- underscore
 	requireDenied(t, out, err, "delete the input")
 	out, err = runTool(ctx, "mkdir", in, "", []string{filepath.Join(in, "d")})
 	requireDenied(t, out, err, "make a directory")
-	data, err := os.ReadFile(video) // #nosec G304 -- the test's own fixture
+
+	// Truncation, which Landlock can deny only from ABI 3 (Ruling 15): the
+	// truncate tool opens the file for writing first, so the write rule
+	// stops it too; truncate(2) by path opens nothing, so only the truncate
+	// right does. An ABI 1 or 2 kernel would let it empty the database.
+	standInTool(t, "truncate-path")
+	for _, p := range []string{db, video} {
+		out, err := runTool(ctx, "truncate", in, "", []string{"-s", "0", p})
+		requireDenied(t, out, err, "truncate -s 0 "+p)
+		out, err = runTool(ctx, "truncate-path", in, "", []string{p})
+		requireDenied(t, out, err, "truncate(2) "+p)
+	}
+	data, err := os.ReadFile(db) // #nosec G304 -- the test's own fixture
+	require.NoError(t, err)
+	assert.Equal(t, "fake chat history", string(data), "the database is unchanged")
+	data, err = os.ReadFile(video) // #nosec G304 -- the test's own fixture
 	require.NoError(t, err)
 	assert.Equal(t, "this chat's video", string(data), "the input is unchanged")
 	assert.FileExists(t, token, "the fake config is still there")
@@ -614,9 +646,9 @@ func TestNewToolCmd_Linux(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 	assert.Equal(t, []string{"--", "/abs/ffmpeg", "-version"}, cmd.Args[3:])
 	inv, err := parseSandboxArgs(cmd.Args[2:])
 	require.NoError(t, err)
-	_, lerr := sandboxAvailable()
+	noSandbox := sandboxUsable(sandboxAvailable())
 	assert.Equal(t, sandboxSpec{InputDir: dir, FontFile: "/fonts/f.ttf", Tool: "/abs/ffmpeg", MemoryLimit: toolMemoryLimit,
-		AllowUnsandboxed: lerr != nil}, inv.spec)
+		AllowUnsandboxed: noSandbox != nil}, inv.spec)
 	require.NotNil(t, cmd.SysProcAttr)
 	assert.Equal(t, syscall.SIGKILL, cmd.SysProcAttr.Pdeathsig, "SIGKILL when the bot dies")
 	assert.True(t, cmd.SysProcAttr.Setpgid, "its own process group (Ruling 12 item 5)")
@@ -637,5 +669,45 @@ func TestNewBot_VideoGateSandboxOn(t *testing.T) { //NOSONAR go:S100 -- undersco
 	b := videoGateBot(t, setupTestDB(t), &VideoConfig{})
 	assert.True(t, b.videoOn())
 	assert.Contains(t, logged.String(), fmt.Sprintf("[video_gate_bot] video: ffmpeg sandbox on (Landlock ABI %d)", abi))
+	if gaps := sandboxGaps(abi); gaps != "" {
+		assert.Contains(t, logged.String(), fmt.Sprintf("[video_gate_bot] video: Landlock ABI %d cannot deny %s\n", abi, gaps),
+			"what this ABI cannot deny is logged once")
+		assert.Equal(t, 1, strings.Count(logged.String(), "cannot deny"))
+	}
 	assert.NotContains(t, logged.String(), "oom_score_adj")
+}
+
+// The Landlock ABI the helper applies (Ruling 15): the kernel's own, but an
+// ABI below minSandboxABI is no sandbox and needs the spec's allowance, and
+// so does no Landlock at all. With the allowance a weak ABI still applies
+// what it can deny; a Landlock that fails otherwise is never skipped.
+func TestSandboxABI(t *testing.T) {
+	noLandlock := fmt.Errorf("%w: landlock_create_ruleset: %w", errNoLandlock, unix.ENOSYS)
+	broken := errors.New("landlock_create_ruleset: invalid argument")
+	for _, tc := range []struct {
+		abi     int
+		err     error
+		allow   bool
+		want    int
+		wantErr string
+	}{
+		{7, nil, false, 7, ""},
+		{3, nil, false, 3, ""},
+		{7, nil, true, 7, ""},
+		{2, nil, false, 0, "ABI 2 cannot deny file truncation"},
+		{1, nil, false, 0, "ABI 1 cannot deny file truncation"},
+		{2, nil, true, 2, ""},
+		{1, nil, true, 1, ""},
+		{0, noLandlock, true, 0, ""},
+		{0, noLandlock, false, 0, "no Landlock"},
+		{0, broken, true, 0, "invalid argument"},
+	} {
+		got, err := sandboxABI(tc.abi, tc.err, tc.allow)
+		if tc.wantErr != "" {
+			assert.ErrorContains(t, err, tc.wantErr, "%+v", tc)
+			continue
+		}
+		assert.NoError(t, err, "%+v", tc)
+		assert.Equal(t, tc.want, got, "%+v", tc)
+	}
 }

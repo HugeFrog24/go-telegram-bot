@@ -44,7 +44,7 @@ func requireFFmpeg(t *testing.T) {
 // does. Where Landlock runs it changes nothing: the helper always uses it.
 func allowUnsandboxedWhereNeeded(t *testing.T) {
 	t.Helper()
-	if _, err := sandboxAvailable(); err == nil {
+	if sandboxUsable(sandboxAvailable()) == nil {
 		return
 	}
 	prev := unsandboxedTools.Load()
@@ -638,7 +638,7 @@ func TestRunTool_NeedsASandbox(t *testing.T) { //NOSONAR go:S100 -- underscore s
 	unsandboxedTools.Store(false)
 	t.Cleanup(func() { unsandboxedTools.Store(prev) })
 	_, err := runTool(context.Background(), "ffmpeg", t.TempDir(), "", []string{"-hide_banner", "-version"})
-	if _, landlock := sandboxAvailable(); landlock == nil {
+	if sandboxUsable(sandboxAvailable()) == nil {
 		assert.NoError(t, err, "inside Landlock")
 		return
 	}
@@ -652,7 +652,7 @@ func TestRunTool_NeedsASandbox(t *testing.T) { //NOSONAR go:S100 -- underscore s
 func TestToolSelfTest(t *testing.T) {
 	requireFFmpeg(t)
 	assert.Less(t, len(selfTestGIF), 2048, "a tiny GIF")
-	_, noSandbox := sandboxAvailable()
+	noSandbox := sandboxUsable(sandboxAvailable())
 	report, err := toolSelfTest(context.Background(), "", noSandbox == nil)
 	require.NoError(t, err, "%q", toolStderr(err))
 	if runtime.GOOS != "linux" {
