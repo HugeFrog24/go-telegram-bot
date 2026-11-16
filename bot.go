@@ -492,17 +492,21 @@ func (b *Bot) stripDeadFileIDFromMemory(chatID int64, deadFileID string) {
 }
 
 // joinConversation puts a stored user message into its chat's memory once it
-// joins the conversation, and returns the copy memory holds, which carries its
-// sequence. Until then its row is aside: no turn can read, cover or answer
-// it, and no reload can load it. In one step under the memory lock, the row
-// leaves aside and takes its join time as its timestamp, later than every
-// message already in memory, so a reload keeps memory's order. A copy
-// already in memory (a row stored before rows waited aside) moves to the end
-// with a fresh sequence.
-func (b *Bot) joinConversation(message Message) Message {
-	chatMemory := b.getOrCreateChatMemory(message.ChatID)
+// joins the conversation, and reports whether it did. Until then its row is
+// aside: no turn can read, cover or answer it, and no reload can load it.
+//
+// Under the memory lock it takes its sequence and its join time as its
+// timestamp, later than every message already in memory, so a reload keeps
+// memory's order, and goes into memory; a copy already there (a row stored
+// before rows waited aside) moves to the end with a fresh sequence. The row
+// leaves aside after the lock is released, so a slow database stalls no other
+// chat's memory. If that write finds the row gone (/clear deleted it), or
+// /clear replaced the memory meanwhile, the message leaves memory again and
+// joinConversation reports false: its path ends silently.
+func (b *Bot) joinConversation(message Message) (Message, bool) {
+	b.getOrCreateChatMemory(message.ChatID)
 	b.chatMemoriesMu.Lock()
-	defer b.chatMemoriesMu.Unlock()
+	chatMemory := b.chatMemories[message.ChatID]
 	if message.ID != 0 {
 		chatMemory.Messages = slices.DeleteFunc(chatMemory.Messages, func(held Message) bool {
 			return held.ID == message.ID
@@ -510,14 +514,25 @@ func (b *Bot) joinConversation(message Message) Message {
 	}
 	message.Aside = false
 	message.Timestamp = b.stampAfter(latestTimestamp(chatMemory.Messages))
-	if message.ID != 0 {
-		err := b.db.Model(&Message{}).Where("id = ?", message.ID).
-			Updates(map[string]any{"aside": false, "timestamp": message.Timestamp}).Error
-		if err != nil {
-			ErrorLogger.Printf("[%s] joining message %d to chat %d: %v", b.config.ID, message.ID, message.ChatID, err)
-		}
+	held := b.insertLocked(chatMemory, message, len(chatMemory.Messages))
+	b.chatMemoriesMu.Unlock()
+	if message.ID == 0 {
+		return held, true
 	}
-	return b.insertLocked(chatMemory, message, len(chatMemory.Messages))
+
+	result := b.db.Model(&Message{}).Where("id = ?", message.ID).
+		Updates(map[string]any{"aside": false, "timestamp": message.Timestamp})
+	if result.Error != nil {
+		ErrorLogger.Printf("[%s] joining message %d to chat %d: %v", b.config.ID, message.ID, message.ChatID, result.Error)
+	}
+	b.chatMemoriesMu.Lock()
+	defer b.chatMemoriesMu.Unlock()
+	if (result.Error == nil && result.RowsAffected == 0) || b.chatMemories[message.ChatID] != chatMemory {
+		chatMemory.Messages = slices.DeleteFunc(chatMemory.Messages, func(m Message) bool { return m.Seq == held.Seq })
+		InfoLogger.Printf("[%s] message %d in chat %d did not join: its history was cleared", b.config.ID, message.ID, message.ChatID)
+		return Message{}, false
+	}
+	return held, true
 }
 
 // latestTimestamp is the latest Timestamp among messages, or the zero time.

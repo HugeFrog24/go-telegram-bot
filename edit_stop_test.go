@@ -19,7 +19,9 @@ func storeUserMessage(t *testing.T, b *Bot, chatID int64, telegramID int, text s
 	msg := b.createMessage(chatID, chatID, "owner", "user", text, true)
 	msg.TelegramMessageID = telegramID
 	require.NoError(t, b.storeMessage(&msg))
-	return b.joinConversation(msg)
+	joined, ok := b.joinConversation(msg)
+	require.True(t, ok)
+	return joined
 }
 
 func editUpdate(chatID int64, telegramID int, text string) *models.Update {

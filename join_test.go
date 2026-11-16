@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-telegram/bot/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // memoryCopy is the chat's memory copy of the message with database id.
@@ -90,7 +92,8 @@ func TestJoinConversation_MovesACopyAlreadyInMemoryToTheEnd(t *testing.T) { //NO
 	dropChatMemory(b, chatID)
 	later := storeUserText(t, b, chatID, "joined in between") // loads memory, with early in it
 
-	joined := b.joinConversation(early)
+	joined, ok := b.joinConversation(early)
+	require.True(t, ok)
 
 	assert.Equal(t, []string{"joined in between", "loaded before it joined"}, memoryTexts(b, chatID))
 	require.Len(t, memoryCopy(t, b, chatID, early.ID), 1, "held once")
@@ -143,4 +146,73 @@ func TestRecordTurnReply_ClockSetBackStillStampsAfterTheLastMessage(t *testing.T
 
 	dropChatMemory(b, chatID)
 	assert.Equal(t, []string{"first", "second", "answer"}, memoryTexts(b, chatID))
+}
+
+// The join's database write runs after the memory lock is released: while it
+// waits for the one connection, other chats' memory stays readable.
+func TestJoinConversation_DatabaseWaitHoldsNoMemoryLock(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	b, _ := historyTestBot(t, nil) // one database connection, as in production
+	const chatX, chatY = int64(9001), int64(9002)
+	b.getOrCreateChatMemory(chatX)
+	b.getOrCreateChatMemory(chatY)
+	msg := b.createMessage(chatX, 5, "x", "user", "hello", true)
+	msg.Aside = true
+	require.NoError(t, b.storeMessage(&msg))
+	tx := b.db.Begin() // a slow statement holding the only connection
+	require.NoError(t, tx.Error)
+
+	joined := make(chan bool, 1)
+	go func() { _, ok := b.joinConversation(msg); joined <- ok }()
+	time.Sleep(100 * time.Millisecond) // the join waits for the connection
+	readY := make(chan struct{})
+	go func() { defer close(readY); b.newestAnswerableSeqInChat(chatY) }()
+	select {
+	case <-readY:
+	case <-time.After(2 * time.Second):
+		t.Error("chat Y's memory read waited behind chat X's database write")
+	}
+	require.NoError(t, tx.Rollback().Error)
+	assert.True(t, <-joined)
+	<-readY
+}
+
+// A row /clear deleted before the message could join no longer joins: the
+// message leaves memory again and its path ends.
+func TestJoinConversation_ARowDeletedBeforeItJoinsStaysOut(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	b, _ := historyTestBot(t, nil)
+	const chatID = int64(808)
+	storeUserText(t, b, chatID, "joined before")
+	msg := b.createMessage(chatID, 555, "tester", "user", "stored, then cleared", true)
+	msg.Aside = true
+	require.NoError(t, b.storeMessage(&msg))
+	require.NoError(t, b.db.Delete(&Message{}, msg.ID).Error) // /clear's delete
+
+	_, ok := b.joinConversation(msg)
+
+	assert.False(t, ok)
+	assert.Equal(t, []string{"joined before"}, memoryTexts(b, chatID))
+}
+
+// A message whose memory /clear replaced between its insert and its write
+// does not stay in the conversation.
+func TestJoinConversation_MemoryReplacedMeanwhileEndsTheJoin(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	b, _ := historyTestBot(t, nil)
+	const chatID = int64(809)
+	b.getOrCreateChatMemory(chatID)
+	msg := b.createMessage(chatID, 555, "tester", "user", "joined as the memory was replaced", true)
+	msg.Aside = true
+	require.NoError(t, b.storeMessage(&msg))
+	var once sync.Once
+	require.NoError(t, b.db.Callback().Update().Before("gorm:update").Register("test:replace_memory", func(*gorm.DB) {
+		once.Do(func() { // /clear's swap lands between the insert and the write
+			b.chatMemoriesMu.Lock()
+			defer b.chatMemoriesMu.Unlock()
+			b.chatMemories[chatID] = &ChatMemory{Size: b.memorySize * 2}
+		})
+	}))
+
+	_, ok := b.joinConversation(msg)
+
+	assert.False(t, ok)
+	assert.Empty(t, memoryTexts(b, chatID), "the new memory never holds it")
 }

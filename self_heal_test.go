@@ -81,7 +81,9 @@ func storePhoto(t *testing.T, b *Bot, chatID int64, caption string) Message {
 	m := b.createMessage(chatID, 555, "tester", "user", caption, true)
 	m.ImageFileIDs = []string{"file_dead"}
 	require.NoError(t, b.storeMessage(&m))
-	return b.joinConversation(m)
+	joined, ok := b.joinConversation(m)
+	require.True(t, ok)
+	return joined
 }
 
 // R4 inverted: the retry after a dead file id sends the request the turn

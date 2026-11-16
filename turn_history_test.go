@@ -49,7 +49,9 @@ func storeUserText(t *testing.T, b *Bot, chatID int64, text string) Message {
 	b.getOrCreateChatMemory(chatID)
 	m := b.createMessage(chatID, 555, "tester", "user", text, true)
 	require.NoError(t, b.storeMessage(&m))
-	return b.joinConversation(m)
+	joined, ok := b.joinConversation(m)
+	require.True(t, ok)
+	return joined
 }
 
 // answerInTurn records reply as a turn's answer to everything in the chat's

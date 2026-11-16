@@ -55,7 +55,9 @@ func (b *Bot) handleVoiceMessage(ctx context.Context, message *models.Message, u
 	if err := b.db.Model(&Message{}).Where("id = ?", userMsg.ID).Update("text", transcript).Error; err != nil {
 		ErrorLogger.Printf("Error updating voice transcript in DB: %v", err)
 	}
-	b.joinConversation(userMsg)
+	if _, joined := b.joinConversation(userMsg); !joined {
+		return // /clear removed the note before it could join
+	}
 
 	// Notes show while the model works. Once it is done, notes end: one still
 	// waiting is dropped, so none first appears during speech synthesis. The
@@ -182,7 +184,9 @@ func (b *Bot) handlePhotoMessage(
 			}
 			return "", errTurnSilent
 		}
-		b.joinConversation(userMessage)
+		if _, joined := b.joinConversation(userMessage); !joined {
+			return "", errTurnSilent // /clear removed the photo before it could join
+		}
 
 		// The memory the photo just joined, which /clear may have replaced
 		// since this turn began.
@@ -453,8 +457,10 @@ func (b *Bot) handleUpdate(ctx context.Context, tgBot *bot.Bot, update *models.U
 	}
 
 	// The text passed the command and rate-limit checks: it joins the
-	// conversation.
-	b.joinConversation(userMsg)
+	// conversation, unless /clear removed it first.
+	if _, joined := b.joinConversation(userMsg); !joined {
+		return
+	}
 	req := turnRequest{
 		ctx: ctx, chatID: chatID, userID: userID, isEmojiOnly: isOnlyEmojis(text),
 		username: username, firstName: firstName, lastName: lastName,
@@ -681,7 +687,9 @@ func (b *Bot) sendRateLimitExceededMessage(ctx context.Context, to replyTarget) 
 func (b *Bot) runStickerTurn(ctx context.Context, to replyTarget, userMsg Message, message *models.Message) {
 	turn, turnCtx := b.beginTurn(ctx, to.chatID)
 	defer b.endTurn(turn)
-	b.joinConversation(userMsg)
+	if _, joined := b.joinConversation(userMsg); !joined {
+		return // /clear removed the sticker before it could join
+	}
 	contextMessages := b.snapshotForTurn(turn, b.getOrCreateChatMemory(to.chatID))
 	b.handleStickerMessage(turnCtx, turn, to, userMsg, message, contextMessages)
 }
