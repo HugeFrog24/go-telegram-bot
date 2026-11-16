@@ -64,8 +64,8 @@ var (
 		"rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "sched_yield", "set_robust_list", "set_tid_address",
 		"sigaltstack", "statfs", "statx", "write", "writev",
 	}
-	wantSeccompChecked = []string{"clone", "fcntl", "futex", "ioctl", "kill", "prctl", "prlimit64", "rt_sigqueueinfo",
-		"rt_tgsigqueueinfo", "sched_getaffinity", "tgkill", "tkill"}
+	wantSeccompChecked = []string{"clone", "fcntl", "futex", "ioctl", "kill", "prctl", "prlimit64",
+		"sched_getaffinity", "tgkill", "tkill"}
 	wantSeccompAMD64Extra = []string{"access", "arch_prctl", "dup2", "lstat", "open", "readlink", "stat", "time"}
 )
 
@@ -105,6 +105,18 @@ func testSeccompFilter(t *testing.T, arch seccompArch) {
 	prog, err := seccompProgram(arch, self)
 	require.NoError(t, err)
 	require.Less(t, len(prog), 4096, "within the kernel's BPF_MAXINSNS")
+
+	// rt_sigqueueinfo and rt_tgsigqueueinfo, which queue a signal with
+	// siginfo of the caller's choosing, were never traced and are not in the
+	// filter at all (Ruling 21 item 1): ENOSYS, whatever the target. The
+	// sweep below covers them too; here they are by name.
+	queueinfo := map[uint32][]uint32{unix.AUDIT_ARCH_X86_64: {129, 297}, unix.AUDIT_ARCH_AARCH64: {138, 240}}[arch.audit]
+	require.Len(t, queueinfo, 2)
+	for _, n := range queueinfo {
+		for _, target := range []uint64{self, 1} {
+			assert.Equal(t, seccompENOSYS, evalSeccomp(t, prog, arch.audit, n, target, 0, 0), "call %d to %d", n, target)
+		}
+	}
 	nr := func(name string) uint32 {
 		n, err := arch.nr(name)
 		require.NoError(t, err)
@@ -154,8 +166,6 @@ func testSeccompFilter(t *testing.T, arch seccompArch) {
 		{"tgkill another process", "tgkill", []uint64{1}, seccompEPERM},
 		{"tkill its main thread", "tkill", []uint64{self}, seccompAllow},
 		{"tkill another thread", "tkill", []uint64{self + 3}, seccompEPERM},
-		{"rt_sigqueueinfo another", "rt_sigqueueinfo", []uint64{1}, seccompEPERM},
-		{"rt_tgsigqueueinfo itself", "rt_tgsigqueueinfo", []uint64{self}, seccompAllow},
 		{"prlimit64 of itself as 0", "prlimit64", []uint64{0}, seccompAllow},
 		{"prlimit64 of itself by PID", "prlimit64", []uint64{self}, seccompAllow},
 		{"prlimit64 of the bot", "prlimit64", []uint64{self - 1}, seccompEPERM},

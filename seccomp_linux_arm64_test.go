@@ -70,8 +70,6 @@ func _() {
 	_ = one[unix.SYS_KILL-129]
 	_ = one[unix.SYS_TKILL-130]
 	_ = one[unix.SYS_TGKILL-131]
-	_ = one[unix.SYS_RT_SIGQUEUEINFO-138]
-	_ = one[unix.SYS_RT_TGSIGQUEUEINFO-240]
 	_ = one[unix.SYS_PRLIMIT64-261]
 	_ = one[unix.SYS_SCHED_GETAFFINITY-123]
 	_ = one[unix.SYS_CLONE-220]

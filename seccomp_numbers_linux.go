@@ -72,8 +72,6 @@ var seccompNumbers = map[string]struct{ amd64, arm64 int32 }{
 	"kill":              {62, 129},
 	"tkill":             {200, 130},
 	"tgkill":            {234, 131},
-	"rt_sigqueueinfo":   {129, 138},
-	"rt_tgsigqueueinfo": {297, 240},
 	"prlimit64":         {302, 261},
 	"sched_getaffinity": {204, 123},
 	"clone":             {56, 220},

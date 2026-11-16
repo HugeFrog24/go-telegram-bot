@@ -113,6 +113,7 @@ var sandboxGapList = []struct {
 	{0, false, "readlink targets and statfs"},
 	{0, false, "the parent-death signal, which a thread the tool starts drops by exec: while the bot lives a timeout still kills the tool's group, " +
 		"but a tool that outlives a dead bot, still sandboxed, ends only with Docker's PID namespace or a systemd unit's control-group kill"},
+	{0, false, "the user's pending-signal quota, which the tool shares but may fill only to 64 queued signals (RLIMIT_SIGPENDING)"},
 }
 
 // The task cap's gap (Ruling 19 items 2 and 4): RLIMIT_NPROC is per user, so

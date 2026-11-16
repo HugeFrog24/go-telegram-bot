@@ -453,7 +453,8 @@ const (
 	gapAlways = "file and process metadata (stat: whether a path exists, its size and times, and through /proc/<pid> whether a process does); " +
 		"readlink targets and statfs; " +
 		"the parent-death signal, which a thread the tool starts drops by exec: while the bot lives a timeout still kills the tool's group, " +
-		"but a tool that outlives a dead bot, still sandboxed, ends only with Docker's PID namespace or a systemd unit's control-group kill"
+		"but a tool that outlives a dead bot, still sandboxed, ends only with Docker's PID namespace or a systemd unit's control-group kill; " +
+		"the user's pending-signal quota, which the tool shares but may fill only to 64 queued signals (RLIMIT_SIGPENDING)"
 	gapPool = "the user's task pool: RLIMIT_NPROC counts every task of the bot's user, so a compromised tool can take what is left of it " +
 		"and make other chats' concurrent runs fail while it runs"
 	gapThreads = "threads: RLIMIT_NPROC does not bind the bot's user (root), so a tool can start them until the host, " +

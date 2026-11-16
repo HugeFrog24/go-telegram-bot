@@ -72,8 +72,12 @@ var seccompAllowed = [][]string{
 // helper knows because it execs in place. raise(3) and abort(3) (tgkill or
 // tkill of the tool, kill of itself) and signals between its own threads
 // (tgkill) keep working. 0, which for kill(2) is the tool's process group,
-// is refused: nothing needs it.
-var seccompSelfTargets = []string{"kill", "tkill", "tgkill", "rt_sigqueueinfo", "rt_tgsigqueueinfo"}
+// is refused: nothing needs it. rt_sigqueueinfo and rt_tgsigqueueinfo,
+// which queue a signal with siginfo of the caller's choosing, are not
+// allowed at all: no trace of the matrix, the stand-ins or the check run
+// ever made either (Ruling 21 item 1). Queueing to itself, whatever the
+// call, stops at toolPendingSignals.
+var seccompSelfTargets = []string{"kill", "tkill", "tgkill"}
 
 // seccompSelfOrZero may name the tool by its PID or by 0, "this process": no
 // other process's limits or CPU affinity can be read or changed.

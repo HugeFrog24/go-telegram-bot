@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -355,6 +356,35 @@ var probeActions = map[string]func(args []string) error{
 	},
 	// pdeathsig: clear the parent-death signal, to outlive the bot.
 	"pdeathsig": func([]string) error { return unix.Prctl(unix.PR_SET_PDEATHSIG, 0, 0, 0, 0) },
+	// rt-queue <seconds>: queue SIGRTMIN+8 to its own thread, which blocks
+	// it, until the kernel refuses; print how many it queued, then hold them
+	// pending for the given seconds. tgkill to itself is all it needs.
+	"rt-queue": func(args []string) error {
+		hold, err := strconv.Atoi(args[0])
+		if err != nil {
+			return err
+		}
+		runtime.LockOSThread()
+		const sig = 42 // SIGRTMIN+8: neither the Go runtime nor libc uses it
+		var set unix.Sigset_t
+		set.Val[(sig-1)/64] |= 1 << ((sig - 1) % 64)
+		if err := unix.PthreadSigmask(unix.SIG_BLOCK, &set, nil); err != nil {
+			return err
+		}
+		pid, tid, queued := unix.Getpid(), unix.Gettid(), 0
+		for queued < 1<<20 {
+			if err := unix.Tgkill(pid, tid, sig); err != nil {
+				if !errors.Is(err, unix.EAGAIN) {
+					return err
+				}
+				break
+			}
+			queued++
+		}
+		fmt.Println(queued)
+		time.Sleep(time.Duration(hold) * time.Second)
+		return nil
+	},
 	// mlock <bytes>: lock that much of its own memory, as libgcrypt locks
 	// 16 KiB of secure memory on Ubuntu.
 	"mlock": func(args []string) error {
@@ -990,6 +1020,47 @@ func TestKernelUIDTasks_Terminates(t *testing.T) { //NOSONAR go:S100 -- undersco
 	assert.LessOrEqual(t, *calls, maxTaskProbes)
 }
 
+// A tool can fill only 64 of its user's pending-signal quota (Ruling 21
+// item 1). The quota is per kernel uid, shared with the bot, the host and
+// other containers (and root's under the root opt-out); the kernel compares
+// the user's count with the receiver's RLIMIT_SIGPENDING, so a tool that
+// queues real-time signals to itself stops there. Without the cap the blind
+// re-check queued 127,717, after which timer_create failed in every other
+// process of the user. Here the stand-in queues until refused and holds
+// them, and meanwhile this process, of the same uid, creates a POSIX timer.
+func TestMediaSandbox_PendingSignalCap(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	allowUnsandboxedWhereNeeded(t)
+	standInTool(t, "sandbox-probe")
+	bin, err := lookupTool("sandbox-probe")
+	require.NoError(t, err)
+	cmd, err := newToolCmd(context.Background(), bin, inputDir(t), "", []string{"rt-queue", "30"})
+	require.NoError(t, err)
+	out, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	require.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	line, err := bufio.NewReader(out).ReadString('\n')
+	require.NoError(t, err, "stderr %q", stderr.String())
+	queued, err := strconv.Atoi(strings.TrimSpace(line))
+	require.NoError(t, err)
+	t.Logf("the tool queued %d signals", queued)
+	assert.LessOrEqual(t, queued, toolPendingSignals, "the tool's share of the user's quota")
+
+	// sigevent: the value (8 bytes), the signal, SIGEV_SIGNAL, and padding to 64.
+	var sev [64]byte
+	binary.NativeEndian.PutUint32(sev[8:], uint32(unix.SIGUSR1))
+	var id int32
+	_, _, errno := unix.Syscall(unix.SYS_TIMER_CREATE, uintptr(unix.CLOCK_MONOTONIC), uintptr(unsafe.Pointer(&sev[0])), uintptr(unsafe.Pointer(&id))) // #nosec G103 -- a raw system call
+	require.Zero(t, errno, "timer_create in another process of the same uid, while the tool holds its signals: %v", errno)
+	_, _, errno = unix.Syscall(unix.SYS_TIMER_DELETE, uintptr(id), 0, 0)
+	assert.Zero(t, errno)
+}
+
 // A tool may lock only 64 KiB of memory (RLIMIT_MEMLOCK, Ruling 19 item 3),
 // not all of its 1.5 GiB: libgcrypt's 16 KiB still fits (the Ubuntu
 // renders take that path on every run), 128 KiB does not.
@@ -1228,6 +1299,7 @@ func TestMediaSandbox_Limits(t *testing.T) { //NOSONAR go:S100 -- underscore sep
 	assert.Equal(t, []string{"0", "0", "bytes"}, limitFields(t, limits, "Max core file size"))
 	assert.Equal(t, []string{"0", "0", "bytes"}, limitFields(t, limits, "Max file size"))
 	assert.Equal(t, []string{"64", "64", "files"}, limitFields(t, limits, "Max open files"), "Go's exec must not restore its saved limit")
+	assert.Equal(t, []string{"64", "64", "signals"}, limitFields(t, limits, "Max pending signals"), "RLIMIT_SIGPENDING (Ruling 21 item 1)")
 	assert.Equal(t, []string{"65536", "65536", "bytes"}, limitFields(t, limits, "Max locked memory"), "RLIMIT_MEMLOCK: 64 KiB (Ruling 19 item 3)")
 	cpu := strconv.Itoa(cpuTimeLimit(context.Background())) // twice the call's timeout (Ruling 16 item 2)
 	assert.Equal(t, []string{cpu, cpu, "seconds"}, limitFields(t, limits, "Max cpu time"), "ffprobe has no -timelimit: RLIMIT_CPU covers both tools")
