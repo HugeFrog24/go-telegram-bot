@@ -243,3 +243,54 @@ The user chose, on 2026-11-16, to sandbox ffmpeg and ffprobe. This settles Rulin
 - **Fail closed by default.** If Landlock is unavailable (any non-Linux OS, or an unsupported or seccomp-blocked kernel), video watching is off. `video.allow_unsandboxed: true` opts out, with a loud boot warning; Windows development uses it.
 - **A gate self-test** checks that a read inside the input directory works, while a read outside it and any file creation both fail. It logs the result and the ABI.
 - **Still not covered:** UDP and other non-TCP sockets on ABI < 6 or so. Ptrace of the bot is blocked by Landlock's domain rules, plus `PR_SET_DUMPABLE` from Task 8.
+
+## Blind review of the sandbox: seccomp and process containment (Ruling 16)
+
+The blind review of the memory caps and Task 2b confirmed that file and secret isolation holds:
+- `config/`, `bot.db`, other chats' videos and `/proc/<bot>` are all denied.
+- Truncation is denied, and so is creating any file.
+- Only fds 0–2 leak into the tool.
+
+It also showed that on common kernels (Landlock ABI 4–7) a compromised tool can still:
+- signal or kill the bot and other same-uid processes (below ABI 6);
+- connect to same-uid pathname unix sockets (below ABI 9). Run natively, that includes the user's systemd/D-Bus bus, which is an escape.
+- send UDP;
+- open netlink sockets;
+- fork or `setsid` children that outlive the run and escape the group kill, `Pdeathsig` and the per-process caps.
+
+These items are binding for a Task 2b fix round.
+
+1. **A seccomp-BPF filter in the helper.**
+   - Install it after `no_new_privs` and Landlock, and before the exec, on the same locked thread. Build it with `x/sys/unix` only; no libseccomp.
+   - Check the architecture first. Support `AUDIT_ARCH_X86_64` (rejecting the x32 bit) and `AUDIT_ARCH_AARCH64`. Any other architecture gets `SECCOMP_RET_KILL_PROCESS`.
+   - Deny with EPERM, unless noted otherwise:
+     - all socket syscalls: `socket`, `socketpair`, `connect`, `bind`, `listen`, `accept`/`accept4`, `sendto`, `sendmsg`, `sendmmsg`;
+     - signals to anything but itself: `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `pidfd_open`, `pidfd_send_signal`. They are allowed only when the target is the tool's own PID, which the helper knows because it execs in place. ffmpeg's own `raise`/`abort` and thread signals must keep working;
+     - process creation: `fork`, `vfork`; `clone` without `CLONE_THREAD`, or with any namespace flag; `clone3` (ENOSYS, so libc falls back to `clone`); `setsid`, `setpgid`;
+     - kernel attack surface:
+       - `ptrace`, `process_vm_readv`, `process_vm_writev`;
+       - `unshare`, `setns`;
+       - `io_uring_setup`, `io_uring_enter`, `io_uring_register`;
+       - `bpf`, `perf_event_open`;
+       - `keyctl`, `add_key`, `request_key`;
+       - `userfaultfd`;
+       - the mount family;
+       - the module and kexec calls.
+   - If seccomp is unavailable, the sandbox counts as unavailable (fail closed, same as no Landlock).
+   - With seccomp in place, the gaps line names only what neither layer covers.
+2. **`RLIMIT_CPU`** for both tools, at 2× the call's timeout, rounded up. That covers ffprobe, which has no `-timelimit`.
+3. **Kill the process group after every run,** not only on a timeout or the output bound. Wait for the leader with `waitid(…, WEXITED|WNOWAIT)`, then `kill(-pgid, SIGKILL)`, then reap. The leader stays a zombie until it is reaped, so its PID can't be reused in between. This is defence in depth behind item 1.
+4. **Input directory guard** in `newSandboxSpec`.
+   - Resolve the directory. Refuse it when it is, contains, or lies beneath a bot directory: the working directory, `config/`, `data/`, or the video store root once Task 3 adds it.
+   - Require it to hold exactly one entry.
+   - Passing the input as an `fd:` with no directory grant stays on "Later".
+5. **libvpx only on the sticker alpha path.** The render `-codec_whitelist` includes `libvpx`/`libvpx-vp9` only when the plan forces that decoder. A build without native vp8/vp9 then can't decode those codecs, and that is acceptable.
+6. **Narrow the filesystem grants.**
+   - Execute only on the tool binary and its ELF interpreter, which `debug/elf` reads from `PT_INTERP`.
+   - Read only beneath the library directories, the font and fontconfig directories, and the two loader files, as traced on Alpine and Ubuntu.
+   - Drop the blanket read and execute on `/usr`.
+   - Document that Landlock can't hide `stat` metadata, such as file sizes and mtimes.
+7. **Task 8 additions:**
+   - compose `init: true`, so stray zombies are reaped if the bot is PID 1;
+   - `pids_limit` as already planned;
+   - the systemd example's `TasksMax` as already planned.
