@@ -333,6 +333,8 @@ func TestMediaSandbox_Limits(t *testing.T) { //NOSONAR go:S100 -- underscore sep
 	assert.Equal(t, []string{"0", "0", "bytes"}, limitFields(t, limits, "Max core file size"))
 	assert.Equal(t, []string{"0", "0", "bytes"}, limitFields(t, limits, "Max file size"))
 	assert.Equal(t, []string{"64", "64", "files"}, limitFields(t, limits, "Max open files"), "Go's exec must not restore its saved limit")
+	cpu := strconv.Itoa(cpuTimeLimit(context.Background())) // twice the call's timeout (Ruling 16 item 2)
+	assert.Equal(t, []string{cpu, cpu, "seconds"}, limitFields(t, limits, "Max cpu time"), "ffprobe has no -timelimit: RLIMIT_CPU covers both tools")
 
 	assert.Equal(t, "1000", strings.TrimSpace(procFile(t, pid, "oom_score_adj")), "the OOM killer's first choice")
 	assert.Contains(t, procFile(t, pid, "status"), "NoNewPrivs:\t1")
@@ -373,7 +375,7 @@ func TestMediaSandbox_ExecFailsCleanly(t *testing.T) { //NOSONAR go:S100 -- unde
 	require.NoError(t, err)
 	dir := t.TempDir()
 	notATool := writeFake(t, t.TempDir(), "not-a-tool", "plain text, mode 0600") // execve: EACCES
-	spec := sandboxSpec{InputDir: dir, Tool: notATool, MemoryLimit: toolMemoryLimit, AllowUnsandboxed: true}
+	spec := sandboxSpec{InputDir: dir, Tool: notATool, MemoryLimit: toolMemoryLimit, CPUSeconds: 60, AllowUnsandboxed: true}
 	want := fmt.Sprintf("media sandbox: execve %s failed: errno %d\n", notATool, int(unix.EACCES))
 	for i := range 50 {
 		cmd := exec.Command(exe, mediaSandboxArg, spec.String(), "--", notATool) // #nosec G204 -- the test binary
@@ -439,7 +441,7 @@ func TestMediaSandbox_HardLimitBelowTheCap(t *testing.T) { //NOSONAR go:S100 -- 
 	exe, err := os.Executable()
 	require.NoError(t, err)
 	const capBytes, hardBytes = 3 << 30, 5 << 29
-	spec := sandboxSpec{InputDir: t.TempDir(), Tool: echo, MemoryLimit: capBytes, AllowUnsandboxed: true}
+	spec := sandboxSpec{InputDir: t.TempDir(), Tool: echo, MemoryLimit: capBytes, CPUSeconds: 60, AllowUnsandboxed: true}
 	cmd := exec.Command("/bin/sh", "-c", fmt.Sprintf(`ulimit -v %d && exec "$0" "$@"`, hardBytes>>10), // #nosec G204 -- the test binary
 		exe, mediaSandboxArg, spec.String(), "--", echo, "ran")
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
@@ -519,14 +521,14 @@ func TestSandboxSparesBot(t *testing.T) {
 // The spec is strict: anything malformed is refused before any exec.
 func TestParseSandboxArgs(t *testing.T) {
 	dir := t.TempDir()
-	good := sandboxSpec{InputDir: dir, FontFile: "/usr/share/fonts/x.ttf", Tool: "/usr/bin/ffmpeg", MemoryLimit: toolMemoryLimit}
+	good := sandboxSpec{InputDir: dir, FontFile: "/usr/share/fonts/x.ttf", Tool: "/usr/bin/ffmpeg", MemoryLimit: toolMemoryLimit, CPUSeconds: 120}
 	inv, err := parseSandboxArgs([]string{good.String(), "--", "/usr/bin/ffmpeg", "-version"})
 	require.NoError(t, err)
 	assert.Equal(t, good, inv.spec)
 	assert.Equal(t, []string{"/usr/bin/ffmpeg", "-version"}, inv.argv)
 	assert.False(t, inv.check)
 
-	checkSpec := sandboxSpec{InputDir: dir, MemoryLimit: toolMemoryLimit}
+	checkSpec := sandboxSpec{InputDir: dir, MemoryLimit: toolMemoryLimit, CPUSeconds: 60}
 	inv, err = parseSandboxArgs([]string{checkSpec.String(), "--check", filepath.Join(dir, "media"), "/tmp/outside/file"})
 	require.NoError(t, err)
 	assert.True(t, inv.check)
@@ -562,6 +564,8 @@ func TestParseSandboxArgs(t *testing.T) {
 		"no memory limit":       {with(func(s *sandboxSpec) { s.MemoryLimit = 0 }), "--", "/usr/bin/ffmpeg"},
 		"tiny memory limit":     {with(func(s *sandboxSpec) { s.MemoryLimit = 1 << 20 }), "--", "/usr/bin/ffmpeg"},
 		"huge memory limit":     {with(func(s *sandboxSpec) { s.MemoryLimit = 1 << 50 }), "--", "/usr/bin/ffmpeg"},
+		"no CPU limit":          {with(func(s *sandboxSpec) { s.CPUSeconds = 0 }), "--", "/usr/bin/ffmpeg"},
+		"huge CPU limit":        {with(func(s *sandboxSpec) { s.CPUSeconds = 1 << 40 }), "--", "/usr/bin/ffmpeg"},
 		"check with a tool":     {good.String(), "--check", filepath.Join(dir, "media"), "/tmp/outside/file"},
 		"check, one path":       {checkSpec.String(), "--check", filepath.Join(dir, "media")},
 		"check, inside outside": {checkSpec.String(), "--check", "/tmp/elsewhere/media", "/tmp/outside/file"},
@@ -579,7 +583,7 @@ func TestMediaSandbox_BadSpecNoExec(t *testing.T) { //NOSONAR go:S100 -- undersc
 	require.NoError(t, err)
 	exe, err := os.Executable()
 	require.NoError(t, err)
-	good := sandboxSpec{InputDir: t.TempDir(), Tool: echo, MemoryLimit: toolMemoryLimit, AllowUnsandboxed: true}
+	good := sandboxSpec{InputDir: t.TempDir(), Tool: echo, MemoryLimit: toolMemoryLimit, CPUSeconds: 60, AllowUnsandboxed: true}
 	for name, args := range map[string][]string{
 		"not JSON":       {"{", "--", echo, "ran"},
 		"tool mismatch":  {good.String(), "--", "/bin/sh", "-c", "echo ran"},
@@ -728,12 +732,21 @@ func TestNewToolCmd_Linux(t *testing.T) { //NOSONAR go:S100 -- underscore separa
 	inv, err := parseSandboxArgs(cmd.Args[2:])
 	require.NoError(t, err)
 	noSandbox := sandboxUsable(sandboxAvailable())
-	assert.Equal(t, sandboxSpec{InputDir: dir, FontFile: "/fonts/f.ttf", Tool: "/abs/ffmpeg", MemoryLimit: toolMemoryLimit,
+	assert.Equal(t, sandboxSpec{InputDir: dir, FontFile: "/fonts/f.ttf", Tool: "/abs/ffmpeg", MemoryLimit: toolMemoryLimit, CPUSeconds: 120,
 		AllowUnsandboxed: noSandbox != nil}, inv.spec)
 	require.NotNil(t, cmd.SysProcAttr)
 	assert.Equal(t, syscall.SIGKILL, cmd.SysProcAttr.Pdeathsig, "SIGKILL when the bot dies")
 	assert.True(t, cmd.SysProcAttr.Setpgid, "its own process group (Ruling 12 item 5)")
 	assert.NotNil(t, cmd.Cancel, "a timeout kills the whole group")
+
+	// RLIMIT_CPU is twice the call's timeout, rounded up (Ruling 16 item 2).
+	ctx, cancel := context.WithTimeout(context.Background(), 9500*time.Millisecond)
+	defer cancel()
+	cmd, err = newToolCmd(ctx, "/abs/ffprobe", dir, "", nil)
+	require.NoError(t, err)
+	inv, err = parseSandboxArgs(cmd.Args[2:])
+	require.NoError(t, err)
+	assert.EqualValues(t, 20, inv.spec.CPUSeconds)
 
 	_, err = newToolCmd(context.Background(), "/abs/ffmpeg", "", "", nil)
 	assert.Error(t, err, "no input directory, no run: the bot's own working directory is never granted")

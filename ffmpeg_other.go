@@ -15,7 +15,7 @@ const toolMemoryCapped = false
 
 // toolCommand runs the tool directly, and only once a bot's gate allowed
 // tools without a sandbox (video.allow_unsandboxed): there is none here.
-func toolCommand(bin, _, _ string, args []string) (string, []string, error) {
+func toolCommand(bin, _, _ string, _ int, args []string) (string, []string, error) {
 	if !unsandboxedAllowed() {
 		_, err := sandboxAvailable()
 		return "", nil, fmt.Errorf("%w: %w", errNoSandbox, err)

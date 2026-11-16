@@ -43,10 +43,11 @@ const sandboxExe = "/proc/self/exe"
 // toolOpenFiles is RLIMIT_NOFILE inside the sandbox.
 const toolOpenFiles = 64
 
-// A spec's memory limit must be within these bounds.
+// A spec's memory limit and CPU seconds must be within these bounds.
 const (
 	minSandboxMemory = 64 << 20
 	maxSandboxMemory = 64 << 30
+	maxSandboxCPU    = 3600
 )
 
 // sandboxSpec is all the helper is told. The bot builds it from its own paths
@@ -56,6 +57,7 @@ type sandboxSpec struct {
 	FontFile         string `json:"font_file,omitempty"`         // read only: drawtext's font, if any
 	Tool             string `json:"tool,omitempty"`              // read and execute: the tool ("" for a check)
 	MemoryLimit      uint64 `json:"memory_limit"`                // RLIMIT_AS, soft and hard
+	CPUSeconds       uint64 `json:"cpu_seconds"`                 // RLIMIT_CPU, soft and hard: twice the call's timeout
 	AllowUnsandboxed bool   `json:"allow_unsandboxed,omitempty"` // a kernel without Landlock is not an error
 }
 
@@ -84,6 +86,9 @@ func (s sandboxSpec) validate() error {
 	if s.MemoryLimit < minSandboxMemory || s.MemoryLimit > maxSandboxMemory {
 		return fmt.Errorf("memory limit %d out of range", s.MemoryLimit)
 	}
+	if s.CPUSeconds < 1 || s.CPUSeconds > maxSandboxCPU {
+		return fmt.Errorf("CPU limit %d s out of range", s.CPUSeconds)
+	}
 	return nil
 }
 
@@ -96,13 +101,15 @@ func sandboxPath(what, p string) error {
 }
 
 // newSandboxSpec builds the spec for a run in dir: a tool run when tool is
-// set, a check otherwise. It fails with errNoSandbox when there is no
-// Landlock and no bot allowed running without it.
-func newSandboxSpec(dir, font, tool string) (sandboxSpec, error) {
+// set, a check otherwise, with cpu seconds of CPU time (cpuTimeLimit). It
+// fails with errNoSandbox when there is no Landlock and no bot allowed
+// running without it.
+func newSandboxSpec(dir, font, tool string, cpu int) (sandboxSpec, error) {
 	if font != "" {
 		font = filepath.Clean(font) // the same file; resolveFontFile already took it
 	}
-	spec := sandboxSpec{InputDir: dir, FontFile: font, Tool: tool, MemoryLimit: toolMemoryLimit, AllowUnsandboxed: unsandboxedAllowed()}
+	spec := sandboxSpec{InputDir: dir, FontFile: font, Tool: tool, MemoryLimit: toolMemoryLimit,
+		CPUSeconds: uint64(max(cpu, 1)), AllowUnsandboxed: unsandboxedAllowed()} // #nosec G115 -- positive, from cpuTimeLimit
 	if err := sandboxUsable(sandboxAvailable()); err != nil && !spec.AllowUnsandboxed {
 		return spec, fmt.Errorf("%w: %w", errNoSandbox, err)
 	}
@@ -251,7 +258,7 @@ func mediaSandbox(args []string, ppid int) error {
 // ABI the kernel has (see sandboxABI).
 func applySandbox(spec sandboxSpec, ppid int) (sandboxReport, error) {
 	var report sandboxReport
-	if err := setToolLimits(spec.MemoryLimit); err != nil {
+	if err := setToolLimits(spec.MemoryLimit, spec.CPUSeconds); err != nil {
 		return report, err
 	}
 	report.OOMScoreAdj = setOOMScoreAdj() == nil
@@ -295,12 +302,14 @@ func sandboxABI(kernel int, err error, allowUnsandboxed bool) (int, error) {
 	return kernel, nil
 }
 
-// setToolLimits sets core and file size to 0 and open files to
-// toolOpenFiles, and checks that the address-space limit can be set to
-// memory: a hard limit already below it is an error, never clamped (Ruling 14
-// note 3). underMemoryLimit sets that one.
-func setToolLimits(memory uint64) error {
-	var as, files syscall.Rlimit
+// setToolLimits sets core and file size to 0, open files to toolOpenFiles
+// and CPU time to cpu seconds (Ruling 16 item 2: ffprobe has no -timelimit),
+// and checks that the address-space limit can be set to memory: a hard limit
+// already below it is an error, never clamped (Ruling 14 note 3).
+// underMemoryLimit sets that one. A lower inherited open-files or CPU hard
+// limit is kept: it is only stricter.
+func setToolLimits(memory, cpu uint64) error {
+	var as, files, cpuTime syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_AS, &as); err != nil {
 		return fmt.Errorf("getrlimit RLIMIT_AS: %w", err)
 	}
@@ -310,6 +319,9 @@ func setToolLimits(memory uint64) error {
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &files); err != nil {
 		return fmt.Errorf("getrlimit RLIMIT_NOFILE: %w", err)
 	}
+	if err := syscall.Getrlimit(syscall.RLIMIT_CPU, &cpuTime); err != nil {
+		return fmt.Errorf("getrlimit RLIMIT_CPU: %w", err)
+	}
 	for _, l := range []struct {
 		name     string
 		resource int
@@ -318,6 +330,7 @@ func setToolLimits(memory uint64) error {
 		{"RLIMIT_CORE", syscall.RLIMIT_CORE, 0},
 		{"RLIMIT_FSIZE", syscall.RLIMIT_FSIZE, 0},
 		{"RLIMIT_NOFILE", syscall.RLIMIT_NOFILE, min(toolOpenFiles, files.Max)},
+		{"RLIMIT_CPU", syscall.RLIMIT_CPU, min(cpu, cpuTime.Max)},
 	} {
 		// syscall's Setrlimit, not unix's: for RLIMIT_NOFILE it also stops
 		// Go restoring the limit it saved at startup in a later exec.
@@ -536,7 +549,7 @@ func sandboxSelfCheck(ctx context.Context, dir, inside string) (sandboxReport, e
 	if err := os.WriteFile(outside, []byte("outside the input directory"), 0o600); err != nil {
 		return sandboxReport{}, err
 	}
-	spec, err := newSandboxSpec(dir, "", "")
+	spec, err := newSandboxSpec(dir, "", "", cpuTimeLimit(ctx))
 	if err != nil {
 		return sandboxReport{}, err
 	}

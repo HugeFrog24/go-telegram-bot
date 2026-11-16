@@ -16,11 +16,12 @@ const toolMemoryCapped = true
 // toolCommand runs bin with args through the media sandbox helper: the bot's
 // own binary, told the spec, which limits and Landlocks itself and then execs
 // bin in place (sandbox_linux.go). It replaced Ruling 12's /bin/sh wrapper.
-func toolCommand(bin, dir, font string, args []string) (string, []string, error) {
+// cpu is the run's CPU-time limit in seconds.
+func toolCommand(bin, dir, font string, cpu int, args []string) (string, []string, error) {
 	if bin == "" {
 		return "", nil, errors.New("no tool")
 	}
-	spec, err := newSandboxSpec(dir, font, bin)
+	spec, err := newSandboxSpec(dir, font, bin, cpu)
 	if err != nil {
 		return "", nil, err
 	}

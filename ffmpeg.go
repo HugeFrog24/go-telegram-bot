@@ -924,8 +924,10 @@ func runToolCmd(ctx context.Context, name string, build func(context.Context) (*
 // newToolCmd builds the child process for bin. On Linux it runs bin through
 // the sandbox helper (ffmpeg_linux.go, sandbox_linux.go); elsewhere directly,
 // once a bot allowed that. It fails with errNoSandbox when neither can be.
+// On Linux the run's CPU time is capped at twice ctx's timeout, the same
+// cpuTimeLimit ffmpeg's -timelimit gets (Ruling 16 item 2).
 func newToolCmd(ctx context.Context, bin, dir, font string, args []string) (*exec.Cmd, error) {
-	path, argv, err := toolCommand(bin, dir, font, args)
+	path, argv, err := toolCommand(bin, dir, font, cpuTimeLimit(ctx), args)
 	if err != nil {
 		return nil, err
 	}
