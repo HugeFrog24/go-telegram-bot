@@ -47,8 +47,9 @@ var seccompAllowed = [][]string{
 	// capped by RLIMIT_MEMLOCK.
 	{"brk", "mmap", "munmap", "mprotect", "mremap", "madvise", "mlock", "membarrier"},
 	// Threads, which clone (checked below) starts and RLIMIT_NPROC counts:
-	// futexes, libc's thread setup, yielding and ending a thread.
-	{"futex", "set_tid_address", "set_robust_list", "rseq", "gettid", "sched_yield", "exit"},
+	// libc's thread setup, yielding and ending a thread. Futexes are checked
+	// below.
+	{"set_tid_address", "set_robust_list", "rseq", "gettid", "sched_yield", "exit"},
 	// Signals that name no target: handlers, masks, the alternate stack,
 	// the return from a handler and the restart of the call it interrupted.
 	{"rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "sigaltstack", "restart_syscall"},
@@ -91,6 +92,27 @@ var seccompFcntlCommands = []uint32{unix.F_DUPFD, unix.F_DUPFD_CLOEXEC, unix.F_G
 // (libcap, on Ubuntu) and naming a mapping (the Go runtime). Every other
 // option, PR_SET_PDEATHSIG among them, is refused.
 var seccompPrctlOptions = []uint32{unix.PR_SET_NAME, unix.PR_GET_NAME, unix.PR_CAPBSET_READ, unix.PR_SET_VMA}
+
+// seccompFutexOps are the futex(2) operations allowed once seccompFutexFlags
+// are masked off: waiting and waking, plainly, by bitset or by operation, and
+// requeueing (Ruling 19 item 6, as Chromium's RestrictFutex). Every other
+// operation gets EPERM: the priority-inheriting ones (LOCK_PI, LOCK_PI2,
+// UNLOCK_PI, TRYLOCK_PI, WAIT_REQUEUE_PI, CMP_REQUEUE_PI), a kernel path
+// with a history of bugs (CVE-2014-3153, CVE-2021-3347) that neither libc
+// nor the Go runtime uses here, and the long-gone FUTEX_FD.
+var seccompFutexOps = []uint32{
+	0,  // FUTEX_WAIT
+	1,  // FUTEX_WAKE
+	3,  // FUTEX_REQUEUE
+	4,  // FUTEX_CMP_REQUEUE
+	5,  // FUTEX_WAKE_OP
+	9,  // FUTEX_WAIT_BITSET
+	10, // FUTEX_WAKE_BITSET
+}
+
+// seccompFutexFlags are the bits of a futex operation that change no more
+// than how it waits: FUTEX_PRIVATE_FLAG and FUTEX_CLOCK_REALTIME.
+const seccompFutexFlags = 128 | 256
 
 // seccompIoctlRequests are the only ioctl(2) requests allowed: isatty(3) on
 // the tool's stderr (TCGETS for glibc, TIOCGWINSZ for musl). TIOCSTI and
@@ -141,8 +163,8 @@ func (a seccompArch) nr(name string) (uint32, error) {
 // The parts of struct seccomp_data the filter reads (linux/seccomp.h). Both
 // supported architectures are little-endian, so an argument's low 32 bits
 // come first. The kernel itself reads only those of every argument checked
-// here: PIDs, clone(2)'s legacy flags, and fcntl(2), prctl(2) and ioctl(2)
-// commands are 32 bits wide.
+// here: PIDs, clone(2)'s legacy flags, futex(2) operations, and fcntl(2),
+// prctl(2) and ioctl(2) commands are 32 bits wide.
 const (
 	seccompNr       = 0
 	seccompArchWord = 4
@@ -156,6 +178,7 @@ const (
 	bpfJumpEq  = unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K
 	bpfJumpGE  = unix.BPF_JMP | unix.BPF_JGE | unix.BPF_K
 	bpfJumpSet = unix.BPF_JMP | unix.BPF_JSET | unix.BPF_K
+	bpfAnd     = unix.BPF_ALU | unix.BPF_AND | unix.BPF_K
 	bpfReturn  = unix.BPF_RET | unix.BPF_K
 )
 
@@ -253,7 +276,8 @@ func seccompProgram(arch seccompArch, pid uint32) ([]unix.SockFilter, error) {
 		names []string
 	}{
 		{"self", seccompSelfTargets}, {"self-or-zero", seccompSelfOrZero},
-		{"clone", []string{"clone"}}, {"fcntl", []string{"fcntl"}}, {"prctl", []string{"prctl"}}, {"ioctl", []string{"ioctl"}},
+		{"clone", []string{"clone"}}, {"futex", []string{"futex"}}, {"fcntl", []string{"fcntl"}},
+		{"prctl", []string{"prctl"}}, {"ioctl", []string{"ioctl"}},
 	} {
 		if err := to(c.label, c.names...); err != nil {
 			return nil, err
@@ -277,6 +301,15 @@ func seccompProgram(arch seccompArch, pid uint32) ([]unix.SockFilter, error) {
 	a.stmt(bpfLoad, seccompArg0Low)
 	a.jump(bpfJumpSet, unix.CLONE_THREAD, "", "eperm")
 	a.jump(bpfJumpSet, cloneNamespaces, "eperm", "allow")
+
+	// futex's operation, its second argument, with the flags masked off.
+	a.label("futex")
+	a.stmt(bpfLoad, seccompArg1Low)
+	a.stmt(bpfAnd, ^uint32(seccompFutexFlags))
+	for _, op := range seccompFutexOps {
+		a.jump(bpfJumpEq, op, "allow", "")
+	}
+	a.stmt(bpfReturn, seccompEPERM)
 
 	for _, c := range []struct {
 		label  string

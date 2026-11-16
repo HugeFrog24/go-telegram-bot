@@ -349,6 +349,16 @@ var probeActions = map[string]func(args []string) error{
 	},
 	// pdeathsig: clear the parent-death signal, to outlive the bot.
 	"pdeathsig": func([]string) error { return unix.Prctl(unix.PR_SET_PDEATHSIG, 0, 0, 0, 0) },
+	// futex-lock-pi: take an uncontended priority-inheriting futex of its
+	// own, a kernel path with a history of bugs (CVE-2014-3153).
+	"futex-lock-pi": func([]string) error {
+		const lockPIPrivate = 6 | 128 // FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG
+		word := new(uint32)
+		if _, _, errno := syscall.Syscall6(unix.SYS_FUTEX, uintptr(unsafe.Pointer(word)), lockPIPrivate, 0, 0, 0, 0); errno != 0 { // #nosec G103 -- futex(2)
+			return errno
+		}
+		return nil
+	},
 	// inotify, fanotify: watch the bot's directories for new names.
 	"inotify": func([]string) error {
 		fd, err := unix.InotifyInit1(unix.IN_CLOEXEC)
@@ -724,6 +734,8 @@ func TestMediaSandbox_AllowlistRefusals(t *testing.T) { //NOSONAR go:S100 -- und
 		works(action+" at ABI 4", "noseccomp-abi4-sandbox-probe", action)
 	}
 	refused(eperm, "PR_SET_PDEATHSIG 0", "sandbox-probe", "pdeathsig")
+	refused(eperm, "FUTEX_LOCK_PI", "sandbox-probe", "futex-lock-pi")
+	works("FUTEX_LOCK_PI", "noseccomp-sandbox-probe", "futex-lock-pi")
 	works("PR_SET_PDEATHSIG 0", "noseccomp-sandbox-probe", "pdeathsig")
 
 	for _, action := range []string{"shmget", "msgget", "inotify"} {

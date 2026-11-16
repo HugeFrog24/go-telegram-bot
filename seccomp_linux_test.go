@@ -40,6 +40,8 @@ func evalSeccomp(t *testing.T, prog []unix.SockFilter, arch, nr uint32, args ...
 			pc += jump(a >= in.K, in)
 		case bpfJumpSet:
 			pc += jump(a&in.K != 0, in)
+		case bpfAnd:
+			a &= in.K
 		case bpfReturn:
 			return in.K
 		default:
@@ -56,13 +58,13 @@ var (
 	wantSeccompAllowed = []string{
 		"brk", "clock_getres", "clock_gettime", "clock_nanosleep", "close", "dup", "dup3", "epoll_create1", "epoll_ctl",
 		"epoll_pwait", "eventfd2", "execve", "exit", "exit_group", "faccessat", "faccessat2", "fstat", "fstatfs",
-		"futex", "getcwd", "getdents64", "getegid", "geteuid", "getgid", "getpid", "getppid", "getrandom", "getrusage", "gettid",
+		"getcwd", "getdents64", "getegid", "geteuid", "getgid", "getpid", "getppid", "getrandom", "getrusage", "gettid",
 		"gettimeofday", "getuid", "lseek", "madvise", "membarrier", "mlock", "mmap", "mprotect", "mremap", "munmap",
 		"nanosleep", "newfstatat", "openat", "pread64", "read", "readlinkat", "readv", "restart_syscall", "rseq",
 		"rt_sigaction", "rt_sigprocmask", "rt_sigreturn", "sched_yield", "set_robust_list", "set_tid_address",
 		"sigaltstack", "statfs", "statx", "write", "writev",
 	}
-	wantSeccompChecked = []string{"clone", "fcntl", "ioctl", "kill", "prctl", "prlimit64", "rt_sigqueueinfo",
+	wantSeccompChecked = []string{"clone", "fcntl", "futex", "ioctl", "kill", "prctl", "prlimit64", "rt_sigqueueinfo",
 		"rt_tgsigqueueinfo", "sched_getaffinity", "tgkill", "tkill"}
 	wantSeccompAMD64Extra = []string{"access", "arch_prctl", "dup2", "lstat", "open", "readlink", "stat", "time"}
 )
@@ -74,7 +76,7 @@ func TestSeccompAllowlist(t *testing.T) {
 	}
 	slices.Sort(allowed)
 	assert.Equal(t, wantSeccompAllowed, allowed)
-	checked := append(append(slices.Clone(seccompSelfTargets), seccompSelfOrZero...), "clone", "fcntl", "prctl", "ioctl")
+	checked := append(append(slices.Clone(seccompSelfTargets), seccompSelfOrZero...), "clone", "fcntl", "futex", "prctl", "ioctl")
 	slices.Sort(checked)
 	assert.Equal(t, wantSeccompChecked, checked)
 	extra := slices.Clone(seccompAMD64.extra)
@@ -181,6 +183,28 @@ func testSeccompFilter(t *testing.T, arch seccompArch) {
 		{"F_NOTIFY", "fcntl", []uint64{1, unix.F_NOTIFY}, seccompEPERM},
 		{"F_SETLK", "fcntl", []uint64{1, unix.F_SETLK}, seccompEPERM},
 		{"F_OFD_SETLK", "fcntl", []uint64{1, unix.F_OFD_SETLK}, seccompEPERM},
+		// futex(2): only the non-PI operations, whatever FUTEX_PRIVATE_FLAG
+		// (128) and FUTEX_CLOCK_REALTIME (256) say (Ruling 19 item 6).
+		{"FUTEX_WAIT", "futex", []uint64{0, 0}, seccompAllow},
+		{"FUTEX_WAKE", "futex", []uint64{0, 1}, seccompAllow},
+		{"FUTEX_REQUEUE", "futex", []uint64{0, 3}, seccompAllow},
+		{"FUTEX_CMP_REQUEUE", "futex", []uint64{0, 4}, seccompAllow},
+		{"FUTEX_WAKE_OP", "futex", []uint64{0, 5}, seccompAllow},
+		{"FUTEX_WAIT_BITSET", "futex", []uint64{0, 9}, seccompAllow},
+		{"FUTEX_WAKE_BITSET", "futex", []uint64{0, 10}, seccompAllow},
+		{"FUTEX_WAIT_PRIVATE (Go)", "futex", []uint64{0, 128}, seccompAllow},
+		{"FUTEX_WAKE_PRIVATE (Go)", "futex", []uint64{0, 129}, seccompAllow},
+		{"FUTEX_WAIT_BITSET_PRIVATE|FUTEX_CLOCK_REALTIME (glibc)", "futex", []uint64{0, 9 | 128 | 256}, seccompAllow},
+		{"FUTEX_WAKE_PRIVATE, high bits set", "futex", []uint64{0, 1<<40 | 129}, seccompAllow},
+		{"FUTEX_FD", "futex", []uint64{0, 2}, seccompEPERM},
+		{"FUTEX_LOCK_PI", "futex", []uint64{0, 6}, seccompEPERM},
+		{"FUTEX_LOCK_PI_PRIVATE", "futex", []uint64{0, 6 | 128}, seccompEPERM},
+		{"FUTEX_UNLOCK_PI", "futex", []uint64{0, 7}, seccompEPERM},
+		{"FUTEX_TRYLOCK_PI", "futex", []uint64{0, 8}, seccompEPERM},
+		{"FUTEX_WAIT_REQUEUE_PI", "futex", []uint64{0, 11}, seccompEPERM},
+		{"FUTEX_CMP_REQUEUE_PI", "futex", []uint64{0, 12 | 128}, seccompEPERM},
+		{"FUTEX_LOCK_PI2", "futex", []uint64{0, 13 | 256}, seccompEPERM},
+		{"an unknown futex op", "futex", []uint64{0, 14}, seccompEPERM},
 		{"PR_SET_NAME", "prctl", []uint64{unix.PR_SET_NAME}, seccompAllow},
 		{"PR_GET_NAME", "prctl", []uint64{unix.PR_GET_NAME}, seccompAllow},
 		{"PR_CAPBSET_READ", "prctl", []uint64{unix.PR_CAPBSET_READ}, seccompAllow},
