@@ -150,3 +150,21 @@ The blind security review of Task 1 (the config block and the on/off gate) raise
   - An owner-only mode. The feature is already opt-in per bot.
   - A lower maximum for `retention_hours`. The size cap bounds the disk.
   - Naming the missing tool in the gate log. The log string is set by the plan.
+
+## Amendment: lookback for the decode window (Ruling 10)
+
+This replaces the "Task 2: decode window" item of Ruling 9. The Task 2 review found that an accurate seek to `Start` drops the frame on screen at `Start` whenever that frame began earlier. On sparse, variable-frame-rate or still-image content, a sheet or a single frame then shows a *later* frame labelled with the requested time, or the render fails.
+
+- **The new window:**
+  - `renderSheet` seeks with `-ss max(0, Start − L)` and passes an input `-t W + L`, where `L = 10 s` is a constant.
+  - `W` is as before: `End − Start` plus one step, or 1 s for one frame.
+  - Times are still measured from `Start`, and the existing fps chain picks the frame on screen at each `t_i`.
+  - `Frames == 1` also goes through the fps chain, and `-frames:v 1` stops it.
+- **The cost:** at most `L` more seconds of decoding per call. The wall-clock timeouts, the semaphore and the pixel caps still bound the work.
+- **The limit:**
+  - A frame that began more than `L` before `Start` still yields no image.
+  - Such a failure is reported as "no frame near that time", kept separate from a decode failure where ffmpeg can tell the two apart.
+  - Otherwise it is the render-failure path.
+- **Tests:**
+  - A fixture made of time segments in distinct solid colours, plus a sparse variant with a frame every 35 s. For a sheet, a lookup and a single frame, tile k must show the colour of the segment that contains `frameTimes[k]`.
+  - A still-image clip lookup at Start = 7 s must succeed.
