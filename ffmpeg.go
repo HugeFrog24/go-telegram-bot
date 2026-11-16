@@ -40,7 +40,8 @@ const (
 	probeMaxSide    = 8192       // the probe refuses a wider or taller stream (item 5)
 	probeMaxArea    = 16777216   // ... or one with more pixels (item 5)
 	toolMaxStreams  = 32         // -max_streams on both tools (item 6)
-	toolThreads     = 2          // -threads as an input option (item 6)
+	toolThreads     = 2          // -threads as an input option of a render (item 6)
+	probeThreads    = 1          // -threads of a probe: ffprobe opens a decoder for every stream (Ruling 19 item 2)
 	encoderThreads  = 1          // -threads as an output option: the mjpeg encoder (see renderArgs)
 	toolOutputLimit = 8 << 20    // stdout bytes a run may write; one more kills it (item 7)
 	toolStderrTail  = 64 << 10   // stderr bytes kept for the log (item 7)
@@ -398,6 +399,10 @@ type toolRun struct {
 // stream durations and start times were lost.
 func toolArgs(r toolRun) []string {
 	ffmpeg := r.tool == "ffmpeg"
+	threads := probeThreads
+	if ffmpeg {
+		threads = toolThreads
+	}
 	args := []string{"-hide_banner"}
 	if ffmpeg {
 		args = append(args, "-nostdin")
@@ -416,7 +421,7 @@ func toolArgs(r toolRun) []string {
 	args = append(args, "-codec_whitelist", r.codecs,
 		"-max_pixels", strconv.Itoa(toolMaxPixels),
 		"-max_streams", strconv.Itoa(toolMaxStreams),
-		"-threads", strconv.Itoa(toolThreads))
+		"-threads", strconv.Itoa(threads))
 	if r.decoder != "" {
 		args = append(args, "-c:v", r.decoder)
 	}
@@ -860,9 +865,13 @@ func ffmpegMajor(line string) (int, bool) {
 // (item 8). Each run takes a slot for itself alone: never across two runs.
 var toolSlots = make(chan struct{}, toolConcurrency(runtime.NumCPU()))
 
-// toolConcurrency is max(1, min(4, cpus/2)).
+// maxToolConcurrency is the most runs toolSlots ever allows at once; the
+// task cap is sized for that many (toolThreadHeadroom, sandbox_linux.go).
+const maxToolConcurrency = 4
+
+// toolConcurrency is max(1, min(maxToolConcurrency, cpus/2)).
 func toolConcurrency(cpus int) int {
-	return max(1, min(4, cpus/2))
+	return max(1, min(maxToolConcurrency, cpus/2))
 }
 
 // toolError is a run that ended with a non-zero exit or a signal. Only the

@@ -860,15 +860,15 @@ func TestMediaSandbox_LockedMemoryCap(t *testing.T) { //NOSONAR go:S100 -- under
 
 // A tool cannot exhaust the uid's tasks: RLIMIT_NPROC holds it to the
 // uid's task count at its start plus toolThreadHeadroom (Ruling 18 item 2).
-// A stand-in that starts 64 threads, well within its 32 GiB of address
-// space, dies of a failed thread creation, and the bot can still start
-// threads.
+// A stand-in that starts toolThreadHeadroom + 16 threads, well within its 32
+// GiB of address space, dies of a failed thread creation, and the bot can
+// still start threads.
 func TestMediaSandbox_ThreadCap(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	allowUnsandboxedWhereNeeded(t)
 	standInTool(t, "bigmem-sandbox-probe")
-	_, err := runTool(context.Background(), "bigmem-sandbox-probe", inputDir(t), "", []string{"threads", "64"})
+	_, err := runTool(context.Background(), "bigmem-sandbox-probe", inputDir(t), "", []string{"threads", strconv.Itoa(toolThreadHeadroom + 16)})
 	var te *toolError
-	require.ErrorAs(t, err, &te, "64 threads are over the cap")
+	require.ErrorAs(t, err, &te, "%d threads are over the cap", toolThreadHeadroom+16)
 	assert.Regexp(t, `pthread_create failed|failed to create new OS thread`, te.Stderr())
 
 	_, err = runTool(context.Background(), "bigmem-sandbox-probe", inputDir(t), "", []string{"threads", "8"})

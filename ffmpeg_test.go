@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -339,9 +340,6 @@ func ffprobeRun(t *testing.T, path, drop string) (probed struct {
 }, err error) {
 	t.Helper()
 	args := probeArgs(path, kindFormats["document"])
-	// One decoder thread per stream: 33 streams at 2 threads each would hit
-	// RLIMIT_NPROC (Ruling 18 item 2) before the cap under test.
-	args[slices.Index(args, "-threads")+1] = "1"
 	if i := slices.Index(args, drop); drop != "" {
 		require.GreaterOrEqual(t, i, 0, "probeMedia passes %s", drop)
 		args = slices.Delete(args, i, i+2)
@@ -555,7 +553,7 @@ func TestToolArgs_Probe(t *testing.T) { //NOSONAR go:S100 -- underscore separati
 	assert.Equal(t, []string{
 		"-hide_banner", "-loglevel", "error", "-max_alloc", "134217728",
 		"-protocol_whitelist", "file", "-format_whitelist", "mov,matroska",
-		"-codec_whitelist", probeCodecs, "-max_pixels", "16777216", "-max_streams", "32", "-threads", "2",
+		"-codec_whitelist", probeCodecs, "-max_pixels", "16777216", "-max_streams", "32", "-threads", "1",
 		"-i", "file:" + in,
 		"-show_entries", "format=format_name,duration,start_time:stream=codec_type,codec_name,width,height,duration,start_time:stream_disposition=attached_pic:stream_tags=alpha_mode,DURATION:stream_side_data=rotation",
 		"-of", "json",
@@ -1470,10 +1468,12 @@ func TestProbeMedia_AlphaOnlyForStickers(t *testing.T) { //NOSONAR go:S100 -- un
 	}
 }
 
-// Normal files still probe and render, as a first sheet and as one frame.
-// On Linux every run is under toolMemoryLimit (Ruling 12 item 2) and the
-// task cap (RLIMIT_NPROC, Ruling 18 item 2), so this is the check that both
-// leave room for ordinary 4K phone video and for AV1 through dav1d.
+// Normal files still probe and render, as a first sheet and as one frame,
+// on the production arguments. On Linux every run is under toolMemoryLimit
+// (Ruling 12 item 2) and the task cap (RLIMIT_NPROC, Ruling 18 item 2), so
+// this is the check that both leave room for ordinary 4K phone video, for
+// AV1 through dav1d and for a file with as many video streams as the probe
+// accepts (Ruling 19 item 2).
 func TestRenderSheet_NormalFilesFitTheMemoryCap(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	requireFFmpeg(t)
 	t.Logf("memory cap in place: %v (%d MiB)", toolMemoryCapped, toolMemoryLimit>>20)
@@ -1492,6 +1492,7 @@ func TestRenderSheet_NormalFilesFitTheMemoryCap(t *testing.T) { //NOSONAR go:S10
 			"-c:a", "libopus", "-shortest", "-f", "webm")},
 		{"alpha sticker", "sticker", alphaWebmArgs(512, 3)},
 		{"1080p AV1", "video", nil}, // av1Fixture: whichever AV1 encoder this ffmpeg has
+		{"31 H.264 streams", "video", manyVideoStreams(toolMaxStreams - 1)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var path string
@@ -1518,13 +1519,82 @@ func TestRenderSheet_NormalFilesFitTheMemoryCap(t *testing.T) { //NOSONAR go:S10
 	}
 }
 
+// manyVideoStreams is a recipe for n H.264 video streams in Matroska, all
+// the same lavfi clip.
+func manyVideoStreams(n int) []string {
+	args := []string{"-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=1"}
+	for range n {
+		args = append(args, "-map", "0:v")
+	}
+	return append(args, "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-f", "matroska")
+}
+
+// The task cap is a pool shared by the user's tasks (Ruling 19 item 2):
+// toolThreadHeadroom leaves room for toolConcurrency legitimate runs at
+// once, each at its worst. Four goroutines at a time probe and render the
+// heaviest files, twice over, on the production arguments; every run gets
+// through.
+func TestRenderSheet_ConcurrentRunsFitTheTaskCap(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	requireFFmpeg(t)
+	in := func(size string) []string {
+		return []string{"-f", "lavfi", "-i", "testsrc2=size=" + size + ":rate=30:duration=1", "-f", "lavfi", "-i", "sine=duration=1"}
+	}
+	paths := []string{
+		optionalFixture(t, append(in("3840x2160"), "-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error",
+			"-pix_fmt", "yuv420p10le", "-tag:v", "hvc1", "-c:a", "aac", "-shortest", "-f", "mp4")...),
+		optionalFixture(t, manyVideoStreams(toolMaxStreams-1)...),
+		optionalFixture(t, append(in("3840x2160"), "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+			"-c:a", "aac", "-shortest", "-f", "mp4")...),
+	}
+	if p, ok := optionalAV1Fixture(t, in("1920x1080")); ok {
+		paths = append(paths, p)
+	}
+	t.Logf("%d runs at once", cap(toolSlots))
+	var wg sync.WaitGroup
+	errs := make(chan error, 2*4*len(paths))
+	for range 2 {
+		for _, path := range paths {
+			for range 4 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					probe, err := probeMedia(context.Background(), path, "video")
+					if err == nil {
+						_, _, err = renderSheet(context.Background(), path, probe,
+							sheetSpec{Start: 0, End: probe.Duration, Frames: maxVideoSheetFrames, MaxEdge: maxImageEdge})
+					}
+					if err != nil {
+						errs <- fmt.Errorf("%s: %w (stderr %q)", path, err, toolStderr(err))
+					}
+				}()
+			}
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
 // av1Fixture encodes the lavfi input in as AV1 in Matroska with the first
 // AV1 encoder this ffmpeg has, fastest settings; it skips the test if none.
 func av1Fixture(t *testing.T, in []string) string {
 	t.Helper()
+	path, ok := optionalAV1Fixture(t, in)
+	if !ok {
+		t.Skip("this ffmpeg has no libdav1d (AV1 is unsupported here, Ruling 12 item 3) or no AV1 encoder")
+	}
+	return path
+}
+
+// optionalAV1Fixture is av1Fixture's file, and false where this ffmpeg
+// cannot decode AV1 through libdav1d or has no AV1 encoder.
+func optionalAV1Fixture(t *testing.T, in []string) (string, bool) {
+	t.Helper()
 	decoders, err := exec.Command("ffmpeg", "-hide_banner", "-decoders").Output()
 	if err != nil || !bytes.Contains(decoders, []byte(" libdav1d ")) {
-		t.Skip("this ffmpeg has no libdav1d: AV1 is unsupported here (Ruling 12 item 3)")
+		return "", false
 	}
 	for _, enc := range [][]string{
 		{"-c:v", "libsvtav1", "-preset", "12"},
@@ -1533,11 +1603,10 @@ func av1Fixture(t *testing.T, in []string) string {
 	} {
 		args := append(append(slices.Clone(in), enc...), "-pix_fmt", "yuv420p", "-c:a", "libopus", "-shortest", "-f", "matroska")
 		if out, _, err := makeFixture(t, args); err == nil {
-			return out
+			return out, true
 		}
 	}
-	t.Skip("this ffmpeg has no AV1 encoder")
-	return ""
+	return "", false
 }
 
 func TestRenderSheet_Timeout(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names

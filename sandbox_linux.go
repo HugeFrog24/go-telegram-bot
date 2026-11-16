@@ -50,11 +50,27 @@ const toolOpenFiles = 64
 // swappable.
 const toolLockedMemory = 64 << 10
 
+// perRunBudget is the tasks one legitimate run may need at once (Ruling 19
+// item 2): the worst peak measured on the production arguments, plus 4,
+// and at least 12. Measured with strace -f, counting every thread a run
+// started and ended, on Alpine 3.24 (ffmpeg 8.1.3) and Ubuntu 24.04 (ffmpeg
+// 6.1.1), for probe and render (a 20-frame sheet and one frame) of a
+// 31-stream H.264 file (the most the probe accepts), 4K HEVC 10-bit and AV1
+// at 1080p and 4K: every probe peaked at 1 task, as ffprobe gets -threads 1
+// (probeThreads; with -threads 2 its decoder for each stream took the
+// 31-stream probe past 38 and it failed), and every render at 8 tasks on
+// 8.1.3 and 6 on 6.1.1, whatever the input. So the budget is 12.
+const perRunBudget = 12
+
 // toolThreadHeadroom is how many tasks a tool may add to its user's count
-// (RLIMIT_NPROC, Ruling 18 item 2): ffmpeg's decoder, filter and encoder
-// threads with room to spare, but no thread bomb. With compose's pids_limit
-// of 256, four runs and the bot fit.
-const toolThreadHeadroom = 32
+// (RLIMIT_NPROC, Ruling 18 item 2): no thread bomb, but room for
+// maxToolConcurrency runs at their worst plus 8 for the bot's own new
+// threads, as the count is the user's, and so a pool every concurrent run
+// shares (Ruling 19 item 2). A compromised tool can still take the whole
+// pool and make other chats' runs fail while it runs (sandboxGaps). Task 8
+// sets compose's pids_limit and systemd's TasksMax to 64 + 4 ×
+// toolThreadHeadroom + 64, rounded up to a multiple of 64: 384 for 56.
+const toolThreadHeadroom = maxToolConcurrency*perRunBudget + 8
 
 // A spec's memory limit and CPU seconds must be within these bounds.
 const (
