@@ -77,9 +77,11 @@ func TestClear_BetweenRegisterAndSnapshotCancelsTheTurnSilently(t *testing.T) { 
 }
 
 // A turn that read memory before /clear and is still streaming when it lands
-// ends silently: nothing sent after the confirmation, nothing filed, no rerun.
+// ends silently: nothing sent after the confirmation, nothing filed, and the
+// flush collected behind it does not rerun.
 func TestClear_DuringTheModelCallDropsTheTurn(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
-	stub, open := newGatedAnthropicStub(t, candleFarmStream(), 1)
+	events := evStream(evTextBlock(0, "First part."), evTextBlock(1, "Second part."), evMessageEnd("end_turn"))
+	stub, open := newGatedAnthropicStub(t, events, 4) // message_start and the first text block
 	b, tg := setupBotForTest(t, 123)
 	useAnthropicStub(b, stub)
 	sent := recordSends(tg)
@@ -88,9 +90,16 @@ func TestClear_DuringTheModelCallDropsTheTurn(t *testing.T) { //NOSONAR go:S100 
 	storeUserText(t, b, chatID, "hi")
 	done := make(chan struct{})
 	go func() { defer close(done); b.respondToChat(textReq(chatID)) }()
-	require.Eventually(t, func() bool { return len(stub.requestBetas()) == 1 }, 5*time.Second, 5*time.Millisecond)
+	// The first segment is out: the turn is committed, so the next flush is
+	// collected behind it rather than restarting it.
+	require.Eventually(t, func() bool {
+		b.turnsMu.Lock()
+		defer b.turnsMu.Unlock()
+		running, ok := b.turns[chatID]
+		return ok && running.committed
+	}, 5*time.Second, 5*time.Millisecond)
 	storeUserText(t, b, chatID, "and another thing")
-	b.respondToChat(textReq(chatID)) // a flush waiting behind the turn
+	b.respondToChat(textReq(chatID)) // collected behind the turn
 
 	b.handleUpdate(context.Background(), nil, clearUpdate(chatID))
 	open()
@@ -98,9 +107,9 @@ func TestClear_DuringTheModelCallDropsTheTurn(t *testing.T) { //NOSONAR go:S100 
 	waitIdle(t, b, chatID)
 
 	assert.Len(t, stub.requestBetas(), 1, "no rerun")
-	assert.Equal(t, []string{clearedNotice}, sentTexts(sent))
+	assert.Equal(t, []string{"First part.", clearedNotice}, sentTexts(sent), "nothing after the confirmation")
 	assert.Empty(t, errs.String())
-	assert.Empty(t, memoryTexts(b, chatID))
+	assert.Empty(t, memoryTexts(b, chatID), "nothing filed")
 }
 
 // A turn's reply recorded after /clear dropped the memory the turn read is
