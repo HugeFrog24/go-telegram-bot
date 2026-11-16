@@ -528,6 +528,10 @@ func renderArgs(input string, p sheetPlan, font string, timeLimit int) []string 
 // does once -ss or -t is set.
 const alphaOnGray = "format=yuva420p,split[fg][bgsrc];[bgsrc]lutyuv=y=128:u=128:v=128:a=255[bg];[bg][fg]overlay=format=yuv420"
 
+// nothingBeforeStart passes frames only once one at or before Start (time 0
+// after the shift) has passed: otherwise the run produces no image.
+const nothingBeforeStart = "select='lte(t,0)+gt(selected_n,0)'"
+
 // timestampText is drawtext's only text: the frame's time (item 11).
 const timestampText = `text='%{pts\:hms}'`
 
@@ -543,8 +547,16 @@ func sheetFilter(p sheetPlan, font string) string {
 		// screen at each tile's time, then shift back in a fine time base so
 		// drawtext prints the source time. One frame works the same way.
 		start := formatSeconds(p.start)
-		f = append(f, "setpts=PTS-"+start+"/TB",
-			"fps=fps="+strconv.FormatFloat(p.rate, 'f', -1, 64)+":start_time=0:round=up",
+		f = append(f, "setpts=PTS-"+start+"/TB")
+		if p.seek > 0 {
+			// Mid-file, the window must hold the frame on screen at Start. If it
+			// does not (that frame began over the lookback earlier), drop
+			// everything: input -t counts from the first frame after the seek
+			// point, so later frames do arrive, and fps would copy the first of
+			// them back onto the earlier tiles.
+			f = append(f, nothingBeforeStart)
+		}
+		f = append(f, "fps=fps="+strconv.FormatFloat(p.rate, 'f', -1, 64)+":start_time=0:round=up",
 			"settb=AVTB", "setpts=PTS+"+start+"/TB")
 	case p.frames > 1:
 		// Unknown duration: the first frame, repeated, every copy at t=0.

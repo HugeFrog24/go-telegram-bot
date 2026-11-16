@@ -909,16 +909,29 @@ func TestRenderSheet_StillImageLookup(t *testing.T) { //NOSONAR go:S100 -- under
 	}
 }
 
-// A frame that began more than the lookback before Start cannot be shown:
-// the documented limit. It must fail as a render failure, not show a later frame.
+// A frame that began more than the lookback before Start is not found: the
+// documented limit. The run must then fail, never show another frame: input
+// -t counts from the first frame after the seek point, so a later frame does
+// reach the filters, and fps would copy it back onto the earlier tiles.
 func TestRenderSheet_FrameBeyondLookback(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	requireFFmpeg(t)
-	path := segmentsFixture(t, 35, "1/35")
+	path := segmentsFixture(t, 35, "1/35") // frames at 0 s (red) and 35 s (green), maybe 70 s (blue)
 	probe, err := probeMedia(context.Background(), path, "video")
 	require.NoError(t, err)
-	_, _, err = renderSheet(context.Background(), path, probe, sheetSpec{Start: 50, Frames: 1, MaxEdge: maxImageEdge})
-	assert.ErrorIs(t, err, errUnsupportedMedia)
-	t.Logf("no frame within the lookback: %v (errNoFrame: %v)", err, errors.Is(err, errNoFrame))
+	for _, spec := range []sheetSpec{
+		{Start: 20, Frames: 1},          // the red frame began 20 s before; green comes at 35 s
+		{Start: 20, End: 30, Frames: 4}, // the same, for a lookup sheet
+		{Start: 50, Frames: 1},          // green began 15 s before; blue may come at 70 s
+	} {
+		spec.MaxEdge = maxImageEdge
+		data, frameTimes, err := renderSheet(context.Background(), path, probe, spec)
+		if err != nil {
+			assert.ErrorIs(t, err, errUnsupportedMedia, "%+v", spec)
+			t.Logf("%+v: %v (errNoFrame: %v)", spec, err, errors.Is(err, errNoFrame))
+			continue
+		}
+		assertTilesShow(t, data, frameTimes, 35) // any image must be the frame really on screen
+	}
 }
 
 func TestRenderSheet_StickerAlpha(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
@@ -1032,6 +1045,8 @@ func TestPlanSheet(t *testing.T) {
 		assert.Equal(t, 6.0, p.start)
 		assert.Equal(t, 0.0, p.seek)
 		assert.InDelta(t, 23, p.window, 1e-9, "the window still covers Start+W from 0")
+		// From the file's start, the first frame is the earliest there is: no guard.
+		assert.NotContains(t, sheetFilter(p, ""), nothingBeforeStart)
 	})
 
 	t.Run("single frame: a small window, sampled like a sheet", func(t *testing.T) {
@@ -1087,7 +1102,7 @@ func TestToolArgs_Render(t *testing.T) { //NOSONAR go:S100 -- underscore separat
 		"-ss", "6.000000", "-t", "23.000000", // 10 s lookback before Start 16
 		"-i", "file:" + in,
 		"-map", "0:V:0", "-an", "-sn", "-dn",
-		"-vf", "setpts=PTS-16.000000/TB,fps=fps=1:start_time=0:round=up,settb=AVTB,setpts=PTS+16.000000/TB,trim=end_frame=12," +
+		"-vf", "setpts=PTS-16.000000/TB,select='lte(t,0)+gt(selected_n,0)',fps=fps=1:start_time=0:round=up,settb=AVTB,setpts=PTS+16.000000/TB,trim=end_frame=12," +
 			"scale=238:422," +
 			`drawtext=fontfile=C\\:\\\\Windows\\\\Fonts\\\\arial.ttf:text='%{pts\:hms}':fontsize=19:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=4:x=4:y=4,` +
 			"tile=4x3",
