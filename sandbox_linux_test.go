@@ -174,9 +174,9 @@ var probeActions = map[string]func(args []string) error{
 	// signal-parent: SIGUSR1 to the bot that ran this tool.
 	"signal-parent": func([]string) error { return syscall.Kill(os.Getppid(), syscall.SIGUSR1) },
 	// fork: a child process, which leaves at once.
-	"fork": func([]string) error { return rawFork(0) },
+	"fork": func([]string) error { return cloneAndReap(0) },
 	// userns: a child process in a new user namespace.
-	"userns": func([]string) error { return rawFork(syscall.CLONE_NEWUSER) },
+	"userns": func([]string) error { return cloneAndReap(syscall.CLONE_NEWUSER) },
 	// setsid and setpgid: a session or group of its own, out of the group kill.
 	"setsid": func([]string) error {
 		_, err := syscall.Setsid()
@@ -247,8 +247,8 @@ var probeActions = map[string]func(args []string) error{
 	},
 }
 
-// rawFork makes a child with clone(2) and flags; the child exits at once.
-func rawFork(flags uintptr) error {
+// cloneAndReap makes a child with clone(2) and flags; the child exits at once.
+func cloneAndReap(flags uintptr) error {
 	pid, _, errno := syscall.RawSyscall6(syscall.SYS_CLONE, flags|uintptr(syscall.SIGCHLD), 0, 0, 0, 0, 0)
 	if errno != 0 {
 		return errno
@@ -516,6 +516,33 @@ func TestMediaSandbox_Seccomp(t *testing.T) { //NOSONAR go:S100 -- underscore se
 	ws, ok := exitErr.Sys().(syscall.WaitStatus)
 	require.True(t, ok)
 	assert.True(t, ws.Signaled() && ws.Signal() == syscall.SIGABRT, "died of SIGABRT: %v, %q", exitErr, toolStderr(err))
+}
+
+// The task count is probed in a child of its own: the caller's RLIMIT_NPROC
+// never drops to the user's count, where its Go runtime could not start a
+// thread. A limit of 1 never lets a probe fork (it is one of the user's
+// tasks itself) unless the user is exempt from the limit.
+func TestKernelUIDTasks(t *testing.T) {
+	var before, after syscall.Rlimit
+	require.NoError(t, syscall.Getrlimit(unix.RLIMIT_NPROC, &before))
+	visible, err := uidTasks(os.Getuid())
+	require.NoError(t, err)
+	n, err := kernelUIDTasks(visible, before.Max)
+	require.NoError(t, err)
+	assert.Positive(t, n)
+	require.NoError(t, syscall.Getrlimit(unix.RLIMIT_NPROC, &after))
+	assert.Equal(t, before, after, "the probes leave the caller's limit alone")
+
+	ok, err := forksUnder(1, before.Max)
+	require.NoError(t, err)
+	if os.Getuid() != 0 {
+		assert.False(t, ok, "a limit of 1 refuses the probe's fork")
+	}
+	ok, err = forksUnder(before.Max, before.Max)
+	require.NoError(t, err)
+	assert.True(t, ok, "the user's own hard limit lets it fork")
+	require.NoError(t, syscall.Getrlimit(unix.RLIMIT_NPROC, &after))
+	assert.Equal(t, before, after, "the probes leave the caller's limit alone")
 }
 
 // A tool cannot exhaust the uid's tasks: RLIMIT_NPROC holds it to the

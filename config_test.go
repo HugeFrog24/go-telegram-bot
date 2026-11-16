@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -23,6 +24,10 @@ func TestMain(m *testing.M) {
 		os.Exit(runMediaSandbox(os.Args[2:]))
 	}
 	if run, ok := testStandIns[filepath.Base(os.Args[0])]; ok {
+		// A stand-in runs under the tool's task cap (RLIMIT_NPROC): a Go
+		// runtime with a P for each of many CPUs could start more threads
+		// than the cap leaves, and dies when one cannot start.
+		runtime.GOMAXPROCS(2)
 		os.Exit(run(os.Args[1:]))
 	}
 	initLoggers()

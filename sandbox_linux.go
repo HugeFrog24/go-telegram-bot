@@ -230,8 +230,11 @@ func runMediaSandbox(args []string) int {
 	// no_new_privs and the re-armed Pdeathsig are all per thread.
 	runtime.LockOSThread()
 	// The helper allocates a few kilobytes and lives for milliseconds: no
-	// collection is worth the mappings one might need under the limit.
+	// collection is worth the mappings one might need under the limit. And
+	// one P keeps its runtime to a few threads, well within the task cap
+	// that its last moments run under (underLastLimits).
 	debug.SetGCPercent(-1)
+	runtime.GOMAXPROCS(1)
 	if err := onSandboxThread(func() error { return mediaSandbox(args, ppid) }); err != nil {
 		fmt.Fprintf(os.Stderr, "media sandbox: %v\n", err)
 		return sandboxExitCode
@@ -287,7 +290,7 @@ func mediaSandbox(args []string, ppid int) error {
 			inv.spec.MemoryLimit = v.memory
 		}
 	}
-	report, err := applySandbox(inv.spec, ppid, v)
+	report, limits, err := applySandbox(inv.spec, ppid, v)
 	if err != nil {
 		return err
 	}
@@ -304,7 +307,7 @@ func mediaSandbox(args []string, ppid int) error {
 		// The run ends right after the report, under the limit, on this
 		// thread: handing back to the main thread could need a new one, and
 		// no thread can be made under the limit.
-		return underMemoryLimit(inv.spec.MemoryLimit, []byte("media sandbox: writing the report failed: errno "), func() unix.Errno {
+		return underLastLimits(limits, []byte("media sandbox: writing the report failed: errno "), func() unix.Errno {
 			if errno := rawWrite(1, out); errno != 0 {
 				return errno
 			}
@@ -312,36 +315,37 @@ func mediaSandbox(args []string, ppid int) error {
 			return 0
 		})
 	}
-	return execTool(inv.spec, inv.argv, os.Environ())
+	return execTool(inv.spec, limits, inv.argv, os.Environ())
 }
 
-// applySandbox applies, in order: the rlimits (the address-space limit
-// itself comes last, see underMemoryLimit), oom_score_adj (best effort),
-// Pdeathsig re-armed on this thread, no_new_privs, Landlock at the best ABI
-// the kernel has (see sandboxABI), and last the seccomp filter (see
+// applySandbox applies, in order: the rlimits (the address-space and task
+// limits themselves come last, see underLastLimits), oom_score_adj (best
+// effort), Pdeathsig re-armed on this thread, no_new_privs, Landlock at the
+// best ABI the kernel has (see sandboxABI), and the seccomp filter (see
 // sandboxSeccomp), all on this thread, which then execs the tool.
-func applySandbox(spec sandboxSpec, ppid int, v sandboxVariant) (sandboxReport, error) {
+func applySandbox(spec sandboxSpec, ppid int, v sandboxVariant) (sandboxReport, lastLimits, error) {
 	var report sandboxReport
-	if err := setToolLimits(spec.MemoryLimit, spec.CPUSeconds); err != nil {
-		return report, err
+	limits, err := setToolLimits(spec.MemoryLimit, spec.CPUSeconds)
+	if err != nil {
+		return report, limits, err
 	}
 	report.OOMScoreAdj = setOOMScoreAdj() == nil
 	// Pdeathsig belongs to the thread that inherited it, and a new thread
 	// starts without it. Exec from another thread would drop it, so this one
 	// takes it again, and a parent already gone means no run (Ruling 14 note 2).
 	if err := unix.Prctl(unix.PR_SET_PDEATHSIG, uintptr(unix.SIGKILL), 0, 0, 0); err != nil {
-		return report, fmt.Errorf("PR_SET_PDEATHSIG: %w", err)
+		return report, limits, fmt.Errorf("PR_SET_PDEATHSIG: %w", err)
 	}
 	if unix.Getppid() != ppid {
-		return report, errors.New("the bot that started this run is gone")
+		return report, limits, errors.New("the bot that started this run is gone")
 	}
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-		return report, fmt.Errorf("PR_SET_NO_NEW_PRIVS: %w", err)
+		return report, limits, fmt.Errorf("PR_SET_NO_NEW_PRIVS: %w", err)
 	}
 	kernel, err := landlockABI()
 	abi, err := sandboxABI(kernel, err, spec.AllowUnsandboxed)
 	if err != nil {
-		return report, err
+		return report, limits, err
 	}
 	if v.maxABI > 0 {
 		abi = min(abi, v.maxABI)
@@ -355,13 +359,13 @@ func applySandbox(spec sandboxSpec, ppid int, v sandboxVariant) (sandboxReport, 
 			interp, _ = elfInterpreter(spec.Tool)
 		}
 		if err := restrictSelf(abi, sandboxRules(spec, interp)); err != nil {
-			return report, err
+			return report, limits, err
 		}
 	}
 	if !v.noSeccomp {
 		report.Seccomp, err = sandboxSeccomp(spec.AllowUnsandboxed)
 	}
-	return report, err
+	return report, limits, err
 }
 
 // errNoSeccomp means the kernel, or a container's own seccomp profile, offers
@@ -400,36 +404,44 @@ func sandboxABI(kernel int, err error, allowUnsandboxed bool) (int, error) {
 	return kernel, nil
 }
 
-// setToolLimits sets core and file size to 0, open files to toolOpenFiles,
-// CPU time to cpu seconds (Ruling 16 item 2: ffprobe has no -timelimit) and
-// the uid's tasks to its count now plus toolThreadHeadroom (Ruling 18 item
-// 2), and checks that the address-space limit can be set to memory: a hard
-// limit already below it is an error, never clamped (Ruling 14 note 3).
-// underMemoryLimit sets that one. A lower inherited open-files, CPU or task
-// hard limit is kept: it is only stricter.
-func setToolLimits(memory, cpu uint64) error {
+// lastLimits are the limits underLastLimits sets just before the helper's
+// last system call, since the helper's own Go runtime could not live under
+// them: RLIMIT_AS and RLIMIT_NPROC, soft and hard.
+type lastLimits struct {
+	memory uint64 // bytes of address space
+	tasks  uint64 // the user's tasks
+}
+
+// setToolLimits sets core and file size to 0, open files to toolOpenFiles
+// and CPU time to cpu seconds (Ruling 16 item 2: ffprobe has no -timelimit),
+// and works out the last limits: the address space, memory, where a hard
+// limit already below it is an error, never clamped (Ruling 14 note 3), and
+// the user's tasks, its count now plus toolThreadHeadroom (Ruling 18 item
+// 2), counted here, before Landlock takes /proc away. A lower inherited
+// open-files, CPU or task hard limit is kept: it is only stricter.
+func setToolLimits(memory, cpu uint64) (lastLimits, error) {
 	var as, files, cpuTime, tasks syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_AS, &as); err != nil {
-		return fmt.Errorf("getrlimit RLIMIT_AS: %w", err)
+		return lastLimits{}, fmt.Errorf("getrlimit RLIMIT_AS: %w", err)
 	}
 	if as.Max < memory {
-		return fmt.Errorf("the hard address-space limit %d is below the %d ffmpeg runs under", as.Max, memory)
+		return lastLimits{}, fmt.Errorf("the hard address-space limit %d is below the %d ffmpeg runs under", as.Max, memory)
 	}
 	for _, l := range []struct {
 		resource int
 		limit    *syscall.Rlimit
 	}{{syscall.RLIMIT_NOFILE, &files}, {syscall.RLIMIT_CPU, &cpuTime}, {unix.RLIMIT_NPROC, &tasks}} {
 		if err := syscall.Getrlimit(l.resource, l.limit); err != nil {
-			return fmt.Errorf("getrlimit %d: %w", l.resource, err)
+			return lastLimits{}, fmt.Errorf("getrlimit %d: %w", l.resource, err)
 		}
 	}
 	visible, err := uidTasks(os.Getuid())
 	if err != nil {
-		return fmt.Errorf("counting the user's tasks: %w", err)
+		return lastLimits{}, fmt.Errorf("counting the user's tasks: %w", err)
 	}
 	running, err := kernelUIDTasks(visible, tasks.Max)
 	if err != nil {
-		return err
+		return lastLimits{}, err
 	}
 	for _, l := range []struct {
 		name     string
@@ -440,15 +452,14 @@ func setToolLimits(memory, cpu uint64) error {
 		{"RLIMIT_FSIZE", syscall.RLIMIT_FSIZE, 0},
 		{"RLIMIT_NOFILE", syscall.RLIMIT_NOFILE, min(toolOpenFiles, files.Max)},
 		{"RLIMIT_CPU", syscall.RLIMIT_CPU, min(cpu, cpuTime.Max)},
-		{"RLIMIT_NPROC", unix.RLIMIT_NPROC, min(uint64(running)+toolThreadHeadroom, tasks.Max)}, // #nosec G115 -- a count
 	} {
 		// syscall's Setrlimit, not unix's: for RLIMIT_NOFILE it also stops
 		// Go restoring the limit it saved at startup in a later exec.
 		if err := syscall.Setrlimit(l.resource, &syscall.Rlimit{Cur: l.value, Max: l.value}); err != nil {
-			return fmt.Errorf("setrlimit %s: %w", l.name, err)
+			return lastLimits{}, fmt.Errorf("setrlimit %s: %w", l.name, err)
 		}
 	}
-	return nil
+	return lastLimits{memory: memory, tasks: min(uint64(running)+toolThreadHeadroom, tasks.Max)}, nil // #nosec G115 -- a count
 }
 
 // uidTasks counts the tasks (threads) whose real uid is uid, which is what
@@ -487,17 +498,13 @@ func uidTasks(uid int) (int, error) {
 	return count, nil
 }
 
-// taskProbe is a path no exec can find: a probe fork's child fails at once.
-const taskProbe = "/proc/self/media-sandbox-task-probe"
-
 // kernelUIDTasks is the kernel's own count of the user's tasks, which is
 // what RLIMIT_NPROC compares with. /proc shows only this PID namespace's
 // tasks (visible, a lower bound), while a container shares its uid with the
 // host and other containers: in Docker, uid 1000 with 1 visible task could
-// not fork under a limit of 40. So the count is found by trying: a fork
-// succeeds exactly while the count is below the soft limit. Each try is one
-// vfork whose child's exec fails and which ForkExec reaps. A limit that
-// never lets a fork through means the user is out of tasks already.
+// not fork under a limit of 40. So the count is found by trying (see
+// forksUnder), by doubling and then a binary search. A limit that never
+// lets a fork through means the user is out of tasks already.
 func kernelUIDTasks(visible int, hard uint64) (int, error) {
 	lo, hi, err := taskBracket(uint64(visible), hard) // #nosec G115 -- a count
 	if err != nil {
@@ -518,7 +525,9 @@ func kernelUIDTasks(visible int, hard uint64) (int, error) {
 			lo = mid
 		}
 	}
-	return int(lo), nil // #nosec G115 -- a count: the smallest limit that forks is the count plus one
+	// hi, the smallest limit that lets the probe fork, is the count plus
+	// two: the probe itself is one of the user's tasks.
+	return int(lo) - 1, nil // #nosec G115 -- a count
 }
 
 // taskBracket finds limits lo, which does not let a fork through (the count
@@ -540,36 +549,128 @@ func taskBracket(visible, hard uint64) (lo, hi uint64, err error) {
 	}
 }
 
-// forksUnder reports whether a fork succeeds with RLIMIT_NPROC's soft limit
-// at limit: whether the user has fewer tasks than that.
+// Exit codes of a task-count probe (taskProbe).
+const (
+	probeForked    = 0
+	probeRefused   = 1
+	probeBrokeDown = 2
+)
+
+// forksUnder reports whether a process whose RLIMIT_NPROC soft limit is
+// limit can fork: whether the user then has fewer tasks than limit. The
+// limit is tried in a probe of its own, a raw fork of this thread that
+// makes system calls only and exits (taskProbe), never in the helper: at
+// the user's count it would also stop the helper's Go runtime starting a
+// thread, which the runtime may do at any moment and does not survive.
+// Signals stay blocked from the fork on, so that no Go signal handler runs
+// in the probe.
 func forksUnder(limit, hard uint64) (bool, error) {
-	if err := syscall.Setrlimit(unix.RLIMIT_NPROC, &syscall.Rlimit{Cur: limit, Max: hard}); err != nil {
-		return false, fmt.Errorf("setrlimit RLIMIT_NPROC: %w", err)
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	lim := unix.Rlimit{Cur: limit, Max: hard}
+	var all, old unix.Sigset_t
+	for i := range all.Val {
+		all.Val[i] = ^all.Val[i]
 	}
-	_, err := syscall.ForkExec(taskProbe, []string{taskProbe}, &syscall.ProcAttr{})
+	if err := unix.PthreadSigmask(unix.SIG_SETMASK, &all, &old); err != nil {
+		return false, fmt.Errorf("blocking signals: %w", err)
+	}
+	pid, errno := rawFork()
+	if errno == 0 && pid == 0 {
+		taskProbe(&lim) // never returns
+	}
+	if err := unix.PthreadSigmask(unix.SIG_SETMASK, &old, nil); err != nil {
+		return false, fmt.Errorf("restoring the signal mask: %w", err)
+	}
+	if errno != 0 {
+		return false, fmt.Errorf("a task-count probe: fork: %w", errno)
+	}
+	var ws unix.WaitStatus
+	for {
+		_, err := unix.Wait4(int(pid), &ws, 0, nil) // #nosec G115 -- a PID
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, unix.EINTR) {
+			return false, fmt.Errorf("a task-count probe: wait: %w", err)
+		}
+	}
 	switch {
-	case errors.Is(err, syscall.ENOENT):
-		return true, nil // forked; the exec failed, as meant
-	case errors.Is(err, syscall.EAGAIN):
+	case ws.Exited() && ws.ExitStatus() == probeForked:
+		return true, nil
+	case ws.Exited() && ws.ExitStatus() == probeRefused:
 		return false, nil
 	}
-	return false, fmt.Errorf("a task-count probe: %w", err)
+	return false, fmt.Errorf("a task-count probe failed (wait status %#x)", uint32(ws))
 }
 
-// underMemoryLimit sets RLIMIT_AS, soft and hard, to memory and then makes
-// the one system call last, allocating nothing in between. The limit has to
-// come last: the helper's own Go runtime already holds more address space
-// than toolMemoryLimit on glibc (about 1.6 GiB measured on Ubuntu 24.04, 1.2
-// GiB on Alpine), and the kernel refuses every new mapping to a process over
-// its limit, so the helper would die at its next heap growth. The tool gets
-// the limit all the same: execve keeps it. If last fails, nothing may
-// allocate any more either: failUnderLimit reports failMsg, made before the
-// limit, and the errno, and ends the helper (review Minor 7).
-func underMemoryLimit(memory uint64, failMsg []byte, last func() unix.Errno) error {
-	limit := unix.Rlimit{Cur: memory, Max: memory}
+// taskProbe is the probe forksUnder forks: one thread, a copy of the
+// helper's memory, and none of the Go runtime's help. So it only makes raw
+// system calls and never allocates or grows its stack: it sets its own soft
+// RLIMIT_NPROC to lim, forks a child that exits at once, reaps it and exits
+// with probeForked; probeRefused if the fork was refused for want of tasks.
+//
+//go:nosplit
+//go:norace
+func taskProbe(lim *unix.Rlimit) {
+	code := uintptr(probeBrokeDown)
+	_, _, errno := syscall.RawSyscall6(unix.SYS_PRLIMIT64, 0, unix.RLIMIT_NPROC, uintptr(unsafe.Pointer(lim)), 0, 0, 0) // #nosec G103 -- prlimit(2) of a struct
+	if errno == 0 {
+		pid, errno := rawFork()
+		switch {
+		case errno == unix.EAGAIN:
+			code = probeRefused
+		case errno != 0:
+		case pid == 0:
+			code = probeForked // the child: exits at once
+		default:
+			_, _, errno = syscall.RawSyscall6(unix.SYS_WAIT4, pid, 0, 0, 0, 0, 0)
+			if errno == 0 {
+				code = probeForked
+			}
+		}
+	}
+	for {
+		_, _, _ = syscall.RawSyscall(unix.SYS_EXIT_GROUP, code, 0, 0)
+	}
+}
+
+// rawFork is fork(2) as clone(2) with SIGCHLD, which every architecture
+// has (AArch64 has no fork): the child's PID, or 0 in the child.
+//
+//go:nosplit
+//go:norace
+func rawFork() (uintptr, syscall.Errno) {
+	if runtime.GOARCH == "s390x" { // clone(stack, flags, ...) there
+		pid, _, errno := syscall.RawSyscall6(unix.SYS_CLONE, 0, uintptr(syscall.SIGCHLD), 0, 0, 0, 0)
+		return pid, errno
+	}
+	pid, _, errno := syscall.RawSyscall6(unix.SYS_CLONE, uintptr(syscall.SIGCHLD), 0, 0, 0, 0, 0)
+	return pid, errno
+}
+
+// underLastLimits sets RLIMIT_NPROC and then RLIMIT_AS, soft and hard, to
+// l and then makes the one system call last, allocating nothing in between.
+// These limits have to come last, as the helper's own Go runtime could not
+// live under them. It already holds more address space than toolMemoryLimit
+// on glibc (about 1.6 GiB measured on Ubuntu 24.04, 1.2 GiB on Alpine), and
+// the kernel refuses every new mapping to a process over its limit, so the
+// helper would die at its next heap growth. And on a many-CPU host its
+// runtime may start dozens of threads (a collection's workers, say), and it
+// dies if one cannot start. The tool gets the limits all the same: execve
+// keeps them. If a limit fails the helper may still allocate, but if last
+// fails nothing may any more: failUnderLimit reports failMsg, made before
+// the limits, and the errno, and ends the helper (review Minor 7).
+func underLastLimits(l lastLimits, failMsg []byte, last func() unix.Errno) error {
+	tasks := unix.Rlimit{Cur: l.tasks, Max: l.tasks}
+	if _, _, errno := unix.RawSyscall6(unix.SYS_PRLIMIT64, 0, unix.RLIMIT_NPROC,
+		uintptr(unsafe.Pointer(&tasks)), 0, 0, 0); errno != 0 { // #nosec G103 -- prlimit(2) of this process
+		return fmt.Errorf("setrlimit RLIMIT_NPROC: %w", errno)
+	}
+	memory := unix.Rlimit{Cur: l.memory, Max: l.memory}
 	if _, _, errno := unix.RawSyscall6(unix.SYS_PRLIMIT64, 0, unix.RLIMIT_AS,
-		uintptr(unsafe.Pointer(&limit)), 0, 0, 0); errno != 0 { // #nosec G103 -- prlimit(2) of this process
-		return fmt.Errorf("setrlimit RLIMIT_AS: %w", errno) // the limit is not set: allocating is still fine
+		uintptr(unsafe.Pointer(&memory)), 0, 0, 0); errno != 0 { // #nosec G103 -- prlimit(2) of this process
+		return fmt.Errorf("setrlimit RLIMIT_AS: %w", errno)
 	}
 	if errno := last(); errno != 0 {
 		failUnderLimit(failMsg, errno)
@@ -617,7 +718,7 @@ func rawWrite(fd int, b []byte) unix.Errno {
 // execve, unlike syscall.Exec, does not take the runtime's exec lock against
 // thread creation: the helper runs no goroutine of its own that could make
 // the runtime start a thread then, and a failed exec only ends the run.
-func execTool(spec sandboxSpec, argv, env []string) error {
+func execTool(spec sandboxSpec, limits lastLimits, argv, env []string) error {
 	path, err := unix.BytePtrFromString(spec.Tool)
 	if err != nil {
 		return err
@@ -631,7 +732,7 @@ func execTool(spec sandboxSpec, argv, env []string) error {
 		return err
 	}
 	failMsg := []byte("media sandbox: execve " + spec.Tool + " failed: errno ")
-	return underMemoryLimit(spec.MemoryLimit, failMsg, func() unix.Errno {
+	return underLastLimits(limits, failMsg, func() unix.Errno {
 		// execve(2) of the bot's own tool path, checked against the spec.
 		_, _, errno := unix.RawSyscall(unix.SYS_EXECVE, uintptr(unsafe.Pointer(path)), uintptr(unsafe.Pointer(&argvp[0])), uintptr(unsafe.Pointer(&envp[0]))) // #nosec G103 G204
 		return errno
