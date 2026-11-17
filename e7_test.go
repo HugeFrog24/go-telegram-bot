@@ -19,7 +19,7 @@ func TestHandleVoiceMessage_BlankTranscriptIsAFailedTranscription(t *testing.T) 
 	sent := recordSends(tg)
 	(&voiceStubs{text: "  \n "}).install(t, b, tg)
 	voice := voiceMessage(ownerChat, 1001)
-	userMsg, err := b.screenIncomingMessage(voice)
+	userMsg, err := b.screenIncomingMessage(voice, targetFor(voice, voice.BusinessConnectionID))
 	require.NoError(t, err)
 
 	b.handleVoiceMessage(context.Background(), voice, userMsg, replyTarget{chatID: ownerChat},
@@ -39,12 +39,12 @@ func TestFileReply_NeverLowersAnsweredThrough(t *testing.T) { //NOSONAR go:S100 
 	const chatID = int64(805)
 	storeUserText(t, b, chatID, "where is the candle farm?")
 	answerInTurn(t, b, chatID, "Open the Farm tab.")
-	mem := b.getOrCreateChatMemory(chatID)
+	mem := b.getOrCreateChatMemory(chatKey(chatID))
 	answered := mem.answeredThrough.Load()
 	require.NotZero(t, answered)
 
 	turn, _ := b.beginTurn(context.Background(), chatID)
-	_, err := b.recordTurnReply(turn, chatID, "a reply that covered nothing")
+	_, err := b.recordTurnReply(turn, chatKey(chatID), "a reply that covered nothing")
 	require.NoError(t, err)
 	b.finishTurn(turn)
 

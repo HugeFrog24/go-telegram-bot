@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/go-telegram/bot/models"
@@ -42,7 +43,8 @@ func TestHandledCommand_OutOfRangeEntities(t *testing.T) { //NOSONAR go:S100 -- 
 				text = "/clear"
 			}
 			assert.NotPanics(t, func() {
-				assert.Empty(t, handledCommand(commandMessage(text, entity)))
+				command, _ := handledCommand(commandMessage(text, entity), "")
+				assert.Empty(t, command)
 			})
 		})
 	}
@@ -51,11 +53,12 @@ func TestHandledCommand_OutOfRangeEntities(t *testing.T) { //NOSONAR go:S100 -- 
 // An overlapping, out-of-range entity before a good one is skipped.
 func TestHandledCommand_OverlappingEntities(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	assert.NotPanics(t, func() {
-		assert.Equal(t, "/stats", handledCommand(commandMessage("/stats /clear",
+		command, _ := handledCommand(commandMessage("/stats /clear",
 			models.MessageEntity{Offset: 3, Length: 1 << 40},
 			models.MessageEntity{Offset: 2, Length: 6},
 			models.MessageEntity{Offset: 0, Length: 6},
-		)))
+		), "")
+		assert.Equal(t, "/stats", command)
 	})
 }
 
@@ -76,8 +79,9 @@ func TestHandledCommand_OnlyAtTheStart(t *testing.T) { //NOSONAR go:S100 -- unde
 		"with an emoji after it": {"/clear 😀", 0, 6, "/clear"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			assert.Equal(t, tc.want, handledCommand(commandMessage(tc.text,
-				models.MessageEntity{Offset: tc.offset, Length: tc.length})))
+			command, _ := handledCommand(commandMessage(tc.text,
+				models.MessageEntity{Offset: tc.offset, Length: tc.length}), "")
+			assert.Equal(t, tc.want, command)
 		})
 	}
 }
@@ -111,4 +115,39 @@ func TestHandleUpdate_CommandMidTextIsText(t *testing.T) { //NOSONAR go:S100 -- 
 	require.Len(t, texts, 4)
 	assert.Contains(t, texts[2], "Bot Statistics")
 	assert.Equal(t, "User with ID 5 not found.", texts[3], "/clear 5 acts on user 5")
+}
+
+// setBotUsername makes b's Telegram username name, as GetMe reports it at
+// startup.
+func setBotUsername(b *Bot, name string) { b.username = name }
+
+// A command addressed to a bot by name counts only when the name is this
+// bot's, in any case of the name: /stats@thisbot is /stats. One addressed to another bot
+// is ignored: no reply, and nothing reaches the model.
+func TestHandleUpdate_CommandAddressedToABot(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	stub := newAnthropicStub(t, candleFarmStream())
+	b, tg := setupBotForTest(t, 123)
+	useAnthropicStub(b, stub)
+	sent := recordSends(tg)
+	setBotUsername(b, "ThisBot")
+	user := &models.User{ID: 123, Username: "owner"}
+	msgID := 1400
+	send := func(text string) []string {
+		before := len(sent())
+		msgID++
+		command, _, _ := strings.Cut(text, " ")
+		u := textUpdate(groupChatID, msgID, user, text)
+		u.Message.Entities = []models.MessageEntity{{Type: "bot_command", Offset: 0, Length: len(command)}}
+		b.handleUpdate(context.Background(), nil, u)
+		return sentTexts(sent)[before:]
+	}
+
+	for _, text := range []string{"/stats@ThisBot", "/stats@thisbot", "/stats"} {
+		replies := send(text)
+		require.Len(t, replies, 1, text)
+		assert.Contains(t, replies[0], "Bot Statistics", text)
+	}
+	assert.Empty(t, send("/stats@OtherBot"), "a command for another bot gets no reply")
+	assert.Empty(t, send("/start@OtherBot hello"), "nor does any other")
+	assert.Empty(t, stub.requestBetas(), "and none reaches the model")
 }

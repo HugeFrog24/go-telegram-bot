@@ -94,14 +94,14 @@ func TestStripDeadFileIDFromMemory(t *testing.T) {
 	b, _ := setupBotForTest(t, 100)
 	chatID := int64(42)
 
-	cm := b.getOrCreateChatMemory(chatID)
+	cm := b.getOrCreateChatMemory(chatKey(chatID))
 	cm.Messages = []Message{
 		{IsUser: true, Text: "first", ImageFileIDs: []string{"file_a", "file_b"}},
 		{IsUser: false, Text: "reply"},
 		{IsUser: true, Text: "third", ImageFileIDs: []string{"file_b", "file_c"}},
 	}
 
-	b.stripDeadFileIDFromMemory(chatID, "file_b")
+	b.stripDeadFileIDFromMemory(chatKey(chatID), "file_b")
 
 	assert.Equal(t, []string{"file_a"}, cm.Messages[0].ImageFileIDs, "file_b should be removed from message 1")
 	assert.Empty(t, cm.Messages[1].ImageFileIDs, "assistant message untouched")
@@ -110,7 +110,7 @@ func TestStripDeadFileIDFromMemory(t *testing.T) {
 
 func TestStripDeadFileIDFromMemory_UnknownChatIsNoop(t *testing.T) {
 	b, _ := setupBotForTest(t, 100)
-	b.stripDeadFileIDFromMemory(99999, "file_anything")
+	b.stripDeadFileIDFromMemory(chatKey(99999), "file_anything")
 }
 
 // videoGateBot builds a Bot around the given video block. The database is

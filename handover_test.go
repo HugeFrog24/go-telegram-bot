@@ -24,7 +24,7 @@ func handoverTurn(t *testing.T, b *Bot, chatID int64, want uint64) *chatTurn {
 func heldTurn(b *Bot, chatID int64) *chatTurn {
 	b.turnsMu.Lock()
 	defer b.turnsMu.Unlock()
-	return b.turns[chatID]
+	return b.turns[chatKey(chatID)]
 }
 
 // closeTurn with handOver registers the collected flush's turn in the same
@@ -49,7 +49,7 @@ func TestCloseTurn_NoHandoverForAnAnsweredFlush(t *testing.T) { //NOSONAR go:S10
 	b, _ := setupBotForTest(t, 123)
 	const chatID = int64(821)
 	turn := handoverTurn(t, b, chatID, 7)
-	b.getOrCreateChatMemory(chatID).answeredThrough.Store(7) // a reply covered it meanwhile
+	b.getOrCreateChatMemory(chatKey(chatID)).answeredThrough.Store(7) // a reply covered it meanwhile
 
 	_, next, _ := b.closeTurn(turn, true)
 
@@ -76,7 +76,8 @@ func TestEndTurn_RegistersTheCollectedFlushBeforeReturning(t *testing.T) { //NOS
 	next := heldTurn(b, chatID)
 	require.NotNil(t, next, "the collected flush holds the chat")
 	assert.NotSame(t, turn, next)
-	b.cancelForClear(chatID) // let it end silently
+	_, err := b.beginClear(chatKey(chatID)) // let it end silently
+	require.NoError(t, err)
 	close(release)
 	waitIdle(t, b, chatID)
 }

@@ -13,10 +13,11 @@ import (
 	"gorm.io/gorm"
 )
 
-// A media message never takes over the text batch waiting in its quiet
-// window: the batch runs first, as its own text turn (startWaitingText). It is
-// answered whatever becomes of the media path, which may end without a model
-// turn of its own.
+// The owner's text waiting in its quiet window is answered whatever becomes
+// of the owner's media message that follows it. A media path that gives up
+// before it takes the chat leaves the batch in its window, answered when the
+// window closes; one that took the batch over and then ends without reading
+// it runs it as text (beginMediaTurn).
 
 const ownerChat = int64(123) // the owner's private chat
 
@@ -32,7 +33,7 @@ func takeoverBot(t *testing.T) (*Bot, *MockTelegramClient, *anthropicStub, func(
 	sent := recordSends(tg)
 	b.config.DebounceMs = int(bufferOnly / time.Millisecond)
 	b.handleUpdate(context.Background(), nil, textUpdate(ownerChat, 950, owner, "where is the candle farm?"))
-	require.True(t, b.hasPendingIntake(ownerChat))
+	require.True(t, b.hasPendingIntake(chatKey(ownerChat)))
 	return b, tg, stub, sent
 }
 
@@ -41,7 +42,11 @@ func takeoverBot(t *testing.T) (*Bot, *MockTelegramClient, *anthropicStub, func(
 func requireBatchAnswered(t *testing.T, b *Bot, stub *anthropicStub) {
 	t.Helper()
 	waitIdle(t, b, ownerChat)
-	assert.False(t, b.hasPendingIntake(ownerChat))
+	if b.hasPendingIntake(chatKey(ownerChat)) {
+		flushPending(t, b, ownerChat) // the quiet window closes
+		waitIdle(t, b, ownerChat)
+	}
+	assert.False(t, b.hasPendingIntake(chatKey(ownerChat)))
 	require.Len(t, stub.requestBetas(), 1, "the waiting text is answered")
 	role, text := stub.lastMessage(t, 0)
 	assert.Equal(t, "user", role)
@@ -96,7 +101,7 @@ func TestHandleUpdate_BufferedTextSurvivesFailedPhotoStore(t *testing.T) { //NOS
 	b, tg, stub, sent := takeoverBot(t)
 	serveTelegramFiles(t, tg, nil)
 	require.NoError(t, b.db.Callback().Create().Before("gorm:create").Register("test:fail_photo_store", func(db *gorm.DB) {
-		if m, ok := db.Statement.Dest.(*Message); ok && len(m.ImageFileIDs) > 0 {
+		if m, ok := db.Statement.Dest.(*Message); ok && m.TelegramMessageID == 954 { // the photo's row, on arrival
 			_ = db.AddError(errors.New("disk full"))
 		}
 	}))
@@ -120,7 +125,7 @@ func TestHandleUpdate_RateLimitedPhotoLeavesTheWaitingTextAlone(t *testing.T) { 
 
 	b.handleUpdate(context.Background(), nil, photoUpdate(956))
 
-	assert.True(t, b.hasPendingIntake(ownerChat), "the batch still waits in its window")
+	assert.True(t, b.hasPendingIntake(chatKey(ownerChat)), "the batch still waits in its window")
 	assert.Empty(t, stub.requestBetas())
 	flushPending(t, b, ownerChat)
 	requireBatchAnswered(t, b, stub)
@@ -139,7 +144,7 @@ func TestFlushAlbum_RateLimitedAlbumLeavesBufferedTextAnswered(t *testing.T) { /
 	album.Message.MediaGroupID = "album-1"
 	b.handleUpdate(context.Background(), nil, album)
 
-	b.flushAlbum(context.Background(), "album-1")
+	b.flushAlbum(context.Background(), albumKey{conv: chatKey(ownerChat), mediaGroupID: "album-1"})
 
 	requireBatchAnswered(t, b, stub)
 }

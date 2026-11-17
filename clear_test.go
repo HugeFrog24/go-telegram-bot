@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"log"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -106,7 +105,7 @@ func TestClear_DuringTheModelCallDropsTheTurn(t *testing.T) { //NOSONAR go:S100 
 	require.Eventually(t, func() bool {
 		b.turnsMu.Lock()
 		defer b.turnsMu.Unlock()
-		running, ok := b.turns[chatID]
+		running, ok := b.turns[chatKey(chatID)]
 		return ok && running.committed
 	}, 5*time.Second, 5*time.Millisecond)
 	storeUserText(t, b, chatID, "and another thing")
@@ -123,35 +122,34 @@ func TestClear_DuringTheModelCallDropsTheTurn(t *testing.T) { //NOSONAR go:S100 
 	assert.Empty(t, memoryTexts(b, chatID), "nothing filed")
 }
 
-// A turn's reply recorded after /clear dropped the memory the turn read is
-// stored aside, and stays out of the new conversation.
-func TestRecordTurnReply_AfterClearIsAside(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+// A turn's reply recorded after /clear replaced the memory the turn read is
+// neither stored nor filed: it answers a history that is gone.
+func TestRecordTurnReply_AfterClearIsDropped(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	b, tg := setupBotForTest(t, 123)
 	recordSends(tg)
 	const chatID = int64(123)
 	first := storeUserText(t, b, chatID, "hi")
 	turn, _, ok := b.beginTextTurn(textReq(chatID), first.Seq)
 	require.True(t, ok)
-	b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatID))
-	b.clearChatHistory(context.Background(), replyTarget{chatID: chatID}, 123, 0, 0, false)
+	b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatKey(chatID)))
+	b.clearChatHistory(context.Background(), replyTarget{chatID: chatID}, profile{id: 123}, 0, 0, false)
 	storeUserText(t, b, chatID, "a new start")
 
-	reply, err := b.recordTurnReply(turn, chatID, "an answer to the cleared history")
-	require.NoError(t, err)
+	_, err := b.recordTurnReply(turn, chatKey(chatID), "an answer to the cleared history")
 	b.finishTurn(turn)
 
-	assert.True(t, reply.Aside)
-	assert.True(t, storedRow(t, b, chatID, "an answer to the cleared history").Aside)
+	assert.ErrorIs(t, err, errStaleReply)
+	assert.Empty(t, rowsWithText(t, b, chatID, "an answer to the cleared history"))
 	assert.Equal(t, []string{"a new start"}, memoryTexts(b, chatID))
 	dropChatMemory(b, chatID)
 	assert.Equal(t, []string{"a new start"}, memoryTexts(b, chatID))
 }
 
-// Blind P7 inverted: /clear lands between a photo's store and its join. The
-// photo joins the new memory, and its turn reads that memory: the request
-// holds the photo and none of the cleared history, and the reply is filed
-// after the photo.
-func TestHandlePhotoMessage_ClearBetweenStoreAndJoinReadsTheNewMemory(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+// Blind P7, as G6 changed it: /clear lands between a photo's upload and its
+// join. The photo's row was stored on arrival, before the clear, so the clear
+// deleted it: the photo does not join, nothing is answered, and none of the
+// cleared history comes back.
+func TestHandlePhotoMessage_ClearBetweenUploadAndJoinRefusesThePhoto(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	stub := newAnthropicStub(t, candleFarmStream())
 	b, tg := setupBotForTest(t, 123)
 	useAnthropicStub(b, stub)
@@ -161,11 +159,9 @@ func TestHandlePhotoMessage_ClearBetweenStoreAndJoinReadsTheNewMemory(t *testing
 	const chatID = int64(123)
 	storeUserText(t, b, chatID, "OLD-SECRET before clear")
 	var fired atomic.Bool
-	require.NoError(t, b.db.Callback().Create().After("gorm:create").Register("test:clear_mid_photo", func(db *gorm.DB) {
+	require.NoError(t, b.db.Callback().Update().Before("gorm:begin_transaction").Register("test:clear_mid_photo", func(db *gorm.DB) {
 		if m, ok := db.Statement.Dest.(*Message); ok && len(m.ImageFileIDs) > 0 && fired.CompareAndSwap(false, true) {
-			// what clearChatHistory does, landing between the store and the join
-			db.Session(&gorm.Session{NewDB: true}).Where("chat_id = ? AND id <> ?", chatID, m.ID).Delete(&Message{})
-			dropChatMemory(b, chatID)
+			clearOwnChat(b, chatID, false) // landing as the photo's upload is recorded
 		}
 	}))
 
@@ -176,11 +172,8 @@ func TestHandlePhotoMessage_ClearBetweenStoreAndJoinReadsTheNewMemory(t *testing
 	waitIdle(t, b, chatID)
 
 	require.True(t, fired.Load())
-	require.Len(t, stub.requestBetas(), 1)
-	body := string(stub.body(t, 0))
-	assert.Contains(t, body, "file_stub", "the request holds the photo")
-	assert.False(t, strings.Contains(body, "OLD-SECRET"), "and none of the cleared history")
-	assert.Equal(t, []string{"", "Open the Farm tab."}, memoryTexts(b, chatID), "the reply follows the photo")
+	assert.Empty(t, stub.requestBetas(), "the photo sent before the clear is not answered")
+	assert.Empty(t, memoryTexts(b, chatID))
 }
 
 // /clear lands while a voice turn is synthesising its answer: the turn ends
@@ -195,7 +188,7 @@ func TestClear_DuringSpeechSynthesisSendsNothing(t *testing.T) { //NOSONAR go:S1
 	voices.install(t, b, tg)
 	t.Cleanup(func() { close(voices.speak) })
 	voice := voiceMessage(ownerChat, 972)
-	userMsg, err := b.screenIncomingMessage(voice)
+	userMsg, err := b.screenIncomingMessage(voice, targetFor(voice, voice.BusinessConnectionID))
 	require.NoError(t, err)
 	done := make(chan struct{})
 	go func() {
@@ -205,7 +198,7 @@ func TestClear_DuringSpeechSynthesisSendsNothing(t *testing.T) { //NOSONAR go:S1
 	}()
 	<-voices.speaking // the model has answered; speech is being made
 
-	b.clearChatHistory(context.Background(), replyTarget{chatID: ownerChat}, 123, 0, 0, false)
+	b.clearChatHistory(context.Background(), replyTarget{chatID: ownerChat}, profile{id: 123}, 0, 0, false)
 	<-done
 
 	assert.Equal(t, []string{clearedNotice}, sentTexts(sent), "nothing after the confirmation")
@@ -225,7 +218,8 @@ func TestAnswerOutput_CancelledTurnSendsNoSegment(t *testing.T) { //NOSONAR go:S
 	defer out.close()
 	require.NoError(t, out.onSegment("before the clear"))
 
-	b.cancelForClear(chatID)
+	_, err := b.beginClear(chatKey(chatID))
+	require.NoError(t, err)
 
 	assert.NoError(t, out.onSegment("after the clear"))
 	assert.Equal(t, []string{"before the clear"}, sentTexts(sent))

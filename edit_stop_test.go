@@ -15,8 +15,8 @@ import (
 // the way screenIncomingMessage does, without going through handleUpdate.
 func storeUserMessage(t *testing.T, b *Bot, chatID int64, telegramID int, text string) Message {
 	t.Helper()
-	b.getOrCreateChatMemory(chatID)
-	msg := b.createMessage(chatID, chatID, "owner", "user", text, true)
+	b.getOrCreateChatMemory(chatKey(chatID))
+	msg := b.createMessage(chatKey(chatID), chatID, "owner", "user", text, true)
 	msg.TelegramMessageID = telegramID
 	require.NoError(t, b.storeMessage(&msg))
 	joined, ok := b.joinConversation(msg)
@@ -39,10 +39,10 @@ func TestHandleUpdate_EditedMessageUpdatesTextAndRearmsWindow(t *testing.T) { //
 	b.handleUpdate(context.Background(), nil, &models.Update{Message: &models.Message{
 		ID: 77, Chat: models.Chat{ID: chatID}, From: from, Text: "How to use libtik",
 	}})
-	require.True(t, b.hasPendingIntake(chatID))
+	require.True(t, b.hasPendingIntake(chatKey(chatID)))
 	b.intakeBuffersMu.Lock()
-	seqBefore := b.intakeBuffers[chatID].seq
-	timerBefore := b.intakeBuffers[chatID].timer
+	seqBefore := b.intakeBuffers[chatKey(chatID)].seq
+	timerBefore := b.intakeBuffers[chatKey(chatID)].timer
 	b.intakeBuffersMu.Unlock()
 
 	b.handleUpdate(context.Background(), nil, editUpdate(chatID, 77, "How to use libtibik"))
@@ -51,15 +51,15 @@ func TestHandleUpdate_EditedMessageUpdatesTextAndRearmsWindow(t *testing.T) { //
 	require.NoError(t, b.db.Where("chat_id = ? AND telegram_message_id = ?", chatID, 77).First(&stored).Error)
 	assert.Equal(t, "How to use libtibik", stored.Text, "database copy follows the edit")
 
-	mem := b.getOrCreateChatMemory(chatID)
+	mem := b.getOrCreateChatMemory(chatKey(chatID))
 	assert.Equal(t, "How to use libtibik", mem.Messages[len(mem.Messages)-1].Text, "memory copy follows the edit")
 
-	require.True(t, b.hasPendingIntake(chatID), "an edit must not flush or drop the batch")
+	require.True(t, b.hasPendingIntake(chatKey(chatID)), "an edit must not flush or drop the batch")
 	b.intakeBuffersMu.Lock()
 	defer b.intakeBuffersMu.Unlock()
-	assert.Equal(t, seqBefore, b.intakeBuffers[chatID].seq, "same batch")
-	assert.NotSame(t, timerBefore, b.intakeBuffers[chatID].timer, "the window restarted")
-	assert.Equal(t, 1, b.intakeBuffers[chatID].count, "an edit is not a new message")
+	assert.Equal(t, seqBefore, b.intakeBuffers[chatKey(chatID)].seq, "same batch")
+	assert.NotSame(t, timerBefore, b.intakeBuffers[chatKey(chatID)].timer, "the window restarted")
+	assert.Equal(t, 1, b.intakeBuffers[chatKey(chatID)].count, "an edit is not a new message")
 }
 
 func TestHandleUpdate_EditFromEmojiToTextClearsEmojiFlag(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
@@ -71,14 +71,14 @@ func TestHandleUpdate_EditFromEmojiToTextClearsEmojiFlag(t *testing.T) { //NOSON
 		ID: 78, Chat: models.Chat{ID: chatID}, From: &models.User{ID: chatID}, Text: "👍",
 	}})
 	b.intakeBuffersMu.Lock()
-	require.True(t, b.intakeBuffers[chatID].allEmojiOnly)
+	require.True(t, b.intakeBuffers[chatKey(chatID)].allEmojiOnly)
 	b.intakeBuffersMu.Unlock()
 
 	b.handleUpdate(context.Background(), nil, editUpdate(chatID, 78, "can you explain that again?"))
 
 	b.intakeBuffersMu.Lock()
 	defer b.intakeBuffersMu.Unlock()
-	assert.False(t, b.intakeBuffers[chatID].allEmojiOnly, "a real question must not get an emoji-only reply")
+	assert.False(t, b.intakeBuffers[chatKey(chatID)].allEmojiOnly, "a real question must not get an emoji-only reply")
 }
 
 func TestHandleUpdate_CaptionEditApplies(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
@@ -107,7 +107,7 @@ func TestHandleUpdate_EditOfAnsweredMessageOnlyCorrectsRecord(t *testing.T) { //
 		ID: 81, Chat: models.Chat{ID: chatID}, From: &models.User{ID: chatID}, Text: "second question",
 	}})
 	b.intakeBuffersMu.Lock()
-	timerBefore := b.intakeBuffers[chatID].timer
+	timerBefore := b.intakeBuffers[chatKey(chatID)].timer
 	b.intakeBuffersMu.Unlock()
 
 	b.handleUpdate(context.Background(), nil, editUpdate(chatID, 80, "first question, corrected"))
@@ -117,7 +117,7 @@ func TestHandleUpdate_EditOfAnsweredMessageOnlyCorrectsRecord(t *testing.T) { //
 	assert.Equal(t, "first question, corrected", stored.Text, "the record is corrected")
 	b.intakeBuffersMu.Lock()
 	defer b.intakeBuffersMu.Unlock()
-	assert.Same(t, timerBefore, b.intakeBuffers[chatID].timer, "an answered message's edit must not touch another batch's window")
+	assert.Same(t, timerBefore, b.intakeBuffers[chatKey(chatID)].timer, "an answered message's edit must not touch another batch's window")
 }
 
 func TestHandleUpdate_EditRestartsUncommittedTurn(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
@@ -141,7 +141,7 @@ func TestHandleUpdate_EditOfUnknownMessageIsIgnored(t *testing.T) { //NOSONAR go
 
 	b.handleUpdate(context.Background(), nil, editUpdate(123, 999, "never stored"))
 
-	assert.False(t, b.hasPendingIntake(123))
+	assert.False(t, b.hasPendingIntake(chatKey(123)))
 	var count int64
 	b.db.Model(&Message{}).Where("chat_id = ?", 123).Count(&count)
 	assert.Zero(t, count, "an edit never creates a message")
@@ -176,7 +176,7 @@ func TestClearChatHistory_DiscardsCollectedFlush(t *testing.T) { //NOSONAR go:S1
 	_, _, ok = b.beginTextTurn(textReq(chatID), 7)
 	require.False(t, ok, "collected behind the running turn")
 
-	b.clearChatHistory(context.Background(), replyTarget{chatID: chatID}, chatID, 0, 0, false)
+	b.clearChatHistory(context.Background(), replyTarget{chatID: chatID}, profile{id: chatID}, 0, 0, false)
 
 	assert.Nil(t, b.finishTurn(turn), "the collected flush must not rerun against the emptied chat")
 }

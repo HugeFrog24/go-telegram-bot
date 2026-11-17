@@ -103,18 +103,24 @@ func (s *statusLine) note(text string) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
-	text = clampRunes(text, telegramMessageLimit)
+	if s.setPending(clampRunes(text, telegramMessageLimit)) {
+		s.wake()
+	}
+}
+
+// setPending makes text the waiting note, unless notes have ended, and
+// reports whether it did, under s.mu.
+func (s *statusLine) setPending(text string) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed || s.ended {
-		s.mu.Unlock()
-		return
+		return false
 	}
 	if s.pending == "" {
 		s.pendingAt = time.Now()
 	}
 	s.pending = text
-	s.mu.Unlock()
-	s.wake()
+	return true
 }
 
 // answerSent is for segment mode: answer text just reached the user, so the
@@ -122,20 +128,25 @@ func (s *statusLine) note(text string) {
 // line from sitting above text the user has read. The next note starts a new
 // status message below the answer. After close it has no effect.
 func (s *statusLine) answerSent() {
-	s.mu.Lock()
-	s.pending = ""
-	s.dropShown = true
-	s.mu.Unlock()
+	s.withLock(func() {
+		s.pending = ""
+		s.dropShown = true
+	})
 	s.wake()
+}
+
+// withLock runs f under s.mu.
+func (s *statusLine) withLock(f func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f()
 }
 
 // dropWaiting is for draft mode: answer text is streaming into the draft, so
 // a note still waiting to be shown is dropped. Unlike freeze it does not end
 // the notes, and unlike answerSent it leaves a shown message alone.
 func (s *statusLine) dropWaiting() {
-	s.mu.Lock()
-	s.pending = ""
-	s.mu.Unlock()
+	s.withLock(func() { s.pending = "" })
 }
 
 // freeze ends notes for the turn: the waiting note is dropped and later
@@ -143,10 +154,10 @@ func (s *statusLine) dropWaiting() {
 // removes it. Draft mode calls it once the first block of answer text is
 // final; the sender calls it after a failed call or a Business refusal.
 func (s *statusLine) freeze() {
-	s.mu.Lock()
-	s.pending = ""
-	s.ended = true
-	s.mu.Unlock()
+	s.withLock(func() {
+		s.pending = ""
+		s.ended = true
+	})
 }
 
 // close stops the sender, waits for any call in flight, then deletes the
@@ -158,11 +169,12 @@ func (s *statusLine) freeze() {
 // gives it shutdownGrace at most.
 func (s *statusLine) close() {
 	s.closeOnce.Do(func() {
-		s.mu.Lock()
-		s.closed = true
-		s.pending = ""
-		started := s.started
-		s.mu.Unlock()
+		var started bool
+		s.withLock(func() {
+			s.closed = true
+			s.pending = ""
+			started = s.started
+		})
 		s.cancel()
 		if !started {
 			return
@@ -191,6 +203,7 @@ func (s *statusLine) wake() {
 // every call that is due, and sleep until the next one is.
 func (s *statusLine) run() {
 	defer close(s.done)
+	defer s.b.recoverPanic("status line")
 
 	var due <-chan time.Time
 	for {
@@ -402,48 +415,4 @@ func (b *Bot) waitForStatusLines(timeout time.Duration) bool {
 			b.config.ID, timeout)
 		return false
 	}
-}
-
-// businessRightsEntry is one cached getBusinessConnection answer.
-type businessRightsEntry struct {
-	allowed bool
-	fetched time.Time
-}
-
-// businessNotesAllowed reports whether a Business connection lets the bot
-// show progress notes: it must be enabled and able to send messages (which
-// covers editing them) and delete them afterwards. Every successful lookup,
-// allowing or not, is cached for businessRightsTTL; a failed lookup means no
-// notes and is retried next time.
-func (b *Bot) businessNotesAllowed(ctx context.Context, connectionID string) bool {
-	b.businessRightsMu.Lock()
-	entry, ok := b.businessRights[connectionID]
-	b.businessRightsMu.Unlock()
-	if ok && b.clock.Now().Sub(entry.fetched) < businessRightsTTL {
-		return entry.allowed
-	}
-
-	conn, err := b.tgBot.GetBusinessConnection(ctx, &bot.GetBusinessConnectionParams{BusinessConnectionID: connectionID})
-	if err == nil && conn == nil {
-		err = errors.New("getBusinessConnection returned no connection")
-	}
-	if err != nil {
-		ErrorLogger.Printf("[%s] business rights lookup for connection %s failed, no progress notes: %v",
-			b.config.ID, connectionID, err)
-		return false
-	}
-	allowed := conn.IsEnabled && conn.Rights != nil && conn.Rights.CanReply && conn.Rights.CanDeleteSentMessages
-
-	b.businessRightsMu.Lock()
-	b.businessRights[connectionID] = businessRightsEntry{allowed: allowed, fetched: b.clock.Now()}
-	b.businessRightsMu.Unlock()
-	return allowed
-}
-
-// forgetBusinessRights drops the cached rights of a connection, so the next
-// lookup asks Telegram again.
-func (b *Bot) forgetBusinessRights(connectionID string) {
-	b.businessRightsMu.Lock()
-	defer b.businessRightsMu.Unlock()
-	delete(b.businessRights, connectionID)
 }

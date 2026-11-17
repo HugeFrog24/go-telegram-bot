@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
@@ -20,7 +21,7 @@ type Bot struct {
 	tgBot           TelegramClient
 	db              *gorm.DB
 	anthropicClient anthropic.Client
-	chatMemories    map[int64]*ChatMemory
+	chatMemories    map[convKey]*ChatMemory
 	memorySize      int
 	chatMemoriesMu  sync.RWMutex
 	config          BotConfig
@@ -28,12 +29,12 @@ type Bot struct {
 	userLimitersMu  sync.RWMutex
 	clock           Clock
 	botID           uint
-	albumBuffers    map[string]*pendingAlbum
+	albumBuffers    map[albumKey]*pendingAlbum
 	albumBuffersMu  sync.Mutex
-	intakeBuffers   map[int64]*pendingIntake
+	intakeBuffers   map[convKey]*pendingIntake
 	intakeBuffersMu sync.Mutex
 	intakeSeq       uint64
-	turns           map[int64]*chatTurn
+	turns           map[convKey]*chatTurn
 	turnsMu         sync.Mutex
 	turnSeq         uint64
 
@@ -41,6 +42,44 @@ type Bot struct {
 	// (Message.Seq), and memoryGen the last generation given to a chat
 	// memory (ChatMemory.generation). Guarded by chatMemoriesMu.
 	memorySeq, memoryGen uint64
+
+	// allChatsCutoffs holds, per user, the newest cutoff of an admin's
+	// /clear of their messages in every chat (beginUserClear with chat 0):
+	// a message of theirs at or below it was deleted, and never joins or
+	// loads, in any chat, including one whose memory was not loaded then.
+	// One entry per user so cleared, for the process's life; guarded by
+	// chatMemoriesMu.
+	allChatsCutoffs map[int64]uint
+
+	// chatCutoffs holds, per chat ID and user, the newest cutoff of an
+	// admin's /clear of that user's messages in that chat (/clear <user_id>
+	// <chat_id>), which covers every conversation with that chat ID: each
+	// Business connection's and each topic's, loaded or not. As
+	// allChatsCutoffs, for the process's life; guarded by chatMemoriesMu.
+	chatCutoffs map[chatUser]uint
+
+	// commandLimiters holds each user's handled-command limit (allowCommand).
+	// Guarded by userLimitersMu.
+	commandLimiters map[int64]*commandLimiter
+
+	// mediaWaiters holds each conversation's media turns waiting for it, in
+	// no order (beginMediaTurn). Guarded by turnsMu.
+	mediaWaiters map[convKey][]*mediaWaiter
+
+	// textsOnWay holds, per conversation, the text messages that joined
+	// memory but whose batch or turn is not on record yet (joinText,
+	// landText). Guarded by intakeBuffersMu.
+	textsOnWay map[convKey]*textsOnWay
+
+	// username is the bot's Telegram username, from GetMe at startup: a
+	// command addressed to a bot counts only when it names this one
+	// (handledCommand). Set before updates are handled.
+	username string
+
+	// selfID is the bot's own Telegram user ID, from the same GetMe: a
+	// Business message whose sender_business_bot is this bot is one of its
+	// own replies, already recorded. 0 while unknown.
+	selfID int64
 
 	// ElevenLabs endpoints: fields so tests can point them at a stand-in.
 	sttURL, ttsURL string
@@ -52,13 +91,19 @@ type Bot struct {
 	draftAfter     func(time.Duration) <-chan time.Time
 
 	// Progress-note status messages: the first-send delay and edit throttle
-	// (fields so tests can shorten them), the per-connection cache of
-	// Business rights, and the lines a shutdown waits for.
+	// (fields so tests can shorten them), and the lines a shutdown waits for.
 	statusFirstDelay   time.Duration
 	statusEditInterval time.Duration
-	businessRights     map[string]businessRightsEntry
-	businessRightsMu   sync.Mutex
 	statusLines        openStatusLines
+
+	// businessConns caches what the bot knows of each Business connection
+	// (businessConnection), businessConnSeq orders its stores, and
+	// businessRefused holds the connections whose refusal was logged (B8).
+	// Guarded by businessConnsMu.
+	businessConns   map[string]businessConn
+	businessConnSeq uint64
+	businessRefused map[string]bool
+	businessConnsMu sync.Mutex
 
 	// video is the defaulted video block; nil means video watching is off
 	// (no block configured, ffmpeg/ffprobe not found as absolute paths, no
@@ -276,16 +321,21 @@ func NewBot(db *gorm.DB, config BotConfig, clock Clock, tgClient TelegramClient)
 	b := &Bot{
 		db:              db,
 		anthropicClient: anthropicClient,
-		chatMemories:    make(map[int64]*ChatMemory),
+		chatMemories:    make(map[convKey]*ChatMemory),
 		memorySize:      config.MemorySize,
 		config:          config,
 		userLimiters:    make(map[int64]*userLimiter),
+		commandLimiters: make(map[int64]*commandLimiter),
+		allChatsCutoffs: make(map[int64]uint),
+		chatCutoffs:     make(map[chatUser]uint),
 		clock:           clock,
 		botID:           botEntry.ID,
 		tgBot:           tgClient,
-		albumBuffers:    make(map[string]*pendingAlbum),
-		intakeBuffers:   make(map[int64]*pendingIntake),
-		turns:           make(map[int64]*chatTurn),
+		albumBuffers:    make(map[albumKey]*pendingAlbum),
+		intakeBuffers:   make(map[convKey]*pendingIntake),
+		turns:           make(map[convKey]*chatTurn),
+		mediaWaiters:    make(map[convKey][]*mediaWaiter),
+		textsOnWay:      make(map[convKey]*textsOnWay),
 
 		draftInterval:  draftUpdateInterval,
 		draftKeepalive: draftKeepaliveInterval,
@@ -293,7 +343,8 @@ func NewBot(db *gorm.DB, config BotConfig, clock Clock, tgClient TelegramClient)
 
 		statusFirstDelay:   defaultStatusFirstDelay,
 		statusEditInterval: defaultStatusEditInterval,
-		businessRights:     make(map[string]businessRightsEntry),
+		businessConns:      make(map[string]businessConn),
+		businessRefused:    make(map[string]bool),
 
 		sttURL: elevenLabsSTTURL,
 		ttsURL: elevenLabsTTSURL,
@@ -378,14 +429,16 @@ func (b *Bot) getRoleByName(roleName string) (Role, error) {
 	return role, err
 }
 
-func (b *Bot) createMessage(chatID, userID int64, username, userRole, text string, isUser bool) Message {
+// createMessage is a new row for conversation k: its chat, connection and
+// topic, which every row stores ("" and 0 where there are none).
+func (b *Bot) createMessage(k convKey, userID int64, username, userRole, text string, isUser bool) Message {
 	message := Message{
-		ChatID:    chatID,
 		UserRole:  userRole,
 		Text:      text,
 		Timestamp: time.Now(),
 		IsUser:    isUser,
 	}
+	message.inConv(k)
 
 	if isUser {
 		message.UserID = userID
@@ -403,37 +456,82 @@ func (b *Bot) storeMessage(message *Message) error {
 	return b.db.Create(message).Error
 }
 
-func (b *Bot) getOrCreateChatMemory(chatID int64) *ChatMemory {
+// storePhotoArrival stores a photo or album message aside as it arrives,
+// before its upload, as voice notes are stored: a /clear during the upload
+// then covers it, and the photo does not join afterwards. The row carries
+// its conversation, as a text's does.
+func (b *Bot) storePhotoArrival(message *models.Message, to replyTarget) (Message, error) {
+	from := senderOf(message)
+	row := b.createMessage(to.conv(), from.id, from.username, "user", message.Caption, true)
+	row.TelegramMessageID = message.ID
+	row.Aside = true
+	return row, b.storeMessage(&row)
+}
+
+// photoRowLive reports whether the photo's row stored at its arrival is still
+// there and no clear's cutoff covers it, just before its upload. A failed
+// read counts as live: recordPhotoUploads checks again.
+func (b *Bot) photoRowLive(row Message) bool {
+	var n int64
+	if err := b.db.Model(&Message{}).Where("id = ?", row.ID).Count(&n).Error; err == nil && n == 0 {
+		return false
+	}
+	b.getOrCreateChatMemory(row.conv())
 	b.chatMemoriesMu.RLock()
-	chatMemory, exists := b.chatMemories[chatID]
-	b.chatMemoriesMu.RUnlock()
-	if exists {
+	defer b.chatMemoriesMu.RUnlock()
+	return !b.deletedByClear(b.chatMemories[row.conv()], row)
+}
+
+// recordPhotoUploads writes the uploads, caption and Telegram id onto the
+// photo's row stored at arrival, and reports whether the row is still there:
+// a clear that ran during the upload deleted it.
+func (b *Bot) recordPhotoUploads(row Message) (bool, error) {
+	result := b.db.Model(&Message{Model: gorm.Model{ID: row.ID}}).
+		Select("ImageFileIDs", "Text", "TelegramMessageID").
+		Updates(&Message{ImageFileIDs: row.ImageFileIDs, Text: row.Text, TelegramMessageID: row.TelegramMessageID})
+	return result.RowsAffected == 1, result.Error
+}
+
+func (b *Bot) getOrCreateChatMemory(k convKey) *ChatMemory {
+	if chatMemory := b.loadedChatMemory(k); chatMemory != nil {
 		return chatMemory
 	}
 
 	b.chatMemoriesMu.Lock()
 	defer b.chatMemoriesMu.Unlock()
-	if chatMemory, exists = b.chatMemories[chatID]; exists {
+	if chatMemory, exists := b.chatMemories[k]; exists {
 		return chatMemory
 	}
-	history := b.loadChatHistory(chatID)
+	history := b.loadChatHistory(k)
 	b.memoryGen++
-	chatMemory = &ChatMemory{Messages: make([]Message, 0, len(history)), Size: b.memorySize * 2, generation: b.memoryGen}
+	chatMemory := &ChatMemory{Messages: make([]Message, 0, len(history)), Size: b.memorySize * 2, generation: b.memoryGen}
 	for _, message := range history {
+		if b.deletedEverywhere(message) {
+			continue // an admin's clear of its sender's messages is deleting its row
+		}
 		b.insertLocked(chatMemory, message, len(chatMemory.Messages))
 	}
 	chatMemory.answeredThrough.Store(reloadedAnsweredThrough(chatMemory.Messages))
-	b.chatMemories[chatID] = chatMemory
+	b.chatMemories[k] = chatMemory
 	return chatMemory
 }
 
-// loadChatHistory reads the chat's newest conversation messages from the
+// loadedChatMemory is the conversation's memory if it is loaded, or nil.
+func (b *Bot) loadedChatMemory(k convKey) *ChatMemory {
+	b.chatMemoriesMu.RLock()
+	defer b.chatMemoriesMu.RUnlock()
+	return b.chatMemories[k]
+}
+
+// loadChatHistory reads the conversation's newest messages from the
 // database, oldest first, for a memory being created: at startup, or after
-// /clear dropped it. Aside rows are skipped. Messages with the same timestamp
-// keep the order they were stored in.
-func (b *Bot) loadChatHistory(chatID int64) []Message {
+// /clear dropped it. Aside rows are skipped, and so are rows stored before
+// rows carried their connection (convScope). Messages with the same
+// timestamp keep the order they were stored in.
+func (b *Bot) loadChatHistory(k convKey) []Message {
 	var messages []Message
-	err := b.db.Where("chat_id = ? AND bot_id = ? AND (aside = ? OR aside IS NULL)", chatID, b.botID, false).
+	scope, args := b.convScope(k)
+	err := b.db.Where(scope, args...).Where("aside = ? OR aside IS NULL", false).
 		Order("timestamp desc, id desc").
 		Limit(b.memorySize * 2).
 		Find(&messages).Error
@@ -451,7 +549,7 @@ func (b *Bot) loadChatHistory(chatID int64) []Message {
 // reply are answered and those after it are not.
 func reloadedAnsweredThrough(messages []Message) uint64 {
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].IsUser {
+		if messages[i].IsUser || ownerSide(messages[i]) { // a business owner's message is no reply of the bot's
 			continue
 		}
 		for j := i - 1; j >= 0; j-- {
@@ -470,10 +568,10 @@ func answerable(msg Message) bool {
 	return msg.IsUser && len(contentBlocksForMessage(msg)) > 0
 }
 
-func (b *Bot) stripDeadFileIDFromMemory(chatID int64, deadFileID string) {
+func (b *Bot) stripDeadFileIDFromMemory(k convKey, deadFileID string) {
 	b.chatMemoriesMu.Lock()
 	defer b.chatMemoriesMu.Unlock()
-	cm, exists := b.chatMemories[chatID]
+	cm, exists := b.chatMemories[k]
 	if !exists {
 		return
 	}
@@ -491,6 +589,30 @@ func (b *Bot) stripDeadFileIDFromMemory(chatID int64, deadFileID string) {
 	}
 }
 
+// joinText is joinConversation for a text message that goes on to a batch or
+// a turn of its own: from its placement until that is on record (landText),
+// it is on its way, and a media turn whose ticket came after it waits for it
+// (G5). It is recorded in the same step under the memory lock as its
+// placement, so any ticket taken after it sees it.
+func (b *Bot) joinText(message Message) (held Message, outcome joinOutcome) {
+	var seq uint64
+	outcome = joinWriteFailed // until join returns: a panic inside it lands the text below
+	defer func() {
+		if outcome != joinOK && seq != 0 {
+			b.landText(message.conv(), seq)
+		}
+	}()
+	held, outcome = b.join(message, func(chatMemory *ChatMemory) (int, uint64) {
+		b.memorySeq++
+		seq = b.memorySeq
+		b.intakeBuffersMu.Lock() // chatMemoriesMu, then intakeBuffersMu
+		defer b.intakeBuffersMu.Unlock()
+		b.markTextOnWayLocked(message.conv(), seq)
+		return len(chatMemory.Messages), seq
+	})
+	return held, outcome
+}
+
 // joinConversation puts a stored user message into its chat's memory once it
 // joins the conversation, and reports whether it did. Until then its row is
 // aside: no turn can read, cover or answer it, and no reload can load it.
@@ -504,35 +626,128 @@ func (b *Bot) stripDeadFileIDFromMemory(chatID int64, deadFileID string) {
 // /clear replaced the memory meanwhile, the message leaves memory again and
 // joinConversation reports false: its path ends silently.
 func (b *Bot) joinConversation(message Message) (Message, bool) {
-	b.getOrCreateChatMemory(message.ChatID)
+	held, outcome := b.join(message, func(chatMemory *ChatMemory) (int, uint64) {
+		return len(chatMemory.Messages), 0
+	})
+	return held, outcome == joinOK
+}
+
+// joinOutcome is how a join ended.
+type joinOutcome uint8
+
+const (
+	joinOK          joinOutcome = iota
+	joinCleared                 // a /clear deleted the message, or replaced its memory
+	joinWriteFailed             // its row's write failed: the row stays aside
+	joinNoRoom                  // a window of size 0
+)
+
+func (o joinOutcome) String() string {
+	return [...]string{"joined", "its history was cleared", "its write failed", "the window was full"}[o]
+}
+
+// join is joinConversation with the slot in memory and the sequence (0 for
+// the next) that place picks under the memory lock. The message is stamped
+// between its neighbours there (replyStamp), so a reload keeps the order.
+func (b *Bot) join(message Message, place func(*ChatMemory) (at int, seq uint64)) (Message, joinOutcome) {
+	b.getOrCreateChatMemory(message.conv())
+	chatMemory, held, outcome := b.placeJoining(message, place)
+	if outcome != joinOK {
+		InfoLogger.Printf("[%s] message %d in chat %v did not join: %s", b.config.ID, message.ID, message.conv(), outcome)
+		return Message{}, outcome
+	}
+	if message.ID == 0 {
+		return held, joinOK
+	}
+
+	// The row leaves aside only now that the message survived its placement.
+	result := b.db.Model(&Message{}).Where("id = ?", message.ID).
+		Updates(map[string]any{"aside": false, "timestamp": held.Timestamp})
+	if result.Error != nil {
+		ErrorLogger.Printf("[%s] joining message %d to chat %v: %v", b.config.ID, message.ID, message.conv(), result.Error)
+	}
+	if outcome := b.keepJoined(chatMemory, held, result); outcome != joinOK {
+		InfoLogger.Printf("[%s] message %d in chat %v did not join: %s", b.config.ID, message.ID, message.conv(), outcome)
+		return Message{}, outcome
+	}
+	return held, joinOK
+}
+
+// placeJoining is join's first step, under the memory lock: unless a /clear
+// deleted message first, it goes into its chat's memory where place says,
+// stamped between its neighbours. It returns that memory and the copy it
+// holds, or why it did not join.
+func (b *Bot) placeJoining(message Message, place func(*ChatMemory) (at int, seq uint64)) (*ChatMemory, Message, joinOutcome) {
 	b.chatMemoriesMu.Lock()
-	chatMemory := b.chatMemories[message.ChatID]
+	defer b.chatMemoriesMu.Unlock()
+	chatMemory := b.chatMemories[message.conv()]
+	if b.deletedByClear(chatMemory, message) {
+		return nil, Message{}, joinCleared
+	}
 	if message.ID != 0 {
 		chatMemory.Messages = slices.DeleteFunc(chatMemory.Messages, func(held Message) bool {
 			return held.ID == message.ID
 		})
 	}
 	message.Aside = false
-	message.Timestamp = b.stampAfter(latestTimestamp(chatMemory.Messages))
-	held := b.insertLocked(chatMemory, message, len(chatMemory.Messages))
-	b.chatMemoriesMu.Unlock()
-	if message.ID == 0 {
-		return held, true
+	at, seq := place(chatMemory)
+	message.Timestamp = b.replyStamp(chatMemory.Messages, at)
+	held := b.placeLocked(chatMemory, message, at, seq)
+	if !slices.ContainsFunc(chatMemory.Messages, func(m Message) bool { return m.Seq == held.Seq }) {
+		return nil, Message{}, joinNoRoom // only for a window of size 0: a media message is pinned, text goes last
 	}
+	return chatMemory, held, joinOK
+}
 
-	result := b.db.Model(&Message{}).Where("id = ?", message.ID).
-		Updates(map[string]any{"aside": false, "timestamp": message.Timestamp})
-	if result.Error != nil {
-		ErrorLogger.Printf("[%s] joining message %d to chat %d: %v", b.config.ID, message.ID, message.ChatID, result.Error)
-	}
+// keepJoined is join's second step, under the memory lock again, once the
+// row's write is done. It returns why the message did not join, after taking
+// it out of memory: the write failed (the row stays aside) or found the row
+// gone (/clear deleted it), /clear replaced the memory meanwhile, or a clear
+// of its sender's messages took it out. A text message the window trimmed
+// while its write ran (a flood of later messages) did join: the conversation
+// moved past it, as past any old message. A media message is never trimmed
+// before its turn reads it (pinnedSeq).
+func (b *Bot) keepJoined(chatMemory *ChatMemory, held Message, result *gorm.DB) joinOutcome {
 	b.chatMemoriesMu.Lock()
 	defer b.chatMemoriesMu.Unlock()
-	if (result.Error == nil && result.RowsAffected == 0) || b.chatMemories[message.ChatID] != chatMemory {
-		chatMemory.Messages = slices.DeleteFunc(chatMemory.Messages, func(m Message) bool { return m.Seq == held.Seq })
-		InfoLogger.Printf("[%s] message %d in chat %d did not join: its history was cleared", b.config.ID, message.ID, message.ChatID)
-		return Message{}, false
+	var refused joinOutcome
+	switch {
+	case result.Error != nil:
+		refused = joinWriteFailed
+	case result.RowsAffected == 0, b.chatMemories[held.conv()] != chatMemory, b.deletedByClear(chatMemory, held):
+		refused = joinCleared
+	case !slices.ContainsFunc(chatMemory.Messages, func(m Message) bool { return m.Seq == held.Seq }):
+		InfoLogger.Printf("[%s] message %d in chat %v joined, and later messages already trimmed it out of the window",
+			b.config.ID, held.ID, held.conv())
+		return joinOK
+	default:
+		return joinOK
 	}
-	return held, true
+	chatMemory.Messages = slices.DeleteFunc(chatMemory.Messages, func(m Message) bool { return m.Seq == held.Seq })
+	return refused
+}
+
+// deletedByClear reports whether a /clear deleted message before it could
+// join chatMemory: the clear that created the memory, a clear of its
+// sender's messages in this conversation, in every conversation with its chat
+// ID, or in every chat, up to that clear's cutoff. The caller holds
+// chatMemoriesMu.
+func (b *Bot) deletedByClear(chatMemory *ChatMemory, message Message) bool {
+	return message.ID != 0 && (message.ID <= chatMemory.clearedThrough ||
+		message.ID <= chatMemory.userCutoffs[message.UserID] || b.deletedEverywhere(message))
+}
+
+// deletedEverywhere reports whether an admin's clear of its sender's
+// messages, in every chat or in every conversation with its chat ID, deleted
+// message. The caller holds chatMemoriesMu.
+func (b *Bot) deletedEverywhere(message Message) bool {
+	return message.ID != 0 && (message.ID <= b.allChatsCutoffs[message.UserID] ||
+		message.ID <= b.chatCutoffs[chatUser{chatID: message.ChatID, userID: message.UserID}])
+}
+
+// chatUser is one user in every conversation with one chat ID.
+type chatUser struct {
+	chatID, userID int64
 }
 
 // latestTimestamp is the latest Timestamp among messages, or the zero time.
@@ -572,13 +787,37 @@ func wallUTC(t time.Time) time.Time {
 // message was inserted is always below that message's. The caller holds
 // chatMemoriesMu for writing.
 func (b *Bot) insertLocked(chatMemory *ChatMemory, message Message, at int) Message {
-	b.memorySeq++
-	message.Seq = b.memorySeq
-	chatMemory.Messages = slices.Insert(chatMemory.Messages, at, message)
-	if excess := len(chatMemory.Messages) - chatMemory.Size; excess > 0 {
-		chatMemory.Messages = chatMemory.Messages[excess:]
+	return b.placeLocked(chatMemory, message, at, 0)
+}
+
+// placeLocked is insertLocked with the sequence seq reserved for the message
+// earlier (reserveSeq), or the next one for 0.
+func (b *Bot) placeLocked(chatMemory *ChatMemory, message Message, at int, seq uint64) Message {
+	if seq == 0 {
+		b.memorySeq++
+		seq = b.memorySeq
 	}
+	message.Seq = seq
+	chatMemory.Messages = slices.Insert(chatMemory.Messages, at, message)
+	trimLocked(chatMemory)
 	return message
+}
+
+// trimLocked drops the oldest messages beyond the window, but never the media
+// message pinned until its turn reads it (pinnedSeq, set before it is
+// placed): a media message that waited for the chat can be placed at the
+// front of a window full of later text. A reply placed at the front, because
+// the window moved past its context, is still trimmed at once. The caller
+// holds chatMemoriesMu.
+func trimLocked(chatMemory *ChatMemory) {
+	pinned := chatMemory.pinnedSeq.Load()
+	for len(chatMemory.Messages) > chatMemory.Size {
+		oldest := slices.IndexFunc(chatMemory.Messages, func(m Message) bool { return pinned == 0 || m.Seq != pinned })
+		if oldest < 0 {
+			return
+		}
+		chatMemory.Messages = slices.Delete(chatMemory.Messages, oldest, oldest+1)
+	}
 }
 
 // fileReply stores a turn's reply and puts it into memory right after the
@@ -591,35 +830,62 @@ func (b *Bot) insertLocked(chatMemory *ChatMemory, message Message, at int) Mess
 // lock, so nothing can join between choosing its slot and its timestamp: a
 // reload, which goes by timestamp, then keeps memory's order (replyStamp).
 //
-// A turn that read a memory /clear has since dropped (memoryGen no longer
-// the chat's) answers a history that is gone: its reply is stored aside and
-// not filed.
-func (b *Bot) fileReply(chatMemory *ChatMemory, reply *Message, frontier, covered, memoryGen uint64) ([]uint, error) {
+// A turn that read a memory /clear has since replaced (memoryGen no longer
+// the chat's) answers a history that is gone: its reply is not stored at all,
+// so the clear's cutoff stays exact, and errStaleReply tells the caller not
+// to send it either.
+//
+// A turn a clear of one sender's messages stopped (cancelClear) files
+// nothing either, with errStaleReply; one whose reply that clear wants
+// aside (replyAside) has it stored aside instead, and not put into memory.
+// What it answers counts as answered all the same. Both are read under the
+// lock here (clearFlags).
+func (b *Bot) fileReply(chatMemory *ChatMemory, reply *Message, frontier, covered, memoryGen uint64, turn *chatTurn) ([]uint, error) {
 	b.chatMemoriesMu.Lock()
 	defer b.chatMemoriesMu.Unlock()
 
-	if memoryGen != 0 && (memoryGen != chatMemory.generation || b.chatMemories[reply.ChatID] != chatMemory) {
-		InfoLogger.Printf("[%s] reply for chat %d kept aside: the history it answers was cleared", b.config.ID, reply.ChatID)
-		reply.Aside = true
-		return nil, b.storeMessage(reply)
+	stale := memoryGen != 0 && (memoryGen != chatMemory.generation || b.chatMemories[reply.conv()] != chatMemory)
+	cleared, aside := b.clearFlags(turn)
+	if stale || cleared {
+		InfoLogger.Printf("[%s] reply for chat %v dropped: the history it answers was cleared", b.config.ID, reply.conv())
+		return nil, errStaleReply
 	}
 	at := replyIndex(chatMemory, frontier)
 	reply.Timestamp = b.replyStamp(chatMemory.Messages, at)
+	reply.Aside = aside
 	if err := b.storeMessage(reply); err != nil {
 		return nil, err
 	}
+	// Every user message the reply covers, those answered before included
+	// (markAnswered skips them): a media message joins with the sequence of
+	// its ticket, which may be below messages answered while it waited.
 	before := chatMemory.answeredThrough.Load()
 	var answered []uint
 	for _, m := range chatMemory.Messages {
-		if m.IsUser && m.ID != 0 && m.Seq > before && m.Seq <= covered {
+		if m.IsUser && m.ID != 0 && m.Seq <= covered {
 			answered = append(answered, m.ID)
 		}
 	}
-	b.insertLocked(chatMemory, *reply, at)
+	if !aside {
+		b.insertLocked(chatMemory, *reply, at)
+	}
 	if covered > before {
 		chatMemory.answeredThrough.Store(covered)
 	}
 	return answered, nil
+}
+
+// clearFlags reads, under turnsMu, whether a clear stopped turn (cancelClear)
+// or wants its reply aside (replyAside). fileReply calls it holding
+// chatMemoriesMu, the order the clears set them in, so no clear can land
+// between the check and the filing.
+func (b *Bot) clearFlags(turn *chatTurn) (cleared, aside bool) {
+	if turn == nil {
+		return false, false
+	}
+	b.turnsMu.Lock()
+	defer b.turnsMu.Unlock()
+	return turn.reason == cancelClear, turn.replyAside
 }
 
 // replyStamp is the timestamp for a reply going in at index at of messages:
@@ -668,22 +934,68 @@ func replyIndex(chatMemory *ChatMemory, frontier uint64) int {
 // newest answerable user message, which lets a later flush tell whether the
 // turn answers it, and the newest message of any kind, where the turn's reply
 // goes (fileReply).
-func (b *Bot) snapshotForTurn(turn *chatTurn, chatMemory *ChatMemory) []anthropic.BetaMessageParam {
-	b.chatMemoriesMu.RLock()
-	contextMessages := b.buildContextMessages(chatMemory)
-	covered := newestAnswerableSeq(chatMemory)
-	frontier := newestSeq(chatMemory)
-	b.chatMemoriesMu.RUnlock()
+//
+// unanswered reports whether the context holds a user message no reply
+// covers yet. A /clear of one sender's messages can take away all a turn was
+// for before it reads memory; that turn then ends silently.
+func (b *Bot) snapshotForTurn(turn *chatTurn, chatMemory *ChatMemory) (contextMessages []anthropic.BetaMessageParam, unanswered bool) {
+	messages, unanswered := b.readForTurn(turn, chatMemory)
+	return b.buildContextMessages(messages), unanswered
+}
 
+// readForTurn copies chatMemory's messages and records on turn what they
+// cover, in one step under the memory lock, taking turnsMu inside it, the
+// established order: a clear, which applies itself to the turn under the
+// memory lock, lands before the copy, which then lacks its messages, or after
+// the record, which it then sees (blind r5b #2). The context is built from
+// the copy outside the lock. The copy ends with the newest user message, as
+// every request must (I1): what follows it is a business owner's message
+// (recordOwnerMessage), which came after what the turn answers, and stays
+// after its reply, as a message that lands while the turn runs does.
+func (b *Bot) readForTurn(turn *chatTurn, chatMemory *ChatMemory) (messages []Message, unanswered bool) {
+	snapshotStarting(turn)
+	defer snapshotTaken(turn) // once the lock below is released
+	b.chatMemoriesMu.RLock()
+	defer b.chatMemoriesMu.RUnlock()
+	end := len(chatMemory.Messages)
+	for end > 0 && ownerSide(chatMemory.Messages[end-1]) {
+		end--
+	}
+	messages = slices.Clone(chatMemory.Messages[:end])
+	covered := newestAnswerableSeq(messages)
+	var frontier uint64
+	for _, m := range messages {
+		frontier = max(frontier, m.Seq)
+	}
 	b.markSnapshot(turn, covered, frontier, chatMemory.generation)
-	return contextMessages
+	return messages, covered > chatMemory.answeredThrough.Load()
+}
+
+// beforeSnapshot and afterSnapshot, when set, run right before a turn's
+// snapshot step takes the memory lock, and right after it releases it: the
+// last point a clear can reach a turn before it reads memory, and the
+// earliest once it has. Tests land one there; production leaves them nil.
+var beforeSnapshot, afterSnapshot atomic.Pointer[func(*chatTurn)]
+
+// snapshotStarting runs beforeSnapshot, if set, for turn.
+func snapshotStarting(turn *chatTurn) {
+	if hook := beforeSnapshot.Load(); hook != nil {
+		(*hook)(turn)
+	}
+}
+
+// snapshotTaken runs afterSnapshot, if set, for turn.
+func snapshotTaken(turn *chatTurn) {
+	if hook := afterSnapshot.Load(); hook != nil {
+		(*hook)(turn)
+	}
 }
 
 // newestAnswerableSeq is the highest sequence among the answerable user
-// messages in memory, or 0. The caller holds chatMemoriesMu.
-func newestAnswerableSeq(chatMemory *ChatMemory) uint64 {
+// messages, or 0. The caller holds chatMemoriesMu.
+func newestAnswerableSeq(messages []Message) uint64 {
 	var newest uint64
-	for _, msg := range chatMemory.Messages {
+	for _, msg := range messages {
 		if answerable(msg) {
 			newest = max(newest, msg.Seq)
 		}
@@ -691,36 +1003,323 @@ func newestAnswerableSeq(chatMemory *ChatMemory) uint64 {
 	return newest
 }
 
-// newestSeq is the highest sequence in memory, or 0. The caller holds
-// chatMemoriesMu.
-func newestSeq(chatMemory *ChatMemory) uint64 {
-	var newest uint64
-	for _, msg := range chatMemory.Messages {
-		newest = max(newest, msg.Seq)
-	}
-	return newest
+// newestAnswerableSeqInChat is what a text flush for the conversation wants
+// answered.
+func (b *Bot) newestAnswerableSeqInChat(k convKey) uint64 {
+	want, _ := b.flushWant(k)
+	return want
 }
 
-// newestAnswerableSeqInChat is what a text flush for the chat wants answered.
-func (b *Bot) newestAnswerableSeqInChat(chatID int64) uint64 {
-	chatMemory := b.getOrCreateChatMemory(chatID)
+// flushWant is what a text flush for the conversation wants answered, and
+// the generation of the memory it read that from. A flush that reaches a
+// turn in another generation (/clear replaced the memory meanwhile) is
+// dropped.
+func (b *Bot) flushWant(k convKey) (wantSeq, memoryGen uint64) {
+	b.getOrCreateChatMemory(k)
 	b.chatMemoriesMu.RLock()
 	defer b.chatMemoriesMu.RUnlock()
-	return newestAnswerableSeq(chatMemory)
+	chatMemory := b.chatMemories[k]
+	return newestAnswerableSeq(chatMemory.Messages), chatMemory.generation
 }
 
-// buildContextMessages converts chat memory into API messages. The caller
-// holds chatMemoriesMu.
-func (b *Bot) buildContextMessages(chatMemory *ChatMemory) []anthropic.BetaMessageParam {
-	InfoLogger.Printf("Chat memory contains %d messages", len(chatMemory.Messages))
+// currentGeneration is the generation of the conversation's memory.
+func (b *Bot) currentGeneration(k convKey) uint64 {
+	_, gen := b.flushWant(k)
+	return gen
+}
+
+// beginClear empties conversation k for /clear or /clear_hard, in one
+// step under the memory lock: it records the highest message id as the
+// clear's cutoff, swaps in an empty memory with a fresh generation (a swap,
+// not a delete, so no reload before the rows are gone can bring them back),
+// cancels its running turn for good (cancelClear), and drops its waiting
+// batch: otherwise its quiet window would end moments later
+// and answer the very messages being deleted (the openclaw/openclaw#51046
+// failure mode, with a privacy cost), while a batch of a message sent after
+// this step is kept. It takes the locks in the established order,
+// chatMemoriesMu, then turnsMu, then intakeBuffersMu. The caller then
+// deletes the scope's rows up to the cutoff.
+//
+// A reply filed into the old memory before this step has an id at or below
+// the cutoff and is deleted with the rest; one filed after finds its memory
+// replaced and is neither stored nor sent (fileReply). A message stored
+// before it never joins the new memory (joinConversation).
+func (b *Bot) beginClear(k convKey) (uint, error) {
+	b.chatMemoriesMu.Lock()
+	defer b.chatMemoriesMu.Unlock()
+	cutoff, err := b.clearCutoff()
+	if err != nil {
+		return 0, err
+	}
+	b.memoryGen++
+	b.chatMemories[k] = &ChatMemory{
+		Messages: []Message{}, Size: b.memorySize * 2, generation: b.memoryGen, clearedThrough: cutoff,
+	}
+	b.turnsMu.Lock()
+	defer b.turnsMu.Unlock()
+	if running, exists := b.turns[k]; exists {
+		running.reason = cancelClear
+		running.rerun, running.rerunWant, running.rerunFirst = nil, 0, 0
+		running.cancel()
+	}
+	b.intakeBuffersMu.Lock()
+	defer b.intakeBuffersMu.Unlock()
+	if pending := b.removeIntakeLocked(k); pending != nil {
+		InfoLogger.Printf("[%s] discarded %d buffered message(s) for chat %v on history clear",
+			b.config.ID, pending.count, k)
+	}
+	return cutoff, nil
+}
+
+// clearCutoff is the highest message id stored so far, deleted or not: a
+// clear that starts now deletes its scope's rows up to it. The caller holds
+// chatMemoriesMu.
+func (b *Bot) clearCutoff() (uint, error) {
+	var cutoff uint
+	if err := b.db.Unscoped().Model(&Message{}).Select("COALESCE(MAX(id), 0)").Scan(&cutoff).Error; err != nil {
+		return 0, fmt.Errorf("reading the clear's cutoff: %w", err)
+	}
+	return cutoff, nil
+}
+
+// userClear is the scope of a clear of one user's own messages: one
+// conversation (conv, an own /clear), every conversation with one chat ID
+// (an admin's /clear <user_id> <chat_id>: each Business connection's and
+// each topic's), or every conversation (an admin's /clear <user_id>, chatID
+// 0).
+type userClear struct {
+	userID int64
+	conv   *convKey
+	chatID int64
+}
+
+// covers reports whether the clear reaches conversation k.
+func (c userClear) covers(k convKey) bool {
+	switch {
+	case c.conv != nil:
+		return k == *c.conv
+	case c.chatID != 0:
+		return k.chatID == c.chatID
+	default:
+		return true
+	}
+}
+
+// rows is the database scope of the user's rows the clear deletes. The chat
+// and all-chats forms name no connection: they reach rows stored before rows
+// carried one, too.
+func (c userClear) rows(b *Bot) (string, []any) {
+	switch {
+	case c.conv != nil:
+		scope, args := b.convScope(*c.conv)
+		return scope + " AND user_id = ?", append(args, c.userID)
+	case c.chatID != 0:
+		return "bot_id = ? AND chat_id = ? AND user_id = ?", []any{b.botID, c.chatID, c.userID}
+	default:
+		return "bot_id = ? AND user_id = ?", []any{b.botID, c.userID}
+	}
+}
+
+// beginUserClear takes the user's own messages out of every conversation in
+// memory the clear covers, for a /clear of only their messages, in one step
+// under the memory lock: it records the highest message id as that clear's
+// cutoff, and removes their messages from memory. The cutoff stays in force
+// (deletedByClear): a message of theirs stored before it never joins
+// (joinConversation), not even for the moment its row's write takes, and
+// none loads into a memory first loaded later (getOrCreateChatMemory). Each
+// memory, its generation and its turn stay: the conversation goes on for
+// everyone else. The caller then deletes the sender's rows up to the cutoff.
+//
+// An own clear's cutoff is kept with its conversation's memory
+// (ChatMemory.userCutoffs), the newest per sender, which is loaded first for
+// that; an admin's is kept bot-wide, one per user and chat ID (chatCutoffs)
+// or one per user for every chat (allChatsCutoffs), as it also covers
+// conversations not loaded yet. A failed delete leaves nothing to undo: the
+// rows it missed stay out of memory.
+func (b *Bot) beginUserClear(c userClear) (uint, error) {
+	if c.conv != nil {
+		b.getOrCreateChatMemory(*c.conv)
+	}
+	b.chatMemoriesMu.Lock()
+	defer b.chatMemoriesMu.Unlock()
+	cutoff, err := b.clearCutoff()
+	if err != nil {
+		return 0, err
+	}
+	switch {
+	case c.conv != nil:
+	case c.chatID != 0:
+		if b.chatCutoffs == nil {
+			b.chatCutoffs = make(map[chatUser]uint)
+		}
+		b.chatCutoffs[chatUser{chatID: c.chatID, userID: c.userID}] = cutoff
+	default:
+		if b.allChatsCutoffs == nil {
+			b.allChatsCutoffs = make(map[int64]uint)
+		}
+		b.allChatsCutoffs[c.userID] = cutoff
+	}
+	for k, chatMemory := range b.chatMemories {
+		if !c.covers(k) {
+			continue
+		}
+		if c.conv != nil {
+			if chatMemory.userCutoffs == nil {
+				chatMemory.userCutoffs = make(map[int64]uint)
+			}
+			chatMemory.userCutoffs[c.userID] = cutoff
+		}
+		b.stopForUserClearLocked(k, chatMemory, c.userID, cutoff)
+		chatMemory.Messages = slices.DeleteFunc(chatMemory.Messages, func(m Message) bool {
+			return m.UserID == c.userID && m.ID <= cutoff
+		})
+	}
+	return cutoff, nil
+}
+
+// stopForUserClearLocked applies a clear of userID's messages up to cutoff to
+// conversation k's running turn and waiting batch, in the clear's one step,
+// before the messages leave memory:
+//
+//   - a turn whose unanswered messages are all theirs ends silently
+//     (cancelClear);
+//   - a media turn whose own media message is theirs ends silently too, the
+//     others' messages it covered collected behind it, or, having shown part
+//     of its answer, finishes with its reply stored aside
+//     (stopMediaForUserClearLocked);
+//   - one that also answers others restarts if it has shown nothing, reading
+//     memory again without their messages, or, committed, goes on with its
+//     reply stored aside (replyAside);
+//   - work collected behind the turn, and a waiting batch, that hold only
+//     their messages are dropped. Mixed work stays, and reads memory without
+//     their messages.
+//
+// The caller holds chatMemoriesMu; it takes turnsMu, then intakeBuffersMu.
+func (b *Bot) stopForUserClearLocked(k convKey, chatMemory *ChatMemory, userID int64, cutoff uint) {
+	answered := chatMemory.answeredThrough.Load()
+	senders := func(from, to uint64) (theirs, others bool) {
+		for _, m := range chatMemory.Messages {
+			if !m.IsUser || m.Seq <= answered || m.Seq < from || m.Seq > to {
+				continue
+			}
+			if m.UserID == userID && m.ID <= cutoff {
+				theirs = true
+			} else {
+				others = true
+			}
+		}
+		return theirs, others
+	}
+	b.turnsMu.Lock()
+	defer b.turnsMu.Unlock()
+	if running := b.turns[k]; running != nil && running.reason != cancelClear {
+		if running.rerun != nil {
+			if theirs, others := senders(running.rerunFirst, running.rerunWant); theirs && !others {
+				running.rerun, running.rerunWant, running.rerunFirst = nil, 0, 0
+			}
+		}
+		switch theirs, others := senders(0, running.coveredSeq); {
+		case b.stopMediaForUserClearLocked(chatMemory, running, userID, cutoff):
+		case !theirs:
+		case !others:
+			InfoLogger.Printf("[%s] turn %d for chat %v stopped: it answers only cleared messages", b.config.ID, running.seq, k)
+			running.reason, running.coveredSeq = cancelClear, 0 // it answers nothing now
+			running.cancel()
+		case !running.committed && running.req.ctx != nil:
+			InfoLogger.Printf("[%s] turn %d for chat %v restarting without cleared messages", b.config.ID, running.seq, k)
+			if running.rerun == nil {
+				req := running.req
+				running.rerun, running.rerunWant = &req, running.coveredSeq
+			}
+			running.rerunFirst = earliest(running.rerunFirst, running.firstSeq)
+			running.reason = cancelRestart
+			running.cancel()
+		default:
+			running.replyAside = true
+		}
+	}
+	b.intakeBuffersMu.Lock()
+	defer b.intakeBuffersMu.Unlock()
+	if pending := b.intakeBuffers[k]; pending != nil && !pending.mixed && pending.from.userID == userID {
+		b.removeIntakeLocked(k)
+	}
+}
+
+// stopMediaForUserClearLocked applies a clear of userID's messages up to
+// cutoff to running when it is a media turn answering one of them, its own
+// media message, whatever answeredThrough says (a media message joins with
+// its ticket, which can be below it): having shown nothing, the turn ends
+// silently, and the other senders' unanswered messages before its media
+// message, which it would have covered, are collected behind it, to be
+// answered by a text turn; having shown part of its answer, or begun filing
+// its reply (shown), it finishes, its reply stored aside (replyAside). The media message is known by the sender
+// and row the turn recorded at its admission, not looked up in memory: once
+// the turn read it, later messages can trim it out of the window (scoped r6
+// #5). It reports whether running was such a turn. The caller holds
+// chatMemoriesMu, then turnsMu.
+func (b *Bot) stopMediaForUserClearLocked(chatMemory *ChatMemory, running *chatTurn, userID int64, cutoff uint) bool {
+	theirs := func(m Message) bool { return m.UserID == userID && m.ID <= cutoff }
+	if running.mediaSeq == 0 || running.mediaRow == 0 || running.mediaFrom != userID || running.mediaRow > cutoff {
+		return false
+	}
+	// What the turn reads: the messages before its own (its snapshot may not
+	// be recorded yet). Once the window trimmed its message, every message
+	// before it went first; before it joined, those with an earlier sequence.
+	before := chatMemory.Messages
+	if at := slices.IndexFunc(chatMemory.Messages, func(m Message) bool { return m.Seq == running.mediaSeq }); at >= 0 {
+		before = chatMemory.Messages[:at]
+	} else {
+		before = slices.DeleteFunc(slices.Clone(before), func(m Message) bool { return m.Seq > running.mediaSeq })
+	}
+	if running.shown {
+		running.replyAside = true
+		return true
+	}
+	InfoLogger.Printf("[%s] media turn %d for chat %v stopped: its message was cleared", b.config.ID, running.seq, running.conv)
+	answered := chatMemory.answeredThrough.Load()
+	var first, want uint64
+	var oldest Message
+	for _, m := range before {
+		if answerable(m) && !theirs(m) && m.Seq > answered {
+			if first == 0 || m.Seq < first {
+				oldest = m
+			}
+			first, want = earliest(first, m.Seq), max(want, m.Seq)
+		}
+	}
+	if want != 0 {
+		// The rerun answers others' messages in the media turn's place: its
+		// conversation and reply target are the media turn's, and its sender
+		// is the oldest message's it answers (scoped r6 nit 7), as far as a
+		// stored message tells it.
+		req := running.req
+		req.userID, req.username, req.messageTime = oldest.UserID, oldest.Username, int(oldest.Timestamp.Unix())
+		collectLocked(running, &req, want, first)
+	}
+	running.reason, running.coveredSeq = cancelClear, 0 // it answers nothing now
+	running.cancel()
+	return true
+}
+
+// replyIsStale reports whether turn read a memory /clear has since replaced,
+// so whatever it would send answers a history that is gone.
+func (b *Bot) replyIsStale(turn *chatTurn) bool {
+	_, _, memoryGen := b.contextEnd(turn)
+	return memoryGen != 0 && memoryGen != b.currentGeneration(turn.conv)
+}
+
+// buildContextMessages converts memory messages, a copy taken under
+// chatMemoriesMu, into API messages.
+func (b *Bot) buildContextMessages(messages []Message) []anthropic.BetaMessageParam {
+	InfoLogger.Printf("Chat memory contains %d messages", len(messages))
 	if b.config.DebugScreening {
-		for i, msg := range chatMemory.Messages {
+		for i, msg := range messages {
 			InfoLogger.Printf("Message %d: IsUser=%v, Text=%q Images=%d", i, msg.IsUser, msg.Text, len(msg.ImageFileIDs))
 		}
 	}
 
 	var contextMessages []anthropic.BetaMessageParam
-	for _, msg := range chatMemory.Messages {
+	for _, msg := range messages {
 		blocks := contentBlocksForMessage(msg)
 		if len(blocks) == 0 {
 			continue
@@ -861,12 +1460,20 @@ func setElevatedCommands(tgBot TelegramClient, users []User) {
 func initTelegramBot(token string, b *Bot) (TelegramClient, error) {
 	opts := []bot.Option{
 		bot.WithDefaultHandler(b.handleUpdate),
+		bot.WithSkipGetMe(), // called below, to learn the bot's username
 	}
 
 	tgBot, err := bot.New(token, opts...)
 	if err != nil {
 		return nil, err
 	}
+	getMeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	me, err := tgBot.GetMe(getMeCtx)
+	if err != nil {
+		return nil, fmt.Errorf("error call getMe, %w", err)
+	}
+	b.username, b.selfID = me.Username, me.ID
 
 	_, err = tgBot.SetMyCommands(context.Background(), &bot.SetMyCommandsParams{
 		Commands: publicBotCommands,
@@ -893,7 +1500,7 @@ func initTelegramBot(token string, b *Bot) (TelegramClient, error) {
 // model's context, answers nothing, and cannot leave a pending message
 // looking answered.
 func (b *Bot) sendResponse(ctx context.Context, to replyTarget, text string) error {
-	notice := b.createMessage(to.chatID, 0, "", "assistant", text, false)
+	notice := b.createMessage(to.conv(), 0, "", "assistant", text, false)
 	notice.Aside = true
 	if err := b.storeMessage(&notice); err != nil {
 		ErrorLogger.Printf("Error storing notice: %v", err)
@@ -902,10 +1509,29 @@ func (b *Bot) sendResponse(ctx context.Context, to replyTarget, text string) err
 	return b.sendOneSegment(ctx, to, text)
 }
 
+// noticeJoinFailed tells the sender when their message could not be saved
+// into the conversation (its row's write failed), as a failed store does; a
+// message a /clear removed ends silently.
+func (b *Bot) noticeJoinFailed(ctx context.Context, to replyTarget, outcome joinOutcome) {
+	if outcome == joinWriteFailed {
+		b.sendNotice(ctx, to, "Sorry, I had trouble saving your message.")
+	}
+}
+
+// sendNotice is sendResponse for a caller that can only log a failure.
+func (b *Bot) sendNotice(ctx context.Context, to replyTarget, text string) {
+	if err := b.sendResponse(ctx, to, text); err != nil {
+		ErrorLogger.Printf("Error sending response: %v", err)
+	}
+}
+
 // sendTurnReply records text as turn's reply, filed where the turn's context
-// ended (recordTurnReply), then sends it.
+// ended (recordTurnReply), then sends it. A reply to a history /clear has
+// replaced is neither recorded nor sent.
 func (b *Bot) sendTurnReply(ctx context.Context, turn *chatTurn, to replyTarget, text string) error {
-	if _, err := b.recordTurnReply(turn, to.chatID, text); err != nil {
+	if _, err := b.recordTurnReply(turn, to.conv(), text); errors.Is(err, errStaleReply) {
+		return nil
+	} else if err != nil {
 		ErrorLogger.Printf("Error storing assistant message: %v", err)
 		return err
 	}
@@ -913,6 +1539,10 @@ func (b *Bot) sendTurnReply(ctx context.Context, turn *chatTurn, to replyTarget,
 }
 
 func (b *Bot) sendOneSegment(ctx context.Context, to replyTarget, text string) error {
+	if b.connectionStopped(to.businessConnectionID) {
+		ErrorLogger.Printf("[%s] not sending to chat %d: business connection %s %v", b.config.ID, to.chatID, to.businessConnectionID, errConnectionStopped)
+		return errConnectionStopped
+	}
 	params := &bot.SendMessageParams{
 		ChatID:               to.chatID,
 		MessageThreadID:      to.threadID,
@@ -954,7 +1584,7 @@ func (b *Bot) sendStats(ctx context.Context, to replyTarget, userID int64, targe
 			var top []topEntry
 			if err := b.db.Model(&Message{}).
 				Select("user_id, COUNT(*) as msg_count").
-				Where("bot_id = ? AND is_user = ? AND deleted_at IS NULL", b.botID, true).
+				Where("bot_id = ? AND (is_user = ? OR user_role = ?) AND deleted_at IS NULL", b.botID, true, roleBusinessOwner).
 				Group("user_id").
 				Order("msg_count DESC").
 				Limit(3).
@@ -1043,15 +1673,19 @@ func (b *Bot) getUserStats(userID int64) (string, int64, int64, int64, error) {
 		return "", 0, 0, 0, fmt.Errorf("user not found: %w", err)
 	}
 
+	// A business owner's own messages, kept as the business side of the
+	// conversation (recordOwnerMessage), count as what they sent, as they
+	// did when they were stored as user messages, and not as a reply anyone
+	// received from the bot.
 	var messagesIn int64
-	if err := b.db.Model(&Message{}).Where("user_id = ? AND bot_id = ? AND is_user = ?",
-		userID, b.botID, true).Count(&messagesIn).Error; err != nil {
+	if err := b.db.Model(&Message{}).Where("user_id = ? AND bot_id = ? AND (is_user = ? OR user_role = ?)",
+		userID, b.botID, true, roleBusinessOwner).Count(&messagesIn).Error; err != nil {
 		return "", 0, 0, 0, err
 	}
 
 	var messagesOut int64
-	if err := b.db.Model(&Message{}).Where("chat_id IN (SELECT DISTINCT chat_id FROM messages WHERE user_id = ? AND bot_id = ? AND deleted_at IS NULL) AND bot_id = ? AND is_user = ?",
-		userID, b.botID, b.botID, false).Count(&messagesOut).Error; err != nil {
+	if err := b.db.Model(&Message{}).Where("chat_id IN (SELECT DISTINCT chat_id FROM messages WHERE user_id = ? AND bot_id = ? AND deleted_at IS NULL) AND bot_id = ? AND is_user = ? AND (user_role IS NULL OR user_role <> ?)",
+		userID, b.botID, b.botID, false, roleBusinessOwner).Count(&messagesOut).Error; err != nil {
 		return "", 0, 0, 0, err
 	}
 
@@ -1109,7 +1743,7 @@ func (b *Bot) sendWhoAmI(ctx context.Context, to replyTarget, userID int64, user
 	}
 }
 
-func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
+func (b *Bot) screenIncomingMessage(message *models.Message, to replyTarget) (Message, error) {
 	if b.config.DebugScreening {
 		start := time.Now()
 		defer func() {
@@ -1118,7 +1752,7 @@ func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
 				message.Chat.ID,
 				message.From.ID,
 				messageType(message),
-				len(b.getOrCreateChatMemory(message.Chat.ID).Messages),
+				len(b.getOrCreateChatMemory(to.conv()).Messages),
 				time.Since(start),
 			)
 		}()
@@ -1138,7 +1772,8 @@ func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
 		messageText = "[Voice message]"
 	}
 
-	userMessage := b.createMessage(message.Chat.ID, message.From.ID, message.From.Username, userRole, messageText, true)
+	from := senderOf(message)
+	userMessage := b.createMessage(to.conv(), from.id, from.username, userRole, messageText, true)
 	userMessage.TelegramMessageID = message.ID
 
 	if message.Sticker != nil {
@@ -1167,16 +1802,19 @@ func (b *Bot) screenIncomingMessage(message *models.Message) (Message, error) {
 // messages the turn covered are marked answered.
 //
 // Notices outside a model turn never come here: they are aside (sendResponse).
-func (b *Bot) recordTurnReply(turn *chatTurn, chatID int64, response string) (Message, error) {
+func (b *Bot) recordTurnReply(turn *chatTurn, k convKey, response string) (Message, error) {
+	if turn != nil {
+		b.markCommitted(turn) // about to be filed and sent: a clear from here on sets it aside
+	}
 	frontier, covered, memoryGen := b.contextEnd(turn)
 	if b.config.DebugScreening {
 		start := time.Now()
 		defer func() {
 			InfoLogger.Printf(
-				"[Screen] Outgoing: chat=%d len=%d memory_size=%d duration=%v",
-				chatID,
+				"[Screen] Outgoing: chat=%v len=%d memory_size=%d duration=%v",
+				k,
 				len(response),
-				len(b.getOrCreateChatMemory(chatID).Messages),
+				len(b.getOrCreateChatMemory(k).Messages),
 				time.Since(start),
 			)
 		}()
@@ -1184,25 +1822,26 @@ func (b *Bot) recordTurnReply(turn *chatTurn, chatID int64, response string) (Me
 
 	// Memory first: loaded after the store, it would read the reply from the
 	// database and then file it a second time.
-	chatMemory := b.getOrCreateChatMemory(chatID)
-	assistantMessage := b.createMessage(chatID, 0, "", "assistant", response, false)
-	answered, err := b.fileReply(chatMemory, &assistantMessage, frontier, covered, memoryGen)
+	chatMemory := b.getOrCreateChatMemory(k)
+	assistantMessage := b.createMessage(k, 0, "", "assistant", response, false)
+	answered, err := b.fileReply(chatMemory, &assistantMessage, frontier, covered, memoryGen, turn)
 	if err != nil {
 		return Message{}, err
 	}
-	b.markAnswered(chatID, answered)
+	b.markAnswered(k, answered)
 	return assistantMessage, nil
 }
 
 // markAnswered records when the user messages with these ids were answered.
 // A coalesced turn answers the whole batch, so every one of them is marked,
 // not just the newest.
-func (b *Bot) markAnswered(chatID int64, ids []uint) {
+func (b *Bot) markAnswered(k convKey, ids []uint) {
 	if len(ids) == 0 {
 		return
 	}
-	err := b.db.Model(&Message{}).
-		Where("chat_id = ? AND bot_id = ? AND id IN ? AND answered_on IS NULL", chatID, b.botID, ids).
+	scope, args := b.convScope(k)
+	err := b.db.Model(&Message{}).Where(scope, args...).
+		Where("id IN ? AND answered_on IS NULL", ids).
 		Update("answered_on", time.Now()).Error
 	if err != nil {
 		ErrorLogger.Printf("Error marking user messages as answered: %v", err)

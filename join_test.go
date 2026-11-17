@@ -15,7 +15,7 @@ import (
 // memoryCopy is the chat's memory copy of the message with database id.
 func memoryCopy(t *testing.T, b *Bot, chatID int64, id uint) []Message {
 	t.Helper()
-	mem := b.getOrCreateChatMemory(chatID)
+	mem := b.getOrCreateChatMemory(chatKey(chatID))
 	b.chatMemoriesMu.RLock()
 	defer b.chatMemoriesMu.RUnlock()
 	var copies []Message
@@ -33,9 +33,10 @@ func TestReload_SkipsStoredMessageThatNeverJoined(t *testing.T) { //NOSONAR go:S
 	b, _ := historyTestBot(t, nil)
 	const chatID = int64(801)
 	storeUserText(t, b, chatID, "joined")
-	_, err := b.screenIncomingMessage(&models.Message{
+	crashed := &models.Message{
 		ID: 960, Chat: models.Chat{ID: chatID}, From: &models.User{ID: chatID}, Text: "stored, then the bot crashed",
-	})
+	}
+	_, err := b.screenIncomingMessage(crashed, targetFor(crashed, ""))
 	require.NoError(t, err)
 
 	dropChatMemory(b, chatID)
@@ -60,7 +61,7 @@ func TestReload_DuringTranscriptionDoesNotLoadThePlaceholder(t *testing.T) { //N
 	answerInTurn(t, b, chatID, "earlier answer")
 	require.NoError(t, b.db.Where("chat_id = ?", chatID).Delete(&Message{}).Error) // /clear's delete
 	voice := voiceMessage(chatID, 961)
-	userMsg, err := b.screenIncomingMessage(voice) // stored between the delete and the drop
+	userMsg, err := b.screenIncomingMessage(voice, targetFor(voice, voice.BusinessConnectionID)) // stored between the delete and the drop
 	require.NoError(t, err)
 	dropChatMemory(b, chatID) // /clear's drop
 	storeUserText(t, b, chatID, "hello again")
@@ -87,7 +88,7 @@ func TestReload_DuringTranscriptionDoesNotLoadThePlaceholder(t *testing.T) { //N
 func TestJoinConversation_MovesACopyAlreadyInMemoryToTheEnd(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	b, _ := historyTestBot(t, nil)
 	const chatID = int64(802)
-	early := b.createMessage(chatID, 555, "tester", "user", "loaded before it joined", true)
+	early := b.createMessage(chatKey(chatID), 555, "tester", "user", "loaded before it joined", true)
 	require.NoError(t, b.storeMessage(&early)) // a row in the conversation, as an older version stored it
 	dropChatMemory(b, chatID)
 	later := storeUserText(t, b, chatID, "joined in between") // loads memory, with early in it
@@ -111,15 +112,15 @@ func TestReload_KeepsAReplyAfterEveryMessageItAnswered(t *testing.T) { //NOSONAR
 	b, _ := historyTestBot(t, stub)
 	const chatID = int64(803)
 	storeUserText(t, b, chatID, "X sent during transcription")
-	voice := b.createMessage(chatID, 123, "owner", "user", "V transcript", true)
+	voice := b.createMessage(chatKey(chatID), 123, "owner", "user", "V transcript", true)
 	voice.Timestamp = time.Now().Add(-time.Hour) // its intake, long before it joined
 	voice.Aside = true
 	require.NoError(t, b.storeMessage(&voice))
 	b.joinConversation(voice)
 	turn, _ := b.beginTurn(context.Background(), chatID) // the voice turn
-	b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatID))
+	b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatKey(chatID)))
 	storeUserText(t, b, chatID, "Y during the model call")
-	_, err := b.recordTurnReply(turn, chatID, "answer to X and V")
+	_, err := b.recordTurnReply(turn, chatKey(chatID), "answer to X and V")
 	require.NoError(t, err)
 	b.finishTurn(turn)
 
@@ -153,9 +154,9 @@ func TestRecordTurnReply_ClockSetBackStillStampsAfterTheLastMessage(t *testing.T
 func TestJoinConversation_DatabaseWaitHoldsNoMemoryLock(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	b, _ := historyTestBot(t, nil) // one database connection, as in production
 	const chatX, chatY = int64(9001), int64(9002)
-	b.getOrCreateChatMemory(chatX)
-	b.getOrCreateChatMemory(chatY)
-	msg := b.createMessage(chatX, 5, "x", "user", "hello", true)
+	b.getOrCreateChatMemory(chatKey(chatX))
+	b.getOrCreateChatMemory(chatKey(chatY))
+	msg := b.createMessage(chatKey(chatX), 5, "x", "user", "hello", true)
 	msg.Aside = true
 	require.NoError(t, b.storeMessage(&msg))
 	tx := b.db.Begin() // a slow statement holding the only connection
@@ -165,7 +166,7 @@ func TestJoinConversation_DatabaseWaitHoldsNoMemoryLock(t *testing.T) { //NOSONA
 	go func() { _, ok := b.joinConversation(msg); joined <- ok }()
 	time.Sleep(100 * time.Millisecond) // the join waits for the connection
 	readY := make(chan struct{})
-	go func() { defer close(readY); b.newestAnswerableSeqInChat(chatY) }()
+	go func() { defer close(readY); b.newestAnswerableSeqInChat(chatKey(chatY)) }()
 	select {
 	case <-readY:
 	case <-time.After(2 * time.Second):
@@ -182,7 +183,7 @@ func TestJoinConversation_ARowDeletedBeforeItJoinsStaysOut(t *testing.T) { //NOS
 	b, _ := historyTestBot(t, nil)
 	const chatID = int64(808)
 	storeUserText(t, b, chatID, "joined before")
-	msg := b.createMessage(chatID, 555, "tester", "user", "stored, then cleared", true)
+	msg := b.createMessage(chatKey(chatID), 555, "tester", "user", "stored, then cleared", true)
 	msg.Aside = true
 	require.NoError(t, b.storeMessage(&msg))
 	require.NoError(t, b.db.Delete(&Message{}, msg.ID).Error) // /clear's delete
@@ -198,8 +199,8 @@ func TestJoinConversation_ARowDeletedBeforeItJoinsStaysOut(t *testing.T) { //NOS
 func TestJoinConversation_MemoryReplacedMeanwhileEndsTheJoin(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	b, _ := historyTestBot(t, nil)
 	const chatID = int64(809)
-	b.getOrCreateChatMemory(chatID)
-	msg := b.createMessage(chatID, 555, "tester", "user", "joined as the memory was replaced", true)
+	b.getOrCreateChatMemory(chatKey(chatID))
+	msg := b.createMessage(chatKey(chatID), 555, "tester", "user", "joined as the memory was replaced", true)
 	msg.Aside = true
 	require.NoError(t, b.storeMessage(&msg))
 	var once sync.Once
@@ -207,7 +208,7 @@ func TestJoinConversation_MemoryReplacedMeanwhileEndsTheJoin(t *testing.T) { //N
 		once.Do(func() { // /clear's swap lands between the insert and the write
 			b.chatMemoriesMu.Lock()
 			defer b.chatMemoriesMu.Unlock()
-			b.chatMemories[chatID] = &ChatMemory{Size: b.memorySize * 2}
+			b.chatMemories[chatKey(chatID)] = &ChatMemory{Size: b.memorySize * 2}
 		})
 	}))
 

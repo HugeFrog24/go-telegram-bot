@@ -45,9 +45,9 @@ func inTopic(u *models.Update, thread int) *models.Update {
 }
 
 // A asks in topic 1; while A's question waits in its quiet window, the owner
-// sends media in topic 2. A's question is answered first, by a request of its
-// own (A's user context, no emoji rule), in topic 1; the media message gets
-// its own request, in topic 2, holding no unanswered text it did not bring.
+// sends media in the same topic. A's question is answered first, by a request
+// of its own (A's user context, no emoji rule); the media message gets its
+// own request, holding no unanswered text it did not bring.
 func TestHandleUpdate_MediaNeverTakesOverAnotherPersonsWaitingText(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	for name, tc := range map[string]struct {
 		media func(t *testing.T, b *Bot, tg *MockTelegramClient) *models.Update
@@ -86,8 +86,8 @@ func TestHandleUpdate_MediaNeverTakesOverAnotherPersonsWaitingText(t *testing.T)
 			asker := &models.User{ID: 4141, Username: "asker"}
 
 			b.handleUpdate(context.Background(), nil, inTopic(textUpdate(forumChat, 980, asker, "what time does the store open?"), 1))
-			require.True(t, b.hasPendingIntake(forumChat))
-			b.handleUpdate(context.Background(), nil, inTopic(tc.media(t, b, tg), 2))
+			require.True(t, b.hasPendingIntake(forumTopic(1)))
+			b.handleUpdate(context.Background(), nil, inTopic(tc.media(t, b, tg), 1))
 			waitIdle(t, b, forumChat)
 
 			require.Len(t, stub.requestBetas(), 2, "one request each")
@@ -106,54 +106,46 @@ func TestHandleUpdate_MediaNeverTakesOverAnotherPersonsWaitingText(t *testing.T)
 				assert.Contains(t, string(stub.body(t, 1)), "file_stub")
 			}
 			require.Len(t, sent(), 2)
-			assert.Equal(t, 1, sent()[0].MessageThreadID, "the question's answer goes to its topic")
-			assert.Equal(t, 2, sent()[1].MessageThreadID, "the media's answer to its own")
+			assert.Equal(t, []int{1, 1}, threadsOf(sent), "both answers go to the topic")
 			assert.NotNil(t, storedRow(t, b, forumChat, "what time does the store open?").AnsweredOn)
 		})
 	}
 }
 
-// A text batch waits while a committed turn runs, and a sticker arrives. The
-// batch is collected behind the running turn, and when that turn ends it
-// hands the chat to the batch, ahead of the sticker waiting in beginTurn: the
-// batch gets its own request, then the sticker gets one holding no text it
-// did not bring.
+// Another member's text batch waits while a committed turn runs, and a
+// sticker arrives. The sticker runs the batch ahead of itself: it is collected
+// behind the running turn, and when that turn ends it hands the chat to the
+// batch, ahead of the waiting sticker: the batch gets its own request, then
+// the sticker gets one holding no text it did not bring.
 func TestEndTurn_HandsTheChatToCollectedTextBeforeWaitingMedia(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
-	events := evStream(evTextBlock(0, "First part."), evTextBlock(1, "Second part."), evMessageEnd("end_turn"))
-	stub, open := newGatedAnthropicStub(t, events, 4) // message_start and the first text block
+	stub, open := newGatedAnthropicStub(t, splitAnswer(), 4) // message_start and the first text block
 	b, tg := setupBotForTest(t, ownerChat)
 	useAnthropicStub(b, stub)
 	oneConnection(t, b)
 	recordSends(tg)
 	b.config.DebounceMs = int(bufferOnly / time.Millisecond)
-	storeUserText(t, b, ownerChat, "tell me about the farm")
-	go b.respondToChat(textReq(ownerChat))
-	require.Eventually(t, func() bool {
-		b.turnsMu.Lock()
-		defer b.turnsMu.Unlock()
-		running, ok := b.turns[ownerChat]
-		return ok && running.committed
-	}, 5*time.Second, 5*time.Millisecond)
-	b.handleUpdate(context.Background(), nil, textUpdate(ownerChat, 990, owner, "and the bakery?"))
-	require.True(t, b.hasPendingIntake(ownerChat))
+	storeTextFrom(t, b, groupChatID, alice, "tell me about the farm")
+	_, done := startCommittedTurn(t, b, groupChatID)
+	b.handleUpdate(context.Background(), nil, textUpdate(groupChatID, 990, mallory, "and the bakery?"))
+	require.True(t, b.hasPendingIntake(chatKey(groupChatID)))
 
 	stickerDone := make(chan struct{})
 	go func() {
 		defer close(stickerDone)
 		b.handleUpdate(context.Background(), nil, &models.Update{Message: &models.Message{
-			ID: 991, Chat: models.Chat{ID: ownerChat}, From: owner, Sticker: &models.Sticker{FileID: "s", Emoji: "😀"},
+			ID: 991, Chat: models.Chat{ID: groupChatID, Type: models.ChatTypeSupergroup}, From: owner,
+			Sticker: &models.Sticker{FileID: "s", Emoji: "😀"},
 		}})
 	}()
-	require.Eventually(t, func() bool {
-		b.turnsMu.Lock()
-		defer b.turnsMu.Unlock()
-		running, ok := b.turns[ownerChat]
-		return ok && running.rerun != nil
-	}, 5*time.Second, 5*time.Millisecond, "the batch is collected behind the running turn")
-	time.Sleep(50 * time.Millisecond) // the sticker reaches beginTurn and waits
+	waitForMediaWaiter(t, b, groupChatID)
+	b.turnsMu.Lock()
+	collected := b.turns[chatKey(groupChatID)].rerun != nil
+	b.turnsMu.Unlock()
+	require.True(t, collected, "the batch is collected behind the running turn")
 	open()
+	<-done
 	<-stickerDone
-	waitIdle(t, b, ownerChat)
+	waitIdle(t, b, groupChatID)
 
 	require.Len(t, stub.requestBetas(), 3)
 	_, text := stub.lastMessage(t, 1)

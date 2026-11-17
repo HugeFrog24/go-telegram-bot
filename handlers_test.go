@@ -328,7 +328,7 @@ func TestClearChatHistory(t *testing.T) {
 				return &models.Message{}, nil
 			}
 
-			b.clearChatHistory(context.Background(), replyTarget{chatID: chatID, businessConnectionID: tc.businessConnID}, tc.currentUserID, tc.targetUserID, tc.targetChatID, tc.hardDelete)
+			b.clearChatHistory(context.Background(), replyTarget{chatID: chatID, businessConnectionID: tc.businessConnID}, profile{id: tc.currentUserID}, tc.targetUserID, tc.targetChatID, tc.hardDelete)
 
 			assert.Equal(t, tc.expectedMsg, sentMessage)
 
@@ -582,6 +582,10 @@ func setupTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
+// testShopID is the business account whose connections test Business chats
+// come through.
+const testShopID = int64(4242)
+
 func setupBotForTest(t *testing.T, ownerID int64) (*Bot, *MockTelegramClient) {
 	t.Helper()
 	db := setupTestDB(t)
@@ -598,7 +602,15 @@ func setupBotForTest(t *testing.T, ownerID int64) (*Bot, *MockTelegramClient) {
 		SystemPrompts:   make(map[string]string),
 		Active:          true,
 	}
+	// Business chats in tests come through connections the test shop made,
+	// which the bot serves (B8).
+	config.Business = &BusinessConfig{AllowedConnectionUsers: []int64{testShopID}}
 	mockTgClient := &MockTelegramClient{}
+	mockTgClient.GetBusinessConnectionFunc = func(_ context.Context, p *bot.GetBusinessConnectionParams) (*models.BusinessConnection, error) {
+		id, _ := p.BusinessConnectionID.(string)
+		return &models.BusinessConnection{ID: id, User: models.User{ID: testShopID}, IsEnabled: true,
+			Rights: &models.BusinessBotRights{CanReply: true, CanDeleteSentMessages: true}}, nil
+	}
 	botModel := &BotModel{Identifier: config.ID, Name: config.ID}
 	assert.NoError(t, db.Create(botModel).Error)
 	assert.NoError(t, db.Create(&ConfigModel{
@@ -624,9 +636,9 @@ func setupBotForTest(t *testing.T, ownerID int64) (*Bot, *MockTelegramClient) {
 // run and drive a turn against that test's mocks.
 func stopPendingTimers(b *Bot) {
 	b.intakeBuffersMu.Lock()
-	chats := make([]int64, 0, len(b.intakeBuffers))
-	for chatID := range b.intakeBuffers {
-		chats = append(chats, chatID)
+	chats := make([]convKey, 0, len(b.intakeBuffers))
+	for k := range b.intakeBuffers {
+		chats = append(chats, k)
 	}
 	b.intakeBuffersMu.Unlock()
 	for _, chatID := range chats {

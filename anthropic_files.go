@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
+	"gorm.io/gorm"
 )
 
 const fileNotFoundPrefix = "File not found: "
@@ -40,13 +41,23 @@ func (b *Bot) deleteFileFromAnthropic(ctx context.Context, fileID string) error 
 	return fmt.Errorf("anthropic files delete %s: %w", fileID, err)
 }
 
+// compensatingDelete deletes Files API uploads that no message will hold.
+//
+// The deletes run detached from ctx, which a /clear may have cancelled with
+// the photo's turn, under a bounded timeout of their own. A delete that
+// fails is logged with its file id only; a durable retry is Task H.
 func (b *Bot) compensatingDelete(ctx context.Context, fileIDs []string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), compensatingDeleteTimeout)
+	defer cancel()
 	for _, fid := range fileIDs {
 		if err := b.deleteFileFromAnthropic(ctx, fid); err != nil {
-			ErrorLogger.Printf("[%s] compensating delete for %s: %v", b.config.ID, fid, err)
+			ErrorLogger.Printf("[%s] compensating delete for %s failed: %v", b.config.ID, fid, err)
 		}
 	}
 }
+
+// compensatingDeleteTimeout bounds the deletes of one compensation.
+const compensatingDeleteTimeout = 30 * time.Second
 
 func extractMissingFileID(err error) string {
 	if err == nil {
@@ -80,28 +91,35 @@ func parseMissingFileIDFromBody(raw string) string {
 	return rest[:end]
 }
 
-func (b *Bot) hardDeleteScope(ctx context.Context, query string, args ...interface{}) error {
+// hardDeleteScope permanently deletes the rows matching query up to cutoff,
+// with their Files API files. The rows are soft-deleted first, then their
+// files deleted, then the rows hard-deleted by the same scope and cutoff,
+// except any whose files could not all be deleted: those stay soft-deleted,
+// so their file ids are not lost.
+func (b *Bot) hardDeleteScope(ctx context.Context, cutoff uint, query string, args ...interface{}) error {
+	scope := func() *gorm.DB { return b.db.Where(query, args...).Where("id <= ?", cutoff) }
 	var rows []Message
-	if err := b.db.Unscoped().Where(query, args...).Find(&rows).Error; err != nil {
+	if err := scope().Unscoped().Find(&rows).Error; err != nil {
 		return fmt.Errorf("scan rows: %w", err)
 	}
 	if len(rows) == 0 {
 		return nil
 	}
-	if err := b.db.Where(query, args...).Delete(&Message{}).Error; err != nil {
+	if err := scope().Delete(&Message{}).Error; err != nil {
 		return fmt.Errorf("soft delete: %w", err)
 	}
 
-	hardDeletable := make([]uint, 0, len(rows))
+	var kept []uint
 	for _, row := range rows {
-		if b.deleteRowFiles(ctx, row) {
-			hardDeletable = append(hardDeletable, row.ID)
+		if !b.deleteRowFiles(ctx, row) {
+			kept = append(kept, row.ID)
 		}
 	}
-	if len(hardDeletable) == 0 {
-		return nil
+	hard := scope().Unscoped()
+	if len(kept) > 0 {
+		hard = hard.Where("id NOT IN ?", kept)
 	}
-	if err := b.db.Unscoped().Where("id IN ?", hardDeletable).Delete(&Message{}).Error; err != nil {
+	if err := hard.Delete(&Message{}).Error; err != nil {
 		return fmt.Errorf("hard delete: %w", err)
 	}
 	return nil
@@ -133,7 +151,7 @@ func stripDeadFileIDs(src []string, deadSet map[string]struct{}) (survivors []st
 	return survivors, dirty
 }
 
-func (b *Bot) markFilesPendingCleanup(ctx context.Context, chatID int64, deadFileIDs []string) (int, error) {
+func (b *Bot) markFilesPendingCleanup(ctx context.Context, k convKey, deadFileIDs []string) (int, error) {
 	if len(deadFileIDs) == 0 {
 		return 0, nil
 	}
@@ -142,8 +160,9 @@ func (b *Bot) markFilesPendingCleanup(ctx context.Context, chatID int64, deadFil
 		deadSet[id] = struct{}{}
 	}
 	var rows []Message
-	if err := b.db.WithContext(ctx).
-		Where("bot_id = ? AND chat_id = ? AND image_file_ids IS NOT NULL", b.botID, chatID).
+	scope, args := b.convScope(k)
+	if err := b.db.WithContext(ctx).Where(scope, args...).
+		Where("image_file_ids IS NOT NULL").
 		Find(&rows).Error; err != nil {
 		return 0, fmt.Errorf("scan rows for cleanup: %w", err)
 	}
@@ -154,16 +173,23 @@ func (b *Bot) markFilesPendingCleanup(ctx context.Context, chatID int64, deadFil
 		if !dirty {
 			continue
 		}
+		columns := []string{"ImageFileIDs"}
 		if len(survivors) == 0 {
 			row.ImageFileIDs = nil
 			row.FilesCleanedAt = &now
+			columns = append(columns, "FilesCleanedAt")
 		} else {
 			row.ImageFileIDs = survivors
 		}
-		if err := b.db.WithContext(ctx).Save(&row).Error; err != nil {
-			return updated, fmt.Errorf("update row %d: %w", row.ID, err)
+		// Only these columns, and only while the row is live: a Save of the
+		// copy read above would bring back a row a /clear deleted since (its
+		// upsert), or insert it again after a /clear_hard.
+		result := b.db.WithContext(ctx).Model(&Message{}).Where("id = ?", row.ID).Select(columns).
+			Updates(&Message{ImageFileIDs: row.ImageFileIDs, FilesCleanedAt: row.FilesCleanedAt})
+		if result.Error != nil {
+			return updated, fmt.Errorf("update row %d: %w", row.ID, result.Error)
 		}
-		updated++
+		updated += int(result.RowsAffected)
 	}
 	return updated, nil
 }

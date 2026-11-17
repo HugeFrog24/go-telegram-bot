@@ -94,12 +94,12 @@ func TestStopTurn_RequiresMatchingDraft(t *testing.T) { //NOSONAR go:S100 -- und
 	b, _ := setupBotForTest(t, 123)
 	turn, ctx, _ := b.beginTextTurn(textReq(5), 5)
 
-	assert.False(t, b.stopTurn(5, 1), "no draft shown yet: nothing to stop")
+	assert.False(t, b.stopTurn(chatKey(5), 1), "no draft shown yet: nothing to stop")
 	b.setTurnDraft(turn, "42")
-	assert.False(t, b.stopTurn(5, 41), "a stale draft id is ignored")
+	assert.False(t, b.stopTurn(chatKey(5), 41), "a stale draft id is ignored")
 	assert.NoError(t, ctx.Err())
 
-	assert.True(t, b.stopTurn(5, 42))
+	assert.True(t, b.stopTurn(chatKey(5), 42))
 	assert.ErrorIs(t, ctx.Err(), context.Canceled)
 	assert.Equal(t, cancelStop, b.turnReason(turn))
 	b.finishTurn(turn)
@@ -113,7 +113,7 @@ func TestFinishTurn_StopKeepsCollectedFlush(t *testing.T) { //NOSONAR go:S100 --
 	_, _, ok := b.beginTextTurn(textReq(6), 7)
 	require.False(t, ok)
 
-	require.True(t, b.stopTurn(6, int(turn.seq)))
+	require.True(t, b.stopTurn(chatKey(6), int(turn.seq)))
 
 	assert.NotNil(t, b.finishTurn(turn), "a message sent before the Stop tap still deserves an answer")
 }
@@ -123,19 +123,20 @@ func TestFinishTurn_StopKeepsCollectedFlush(t *testing.T) { //NOSONAR go:S100 --
 func dropRerun(b *Bot, chatID int64) {
 	b.turnsMu.Lock()
 	defer b.turnsMu.Unlock()
-	if running, exists := b.turns[chatID]; exists {
+	if running, exists := b.turns[chatKey(chatID)]; exists {
 		running.rerun, running.rerunWant = nil, 0
 	}
 }
 
-func TestCancelForClear_StopsTheTurnAndDropsItsRerun(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+func TestBeginClear_StopsTheTurnAndDropsItsRerun(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	b, _ := setupBotForTest(t, 123)
 	turn, ctx, _ := b.beginTextTurn(textReq(8), 5)
 	b.markCommitted(turn)
 	_, _, ok := b.beginTextTurn(textReq(8), 7)
 	require.False(t, ok)
 
-	b.cancelForClear(8)
+	_, err := b.beginClear(chatKey(8))
+	require.NoError(t, err)
 
 	assert.ErrorIs(t, ctx.Err(), context.Canceled, "the turn stops, committed or not")
 	assert.True(t, b.clearedTurn(turn))
@@ -224,4 +225,63 @@ func TestBeginTurn_CancelledParentStillWaits(t *testing.T) { //NOSONAR go:S100 -
 	case <-time.After(time.Second):
 		t.Fatal("never acquired after the running turn finished")
 	}
+}
+
+// beginTurn takes the chat for a committed turn the way a media turn does
+// (beginMediaTurn): someone else's media turn, for tests.
+func (b *Bot) beginTurn(parent context.Context, chatID int64) (*chatTurn, context.Context) {
+	return b.beginTurnIn(parent, chatKey(chatID))
+}
+
+// beginTurnIn is beginTurn in conversation k.
+func (b *Bot) beginTurnIn(parent context.Context, k convKey) (*chatTurn, context.Context) {
+	to := replyTarget{chatID: k.chatID, businessConnectionID: k.businessConnectionID, threadID: k.threadID, forum: k.threadID != 0}
+	m, _ := b.beginMediaTurn(parent, to, 0, 0)
+	return m.turn, m.ctx
+}
+
+// forumTopic is topic thread's conversation in the test forum.
+func forumTopic(thread int) convKey { return convKey{chatID: forumChat, threadID: thread} }
+
+// beginTextTurn is beginTextTurnLocked taking the lock, for tests that pick
+// the flush's want themselves.
+func (b *Bot) beginTextTurn(req turnRequest, wantSeq uint64) (*chatTurn, context.Context, bool) {
+	chatMemory := b.getOrCreateChatMemory(req.conv())
+	b.turnsMu.Lock()
+	defer b.turnsMu.Unlock()
+	return b.beginTextTurnLocked(req, wantSeq, chatMemory)
+}
+
+// A turn restarted (here by an edit) whose model call finishes anyway before
+// it notices is abandoned all the same: nothing of it is sent or filed, and
+// its rerun answers.
+func TestRunTurn_ARestartedTurnWhoseCallFinishedFirstIsAbandoned(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	stub := newAnthropicStub(t, candleFarmStream())
+	b, tg := setupBotForTest(t, 123)
+	useAnthropicStub(b, stub)
+	sent := recordSends(tg)
+	const chatID = int64(-100800) // a group: segments, no draft
+	first := storeUserText(t, b, chatID, "hi")
+	turn, turnCtx, ok := b.beginTextTurn(textReq(chatID), first.Seq)
+	require.True(t, ok)
+	called, release := make(chan struct{}), make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.runTurn(turn, turnCtx, textReq(chatID), func(context.Context, replyOutput) (string, error) {
+			close(called)
+			<-release // the stream ends just as the restart lands
+			return "a reply to the old wording", nil
+		})
+	}()
+	<-called
+
+	require.True(t, b.restartForEdit(textReq(chatID), first.Seq))
+	close(release)
+	<-done
+	waitIdle(t, b, chatID)
+
+	assert.NotContains(t, memoryTexts(b, chatID), "a reply to the old wording", "nothing of it is filed")
+	assert.Len(t, stub.requestBetas(), 1, "its rerun asked the model")
+	assert.Equal(t, []string{"Open the Farm tab."}, sentTexts(sent), "and only the rerun's answer is sent")
 }

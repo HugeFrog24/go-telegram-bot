@@ -149,6 +149,31 @@ func (c *BotConfig) NotesEnabled() bool {
 	return c.ThinkingDisplay == ThinkingDisplayUpdates
 }
 
+// BusinessConfig is a bot's Telegram Business settings.
+type BusinessConfig struct {
+	// AllowedConnectionUsers are the Telegram user IDs, besides the bot's
+	// owner, whose business accounts may connect the bot as their Business
+	// bot. An update through anyone else's connection is ignored: nothing is
+	// stored or answered (B8).
+	AllowedConnectionUsers []int64 `json:"allowed_connection_users,omitempty"`
+}
+
+// validate checks that every allowed connection user is a Telegram user ID,
+// listed once.
+func (c BusinessConfig) validate() error {
+	seen := make(map[int64]bool, len(c.AllowedConnectionUsers))
+	for _, id := range c.AllowedConnectionUsers {
+		if id <= 0 {
+			return fmt.Errorf("'business.allowed_connection_users' entry %d is not a Telegram user ID (they are positive)", id)
+		}
+		if seen[id] {
+			return fmt.Errorf("'business.allowed_connection_users' lists %d more than once", id)
+		}
+		seen[id] = true
+	}
+	return nil
+}
+
 type BotConfig struct {
 	ID                string            `json:"id"`
 	TelegramToken     string            `json:"telegram_token"`
@@ -176,6 +201,7 @@ type BotConfig struct {
 	MCPServers        []MCPServer       `json:"mcp_servers,omitempty"`
 	WebSearch         *WebSearchConfig  `json:"web_search,omitempty"`
 	Video             *VideoConfig      `json:"video,omitempty"`
+	Business          *BusinessConfig   `json:"business,omitempty"`
 	ConfigFilePath    string            `json:"-"`
 }
 
@@ -390,6 +416,12 @@ func validateConfig(config *BotConfig, ids, tokens map[string]bool) error {
 
 	if config.Video != nil {
 		if err := config.Video.validate(); err != nil {
+			return err
+		}
+	}
+
+	if config.Business != nil {
+		if err := config.Business.validate(); err != nil {
 			return err
 		}
 	}

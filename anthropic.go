@@ -24,6 +24,11 @@ var ErrModelNotFound = errors.New("model not found or deprecated")
 // turn fails like any other failed call.
 var errHistoryNotUserLast = errors.New("the conversation does not end with a user message")
 
+// errStaleReply refuses a turn's reply when /clear replaced the memory the
+// turn read: the reply answers a history that is gone, so it is neither
+// stored nor sent.
+var errStaleReply = errors.New("the history this reply answers was cleared")
+
 const maxFileNotFoundRetries = 3
 
 // imageGoneText stands in for an image whose file the Files API no longer
@@ -40,7 +45,7 @@ var mcpUnsupportedCount atomic.Uint64
 
 type mcpCall struct{ server, name, input string }
 
-func (b *Bot) getAnthropicResponse(ctx context.Context, chatID int64, messages []anthropic.BetaMessageParam, isEmojiOnly bool, username string, firstName string, lastName string, isPremium bool, languageCode string, messageTime int, sinks replySinks) (string, error) {
+func (b *Bot) getAnthropicResponse(ctx context.Context, k convKey, messages []anthropic.BetaMessageParam, isEmojiOnly bool, username string, firstName string, lastName string, isPremium bool, languageCode string, messageTime int, sinks replySinks) (string, error) {
 	params := b.buildMessageParams(messages, isEmojiOnly, username, firstName, lastName, isPremium, languageCode, messageTime)
 
 	// history is the conversation as the turn read it. Every request sends it,
@@ -61,8 +66,8 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, chatID int64, messages [
 			return "", err // the turn was cancelled (restart, Stop, /clear): no request
 		}
 		if len(history) == 0 || history[len(history)-1].OfUser == nil {
-			ErrorLogger.Printf("[%s] BUG: chat %d: the request's history does not end with a user message (%d messages); no model call",
-				b.config.ID, chatID, len(history))
+			ErrorLogger.Printf("[%s] BUG: chat %v: the request's history does not end with a user message (%d messages); no model call",
+				b.config.ID, k, len(history))
 			return "", errHistoryNotUserLast
 		}
 		params.Messages = append(slices.Clip(history), resumed...)
@@ -70,7 +75,7 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, chatID int64, messages [
 		msg, streamErr := b.streamMessages(ctx, params, a)
 		if streamErr != nil {
 			fileRetries++
-			if err := b.selfHeal(ctx, chatID, history, streamErr, fileRetries); err != nil {
+			if err := b.selfHeal(ctx, k, history, streamErr, fileRetries); err != nil {
 				return "", err
 			}
 			continue
@@ -105,7 +110,7 @@ func (b *Bot) getAnthropicResponse(ctx context.Context, chatID int64, messages [
 // history become a note (replaceDeadImage), and the file is stripped from
 // memory and marked for cleanup, for later turns. nil asks for a retry of the
 // same history. Any other failure, or one a retry cannot heal, is returned.
-func (b *Bot) selfHeal(ctx context.Context, chatID int64, history []anthropic.BetaMessageParam, streamErr error, attempt int) error {
+func (b *Bot) selfHeal(ctx context.Context, k convKey, history []anthropic.BetaMessageParam, streamErr error, attempt int) error {
 	var apiErr *anthropic.Error
 	if !errors.As(streamErr, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("error creating Anthropic message: %w", streamErr)
@@ -120,10 +125,10 @@ func (b *Bot) selfHeal(ctx context.Context, chatID int64, history []anthropic.Be
 	if !replaceDeadImage(history, missingFileID) {
 		return fmt.Errorf("file_id %s is gone from anthropic but not in the request: %w", missingFileID, streamErr)
 	}
-	ErrorLogger.Printf("[%s] self-heal: replaced dead file_id %s in chat %d's request (attempt %d/%d)",
-		b.config.ID, missingFileID, chatID, attempt, maxFileNotFoundRetries)
-	b.stripDeadFileIDFromMemory(chatID, missingFileID)
-	if _, cleanupErr := b.markFilesPendingCleanup(ctx, chatID, []string{missingFileID}); cleanupErr != nil {
+	ErrorLogger.Printf("[%s] self-heal: replaced dead file_id %s in chat %v's request (attempt %d/%d)",
+		b.config.ID, missingFileID, k, attempt, maxFileNotFoundRetries)
+	b.stripDeadFileIDFromMemory(k, missingFileID)
+	if _, cleanupErr := b.markFilesPendingCleanup(ctx, k, []string{missingFileID}); cleanupErr != nil {
 		ErrorLogger.Printf("[%s] mark files pending cleanup: %v", b.config.ID, cleanupErr)
 	}
 	return nil

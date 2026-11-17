@@ -76,6 +76,7 @@ Each bot is one JSON file in `config/` (see `config/default.json` for the templa
 | `debounce_ms`      | number | *(omitted)* | Quiet window, in milliseconds, for coalescing rapid follow-up messages into a single turn. Omit or set `0` to disable. See [Coalescing rapid messages](#coalescing-rapid-messages) below. |
 | `stream_drafts`    | bool   | `false`     | Streams each reply into one Telegram draft that grows in place, with a native Stop button, and sends it as a single message when done. Private chats only. See [Draft streaming and the Stop button](#draft-streaming-and-the-stop-button) below. |
 | `cache_history`    | bool   | `true`      | Places a prompt-cache breakpoint on the trailing conversation block, so each turn reads the prior history from cache instead of reprocessing it at full price. Set `false` to cache only the system prompt. |
+| `business`         | object | *(omitted)* | Telegram Business. `allowed_connection_users` lists the Telegram user IDs, besides `owner_telegram_id`, whose business accounts may connect this bot as their chatbot, for example `"business": {"allowed_connection_users": [123456789]}`. Every update through a connection anyone else made is ignored: nothing is stored or answered, and the bot logs the connection's ID and user once. Omit the block to serve only the owner's business account. Each entry must be a positive user ID, listed once. |
 | `web_search`       | object | *(omitted)* | Enables Anthropic's server-side web search (and, optionally, web fetch), sandboxed to a domain allowlist. Omit the key entirely to leave both tools off — an absent block sends byte-identical requests to before. See [Web search / fetch](#web-search--fetch) below. |
 
 Every reply logs one accounting line — `[usage] model=... in=... out=... thinking=... cache_read=... cache_write=... stop=...` — so thinking spend (billed even when its text is omitted) stays visible in `journalctl`/`docker compose logs`. A `stop=max_tokens` line is accompanied by an error-level warning that the reply was truncated.
@@ -93,7 +94,7 @@ A user who sends "how do I do X", then "sorry typo", then "lmao" in five seconds
 
 Reasonable windows are 1500–3000ms for ordinary chat and up to 8000ms for Telegram Business, where a person writing to a business account tends to send longer bursts. The maximum is 30000ms.
 
-Nothing is discarded while buffering. Each message is still persisted and added to chat memory the moment it arrives, so the single coalesced turn sees all of them — the buffer only decides *when* to answer, never *what* the model reads. Reply metadata (language, premium status, business connection) follows the most recent message in the batch.
+Nothing is discarded while buffering. Each message is still persisted and added to chat memory the moment it arrives, so the single coalesced turn sees all of them — the buffer only decides *when* to answer, never *what* the model reads. Reply metadata (language, premium status) follows the most recent message in the batch. Each conversation (each chat, Business connection and forum topic) has its own buffer, so a batch never mixes conversations.
 
 What deliberately does **not** wait:
 
@@ -101,7 +102,7 @@ What deliberately does **not** wait:
 - **Photos, albums, voice, and stickers** dispatch immediately and cancel any pending text window. The buffered text is not lost — it is already in memory, so the media turn answers it too.
 - **`/clear` and `/clear_hard`** cancel the buffer outright. Without this, the window would fire seconds after the wipe and replay the just-deleted messages back into memory.
 
-**Edits count as typing.** Mobile clients deliver autocorrect fixes as `edited_message` updates a few seconds after the send. The stored text (or photo caption) is replaced with the edit. If the message is still inside its quiet window, the window restarts. If a turn is already reading the old wording and has shown nothing yet, that turn restarts with the correction. An edit to a message that was already answered only corrects the record.
+**Edits count as typing.** Mobile clients deliver autocorrect fixes as `edited_message` updates a few seconds after the send. The stored text (or photo caption) is replaced with the edit. If the message is still inside its quiet window, the window restarts. If a turn is already reading the old wording and has shown nothing yet, that turn restarts with the correction, once: a later edit while the restarted turn runs only corrects the record. An edit to a message that was already answered only corrects the record. An edit that would restart the window or a turn counts against its sender's message rate limit; over the limit it only corrects the record. However often messages or edits restart it, a batch's window ends at most four windows after its first message.
 
 #### Messages that arrive mid-turn
 
@@ -112,6 +113,8 @@ No window catches every slow typist, and no LLM API lets you append to a request
 - **Collected** if output is already on screen. The message gets its own turn as soon as the running one finishes, instead of a second concurrent one. If the finished turn's context turns out to have included the message after all, the extra turn is skipped.
 
 Photos, voice, and stickers wait for a running turn to finish and are never restarted. Photo uploads still start immediately and overlap the running turn; only the model call queues behind it.
+
+Chat memory is a sliding window. A flood of messages that overflows it while they wait, behind a running turn or in a quiet window, pushes the oldest of them out before any turn reads them: they stay stored, but no reply sees them. A photo, voice note or sticker waiting for the chat is the exception: it is kept in the window until its turn reads it.
 
 While a turn is running the bot shows Telegram's "typing…" indicator (or "recording audio" while synthesising a voice reply), refreshed every 4 seconds because Telegram expires the status after 5. Without it, a debounce window reads as the bot ignoring you — which is what prompts users to send more messages in the first place.
 
@@ -286,7 +289,17 @@ journalctl -u telegram-bot -f
 
 > **Note:** In private DMs each user's `chat_id` equals their `user_id`. The scoped `<chat_id>` form is mainly useful for group chat moderation.
 
-In forum groups the bot replies in the topic the message was sent in.
+> **Note:** The bot keeps one conversation per chat, per Business connection and per forum topic. A Business chat has the customer's own user ID as its chat ID, the same as the customer's private chat with the bot and their chats with any other business on the same bot, but each is a conversation of its own: its own memory, its own replies, its own rows. A bare `/clear` or `/clear_hard` clears only the conversation it is sent in.
+
+> **Note:** In groups, supergroups and Business chats, a bare `/clear` or `/clear_hard` deletes only your own messages in that conversation; admins and owners clear the whole conversation. The `<user_id>` forms delete only that user's own messages, in every conversation with that chat ID (every Business connection's and every topic's) or in every chat; the user's private chat with the bot is cleared whole, the bot's replies included. In a Business chat with that user as the customer, only the user's own rows go: the business owner's messages and the bot's Business replies stay. Commands are limited per user: 5 at once, refilled at 5 per minute; 30 at once, refilled at 30 per hour (admins and owners exempt).
+
+> **Note:** In a Business chat, a message the business account itself sends the customer (typed by its owner, or sent through another bot) is kept as the business's side of the conversation, so later replies know what was said; the bot never answers it, and it is never a command. A reply the bot itself sent is not recorded twice. `/stats` counts the owner's messages as messages the owner sent, as before. When the business account disconnects the bot, or takes away its right to reply, the bot stops there at once: a reply in progress is not sent, and messages waiting to be answered are dropped. Messages deleted in a Business chat, by either side, leave the conversation, and the photos uploaded with them are deleted from the Files API.
+
+> **Note:** A message sent on behalf of a channel, or by an anonymous admin, counts as the channel's or the group's own (Telegram's `sender_chat`), not as the stand-in user Telegram puts in `from` for all of them: each channel poster has their own messages, rate limit and command limit. Anonymous admins all appear as the group itself, so the bot cannot tell them apart: they share one sender, and an anonymous admin's bare `/clear` of their own messages is refused.
+
+> **Note:** Messages stored before the bot kept conversations apart (before rows carried their Business connection) stay in the database and in `/stats`, but are never loaded into a conversation again: every conversation started afresh then. A bare `/clear` does not reach them; the `<user_id>` forms delete that user's old rows too.
+
+In forum groups each topic is a conversation of its own, and the bot replies in the topic the message was sent in. A reply thread in a group that is not a forum stays in the group's one conversation.
 
 ## Testing
 

@@ -136,9 +136,17 @@ type anthropicStub struct {
 	gate  chan struct{}
 	split int
 
-	mu     sync.Mutex
-	betas  []string // the anthropic-beta header of each request, in order
-	bodies [][]byte // each request's body, in order
+	mu      sync.Mutex
+	betas   []string // the anthropic-beta header of each request, in order
+	bodies  [][]byte // each request's body, in order
+	deletes []string // the path of each Files API delete, in order
+}
+
+// deletedFiles is the path of every Files API delete the stub saw.
+func (s *anthropicStub) deletedFiles() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.deletes...)
 }
 
 func newAnthropicStub(t *testing.T, streams ...[]string) *anthropicStub {
@@ -163,6 +171,11 @@ func serveAnthropicStub(t *testing.T, stub *anthropicStub) *anthropicStub {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/v1/files") {
+			if r.Method == http.MethodDelete {
+				stub.mu.Lock()
+				stub.deletes = append(stub.deletes, r.URL.Path)
+				stub.mu.Unlock()
+			}
 			serveFilesStub(w, r)
 			return
 		}
@@ -292,7 +305,7 @@ func askStubbedModel(t *testing.T, b *Bot, sinks replySinks) (string, error) {
 	messages := []anthropic.BetaMessageParam{
 		anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock("Where is the candle farm?")),
 	}
-	return b.getAnthropicResponse(ctx, 42, messages, false, "alice", "Alice", "", false, "en", 0, sinks)
+	return b.getAnthropicResponse(ctx, chatKey(42), messages, false, "alice", "Alice", "", false, "en", 0, sinks)
 }
 
 func TestGetAnthropicResponse_StreamNotesAndAnswer(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names

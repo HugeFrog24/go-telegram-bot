@@ -74,9 +74,16 @@ func TestTargetFor(t *testing.T) {
 		{
 			name: "topic message carries its thread",
 			msg: &models.Message{
-				Chat: models.Chat{ID: topicChatID}, IsTopicMessage: true, MessageThreadID: topicThreadID,
+				Chat: models.Chat{ID: topicChatID, Type: models.ChatTypeSupergroup}, IsTopicMessage: true, MessageThreadID: topicThreadID,
 			},
-			want: replyTarget{chatID: topicChatID, threadID: topicThreadID},
+			want: replyTarget{chatID: topicChatID, threadID: topicThreadID, shared: true, forum: true},
+		},
+		{
+			name: "a topic in a private chat with the bot is replied in, but is no conversation of its own",
+			msg: &models.Message{
+				Chat: models.Chat{ID: 42, Type: models.ChatTypePrivate}, IsTopicMessage: true, MessageThreadID: 5,
+			},
+			want: replyTarget{chatID: 42, threadID: 5},
 		},
 		{
 			name: "reply thread in a non-forum supergroup has no topic",
@@ -89,7 +96,17 @@ func TestTargetFor(t *testing.T) {
 			name:  "private message keeps the business connection",
 			msg:   &models.Message{Chat: models.Chat{ID: 42}},
 			bizID: "biz-1",
-			want:  replyTarget{chatID: 42, businessConnectionID: "biz-1"},
+			want:  replyTarget{chatID: 42, businessConnectionID: "biz-1", shared: true},
+		},
+		{
+			name: "a group's history is shared",
+			msg:  &models.Message{Chat: models.Chat{ID: -42, Type: models.ChatTypeGroup}},
+			want: replyTarget{chatID: -42, shared: true},
+		},
+		{
+			name: "a private chat with the bot is not",
+			msg:  &models.Message{Chat: models.Chat{ID: 42, Type: models.ChatTypePrivate}},
+			want: replyTarget{chatID: 42},
 		},
 	}
 	for _, tc := range cases {
@@ -188,7 +205,7 @@ func TestHandleEditedMessage_TopicKeepsThreadID(t *testing.T) { //NOSONAR go:S10
 	}})
 
 	b.turnsMu.Lock()
-	rerun := b.turns[topicChatID].rerun
+	rerun := b.turns[chatKey(topicChatID)].rerun
 	b.turnsMu.Unlock()
 	require.NotNil(t, rerun, "the edit must restart the uncommitted turn")
 	assert.Equal(t, 41, rerun.threadID)

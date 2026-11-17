@@ -11,7 +11,11 @@ import (
 const albumFlushWindow = 1 * time.Second
 
 type pendingAlbum struct {
-	items                                       []*models.Message
+	items []*models.Message
+	// row is the album's message, stored aside when its first item arrived
+	// (storePhotoArrival); stored is false when that store failed.
+	row                                         Message
+	stored                                      bool
 	to                                          replyTarget
 	userID                                      int64
 	username, firstName, lastName, languageCode string
@@ -33,9 +37,16 @@ func (b *Bot) bufferAlbumItem(
 	b.albumBuffersMu.Lock()
 	defer b.albumBuffersMu.Unlock()
 
-	album, exists := b.albumBuffers[msg.MediaGroupID]
+	key := albumKey{conv: to.conv(), mediaGroupID: msg.MediaGroupID}
+	album, exists := b.albumBuffers[key]
 	if !exists {
+		row, err := b.storePhotoArrival(msg, to)
+		if err != nil {
+			ErrorLogger.Printf("[%s] store album message failed: %v", b.config.ID, err)
+		}
 		album = &pendingAlbum{
+			row:          row,
+			stored:       err == nil,
 			to:           to,
 			userID:       userID,
 			username:     username,
@@ -45,32 +56,32 @@ func (b *Bot) bufferAlbumItem(
 			languageCode: languageCode,
 			messageTime:  messageTime,
 		}
-		b.albumBuffers[msg.MediaGroupID] = album
+		b.albumBuffers[key] = album
 	}
 	album.items = append(album.items, msg)
 
 	if album.timer != nil {
 		album.timer.Stop()
 	}
-	mediaGroupID := msg.MediaGroupID
 	album.timer = time.AfterFunc(albumFlushWindow, func() {
-		b.flushAlbum(ctx, mediaGroupID)
+		defer b.recoverPanic("album flush")
+		b.flushAlbum(ctx, key)
 	})
 }
 
-func (b *Bot) flushAlbum(ctx context.Context, mediaGroupID string) {
-	b.albumBuffersMu.Lock()
-	album, exists := b.albumBuffers[mediaGroupID]
+func (b *Bot) flushAlbum(ctx context.Context, key albumKey) {
+	captured, exists := b.takeAlbum(key)
 	if !exists {
-		b.albumBuffersMu.Unlock()
 		return
 	}
-	delete(b.albumBuffers, mediaGroupID)
-	items := album.items
-	captured := *album
-	b.albumBuffersMu.Unlock()
+	items := captured.items
 
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+
+	if !captured.stored {
+		b.sendNotice(ctx, captured.to, "Sorry, I had trouble saving your message.")
+		return
+	}
 
 	if !b.checkRateLimits(captured.userID) {
 		b.sendRateLimitExceededMessage(ctx, captured.to)
@@ -78,9 +89,21 @@ func (b *Bot) flushAlbum(ctx context.Context, mediaGroupID string) {
 	}
 
 	b.handlePhotoMessage(
-		ctx, items,
+		ctx, items, captured.row,
 		captured.to, captured.userID,
 		captured.username, captured.firstName, captured.lastName,
 		captured.isPremium, captured.languageCode, captured.messageTime,
 	)
+}
+
+// takeAlbum removes the album's buffer and returns it, under albumBuffersMu.
+func (b *Bot) takeAlbum(key albumKey) (pendingAlbum, bool) {
+	b.albumBuffersMu.Lock()
+	defer b.albumBuffersMu.Unlock()
+	album, exists := b.albumBuffers[key]
+	if !exists {
+		return pendingAlbum{}, false
+	}
+	delete(b.albumBuffers, key)
+	return *album, true
 }

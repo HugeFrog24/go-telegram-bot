@@ -7,17 +7,20 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
 	"github.com/anthropics/anthropic-sdk-go/v2/option"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // selfHealStub fails its first deadFiles requests with the 404 the Files API
 // gives for a file it no longer has, running hook before the first, then
-// answers every later request with candleFarmStream.
+// answers every later request with candleFarmStream. A file's delete is
+// answered as done, and not counted.
 type selfHealStub struct {
 	deadFile  string
 	deadFiles int
@@ -31,6 +34,11 @@ func (s *selfHealStub) serve(t *testing.T) string {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
+		if r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/v1/files/") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":"`+r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]+`","type":"file_deleted"}`)
+			return
+		}
 		s.mu.Lock()
 		n := len(s.bodies)
 		s.bodies = append(s.bodies, body)
@@ -65,6 +73,55 @@ func (s *selfHealStub) count() int {
 	return len(s.bodies)
 }
 
+// Blind r5 #2 inverted (L2): Mallory's photo row, whose file the Files API
+// no longer has, is in a group's memory. Alice's turn hits the 404 and
+// self-heals; the cleanup reads the row, then Mallory's /clear or
+// /clear_hard deletes it, then the cleanup writes. Its write touches only a
+// live row: the cleared row is not brought back, nor inserted again.
+func TestSelfHeal_CleanupDoesNotBringBackAClearedRow(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
+	for _, command := range []string{"/clear", "/clear_hard"} {
+		t.Run(command, func(t *testing.T) {
+			stub := &selfHealStub{deadFile: "file_dead", deadFiles: 1}
+			b, tg := setupBotForTest(t, 123)
+			b.config.MessagePerHour, b.config.MessagePerDay = 1000, 10000
+			b.anthropicClient = anthropic.NewClient(option.WithBaseURL(stub.serve(t)), option.WithAPIKey("test"), option.WithMaxRetries(0))
+			oneConnection(t, b)
+			sent := recordSends(tg)
+
+			b.getOrCreateChatMemory(chatKey(groupChatID))
+			photo := b.createMessage(chatKey(groupChatID), mallory.ID, mallory.Username, "user", "MALLORY-SECRET-CAPTION", true)
+			photo.ImageFileIDs = []string{"file_dead"}
+			require.NoError(t, b.storeMessage(&photo))
+			_, ok := b.joinConversation(photo)
+			require.True(t, ok)
+			answerInTurn(t, b, groupChatID, "nice photo")
+
+			var fired atomic.Bool
+			// The cleanup's write, before its transaction takes the one connection.
+			require.NoError(t, b.db.Callback().Update().Before("gorm:begin_transaction").Register("test:clear_mid_cleanup", func(db *gorm.DB) {
+				if m, isMessage := db.Statement.Dest.(*Message); isMessage && m.FilesCleanedAt != nil && fired.CompareAndSwap(false, true) {
+					b.handleUpdate(context.Background(), nil, commandUpdate(groupChatID, 999, mallory, command))
+				}
+			}))
+			b.handleUpdate(context.Background(), nil, textUpdate(groupChatID, 1000, alice, "what was in that photo?"))
+			waitIdle(t, b, groupChatID)
+			require.True(t, fired.Load(), "the clear ran between the cleanup's read and its write")
+			require.Contains(t, sentTexts(sent), ownClearedNotice)
+
+			var rows []Message
+			require.NoError(t, b.db.Unscoped().Where("id = ?", photo.ID).Find(&rows).Error)
+			if command == "/clear_hard" {
+				assert.Empty(t, rows, "the hard-deleted row is not inserted again")
+			} else if assert.Len(t, rows, 1) {
+				assert.True(t, rows[0].DeletedAt.Valid, "the cleared row stays deleted")
+				assert.Nil(t, rows[0].FilesCleanedAt, "and is not written: the cleanup touches only a live row")
+			}
+			dropChatMemory(b, groupChatID) // a reload, as after a restart
+			assert.NotContains(t, memoryTexts(b, groupChatID), "MALLORY-SECRET-CAPTION", "the cleared caption does not come back")
+		})
+	}
+}
+
 // selfHealBot is a bot whose Anthropic client talks to stub.
 func selfHealBot(t *testing.T, stub *selfHealStub) *Bot {
 	t.Helper()
@@ -77,8 +134,8 @@ func selfHealBot(t *testing.T, stub *selfHealStub) *Bot {
 // into the chat, with caption as its text.
 func storePhoto(t *testing.T, b *Bot, chatID int64, caption string) Message {
 	t.Helper()
-	b.getOrCreateChatMemory(chatID)
-	m := b.createMessage(chatID, 555, "tester", "user", caption, true)
+	b.getOrCreateChatMemory(chatKey(chatID))
+	m := b.createMessage(chatKey(chatID), 555, "tester", "user", caption, true)
 	m.ImageFileIDs = []string{"file_dead"}
 	require.NoError(t, b.storeMessage(&m))
 	joined, ok := b.joinConversation(m)
@@ -119,7 +176,7 @@ func TestGetAnthropicResponse_SelfHealRetryKeepsTheSnapshot(t *testing.T) { //NO
 			assert.NotContains(t, retried, "a bot message filed meanwhile")
 			assert.NotContains(t, retried, "file_dead", "the dead image is gone from the request")
 			assert.Contains(t, retried, imageGoneText, "and a note stands in for it")
-			for _, m := range b.getOrCreateChatMemory(chatID).Messages {
+			for _, m := range b.getOrCreateChatMemory(chatKey(chatID)).Messages {
 				assert.NotContains(t, m.ImageFileIDs, "file_dead", "later turns do not send it either")
 			}
 		})
@@ -178,7 +235,7 @@ func TestGetAnthropicResponse_SelfHealGivesUpOnAFileNotInTheRequest(t *testing.T
 	defer cancel()
 	messages := []anthropic.BetaMessageParam{anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock("hi"))}
 
-	_, err := b.getAnthropicResponse(ctx, 795, messages, false, "alice", "", "", false, "en", 0, replySinks{})
+	_, err := b.getAnthropicResponse(ctx, chatKey(795), messages, false, "alice", "", "", false, "en", 0, replySinks{})
 
 	require.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "file_elsewhere"), err.Error())

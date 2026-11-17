@@ -30,21 +30,26 @@ type ConfigModel struct {
 
 type Message struct {
 	gorm.Model
-	BotID          uint   `gorm:"index"`
-	ChatID         int64  `gorm:"index"`
-	UserID         int64  `gorm:"index"`
-	Username       string `gorm:"index"`
-	UserRole       string
-	Text           string    `gorm:"type:text"`
-	Timestamp      time.Time `gorm:"index"`
-	IsUser         bool
-	StickerFileID  string
-	StickerPNGFile string
-	StickerEmoji   string
-	DeletedAt      gorm.DeletedAt `gorm:"index"`
-	AnsweredOn     *time.Time     `gorm:"index"`
-	ImageFileIDs   []string       `gorm:"type:text;serializer:json"`
-	FilesCleanedAt *time.Time     `gorm:"index"`
+	BotID  uint  `gorm:"index;index:idx_messages_conversation,priority:1"`
+	ChatID int64 `gorm:"index;index:idx_messages_conversation,priority:3"`
+	// BusinessConnectionID is the Business connection the message came
+	// through or went out on, "" for a direct or group chat: with ChatID and
+	// ThreadID it names the message's conversation (convKey). NULL on rows
+	// stored before it was, which no conversation loads again (convScope).
+	BusinessConnectionID string `gorm:"index;index:idx_messages_conversation,priority:2"`
+	UserID               int64  `gorm:"index"`
+	Username             string `gorm:"index"`
+	UserRole             string
+	Text                 string    `gorm:"type:text"`
+	Timestamp            time.Time `gorm:"index"`
+	IsUser               bool
+	StickerFileID        string
+	StickerPNGFile       string
+	StickerEmoji         string
+	DeletedAt            gorm.DeletedAt `gorm:"index"`
+	AnsweredOn           *time.Time     `gorm:"index"`
+	ImageFileIDs         []string       `gorm:"type:text;serializer:json"`
+	FilesCleanedAt       *time.Time     `gorm:"index"`
 	// TelegramMessageID is Telegram's message_id, kept so an edited_message
 	// update can find and correct the stored copy. Zero on rows stored before
 	// edits were tracked.
@@ -54,6 +59,10 @@ type Message struct {
 	// after a turn read memory has a higher one than all the turn read. It
 	// lives in memory only; a reload gives new ones in load order.
 	Seq uint64 `gorm:"-"`
+	// ThreadID is the forum topic of the message's conversation (convKey), 0
+	// outside a forum supergroup's topics. Stored, as a reload of one topic's
+	// conversation loads only its rows; NULL on rows stored before it was.
+	ThreadID int
 	// Aside keeps a stored message out of the conversation: a handled
 	// command and its reply, a rate-limited message and its notice, a voice
 	// note refused or not transcribed and its notice, media the bot does not
@@ -64,21 +73,42 @@ type Message struct {
 }
 
 type ChatMemory struct {
-	Messages             []Message
-	Size                 int
-	BusinessConnectionID string
+	Messages []Message
+	Size     int
 
-	// generation tells this memory from the one /clear dropped before it: a
-	// turn files its reply only into the memory it read (fileReply). Set
-	// once, when the memory is created.
+	// generation tells this memory from the one /clear replaced: a turn files
+	// its reply only into the memory it read (fileReply), and a flush only
+	// runs in the memory it read its want from. Set once, when the memory is
+	// created.
 	generation uint64
+
+	// clearedThrough is the highest message id the /clear that created this
+	// memory deleted (beginClear), 0 for a memory loaded from the database.
+	// A message at or below it predates the clear and never joins.
+	clearedThrough uint
+
+	// userCutoffs holds, per sender, the newest cutoff of a /clear of their
+	// own messages in this chat (beginUserClear): a message of theirs at or
+	// below it was deleted, and never joins. Kept as long as the memory,
+	// like clearedThrough; guarded by chatMemoriesMu.
+	userCutoffs map[int64]uint
 
 	// answeredThrough is the highest sequence a model turn's recorded reply
 	// covered: every answerable user message at or below it has been
 	// answered. Written under chatMemoriesMu; read under turnsMu too, where
 	// a text flush checks it without taking the memory lock.
 	answeredThrough atomic.Uint64
+
+	// pinnedSeq is the media message that joined and that its turn has not
+	// read yet (joinMedia, snapshotForMedia): the window's trim never drops
+	// it. One at a time, as one turn holds the chat; 0 for none.
+	pinnedSeq atomic.Uint64
 }
+
+// roleBusinessOwner is the UserRole of a message the business account itself
+// sent in one of its Business chats (recordOwnerMessage): the business side of
+// the conversation, as the bot's replies are, but written by a person.
+const roleBusinessOwner = "business_owner"
 
 const (
 	ScopeStatsViewOwn        = "stats:view:own"

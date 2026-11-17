@@ -38,14 +38,18 @@ func commandUpdate(chatID int64, msgID int, user *models.User, text string) *mod
 func flushPending(t *testing.T, b *Bot, chatID int64) {
 	t.Helper()
 	b.intakeBuffersMu.Lock()
-	pending, ok := b.intakeBuffers[chatID]
+	var key convKey
 	var seq uint64
-	if ok {
-		seq = pending.seq
+	found := 0
+	for k, pending := range b.intakeBuffers { // the chat's one batch, in whichever topic or connection
+		if k.chatID == chatID {
+			key, seq = k, pending.seq
+			found++
+		}
 	}
 	b.intakeBuffersMu.Unlock()
-	require.True(t, ok, "chat %d has no pending batch", chatID)
-	b.flushIntake(context.Background(), chatID, seq)
+	require.Equal(t, 1, found, "chat %d has no pending batch, or more than one", chatID)
+	b.flushIntake(context.Background(), key, seq)
 }
 
 // storedRow is the chat's stored message with text, aside or not.
@@ -236,7 +240,7 @@ func TestHandleVoiceMessage_InvisibleUntilTranscribed(t *testing.T) { //NOSONAR 
 	const chatID = int64(123)
 	storeUserText(t, b, chatID, "one more thing")
 	voice := voiceMessage(chatID, 906)
-	userMsg, err := b.screenIncomingMessage(voice) // the voice handler's intake
+	userMsg, err := b.screenIncomingMessage(voice, targetFor(voice, voice.BusinessConnectionID)) // the voice handler's intake
 	require.NoError(t, err)
 
 	b.respondToChat(textReq(chatID)) // e.g. a collected rerun wins the race to the turn slot
@@ -257,18 +261,20 @@ func TestHandleVoiceMessage_InvisibleUntilTranscribed(t *testing.T) { //NOSONAR 
 	assert.Equal(t, transcript, storedRow(t, b, chatID, transcript).Text)
 }
 
-// R3 inverted: a text collected behind a voice turn whose transcription
-// fails is still answered, because the failure notice is aside.
+// R3 inverted: a text sent while a voice note is being transcribed is
+// answered, by a turn of its own, when the transcription fails; the failure
+// notice is aside.
 func TestHandleVoiceMessage_TranscriptionFailureLeavesCollectedTextAnswered(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	stub := newAnthropicStub(t, candleFarmStream())
 	b, tg := setupBotForTest(t, 123)
 	useAnthropicStub(b, stub)
 	sent := recordSends(tg)
-	voices := &voiceStubs{release: make(chan struct{})} // no transcript: speech to text fails
+	voices := &voiceStubs{} // no transcript: speech to text fails
 	voices.install(t, b, tg)
+	started, release := holdDownloads(t, tg)
 	const chatID = int64(123)
 	voice := voiceMessage(chatID, 907)
-	userMsg, err := b.screenIncomingMessage(voice)
+	userMsg, err := b.screenIncomingMessage(voice, targetFor(voice, voice.BusinessConnectionID))
 	require.NoError(t, err)
 
 	done := make(chan struct{})
@@ -277,21 +283,20 @@ func TestHandleVoiceMessage_TranscriptionFailureLeavesCollectedTextAnswered(t *t
 		b.handleVoiceMessage(context.Background(), voice, userMsg, replyTarget{chatID: chatID},
 			123, "owner", "", "", false, "en", 0)
 	}()
-	require.Eventually(t, func() bool { return !chatIdle(b, chatID) }, 5*time.Second, 5*time.Millisecond,
-		"the voice turn is transcribing")
+	<-started // the note is being fetched for transcription
 	late := storeUserText(t, b, chatID, "and also, what time do you open?")
-	b.respondToChat(textReq(chatID)) // collected behind the voice turn
-	close(voices.release)
+	b.respondToChat(textReq(chatID))
+	release()
 	<-done
 	waitIdle(t, b, chatID)
 
-	require.Len(t, stub.requestBetas(), 1, "the collected text is answered")
+	require.Len(t, stub.requestBetas(), 1, "the text is answered")
 	role, text := stub.lastMessage(t, 0)
 	assert.Equal(t, "user", role)
 	assert.Equal(t, "and also, what time do you open?", text)
 	assert.NotNil(t, answeredOn(t, b, late.ID))
-	require.NotEmpty(t, sent())
-	notice := sent()[0].Text
+	const notice = "Sorry, I couldn't understand your voice message."
+	require.Contains(t, sentTexts(sent), notice)
 	assert.True(t, storedRow(t, b, chatID, notice).Aside, "the failure notice is aside")
 	assert.True(t, storedRow(t, b, chatID, "[Voice message]").Aside, "so is the voice note")
 }
@@ -307,7 +312,7 @@ func TestRunStickerTurn_StickerIsAnsweredByItsOwnTurn(t *testing.T) { //NOSONAR 
 		ID: 908, Chat: models.Chat{ID: chatID}, From: &models.User{ID: chatID, Username: "tester"},
 		Sticker: &models.Sticker{FileID: "sticker-file", Emoji: "😀"},
 	}
-	sticker, err := b.screenIncomingMessage(message) // the sticker's intake
+	sticker, err := b.screenIncomingMessage(message, targetFor(message, message.BusinessConnectionID)) // the sticker's intake
 	require.NoError(t, err)
 
 	b.respondToChat(textReq(chatID)) // a text turn that runs before the sticker's
@@ -342,7 +347,7 @@ func TestReload_SkipsAsideRows(t *testing.T) { //NOSONAR go:S100 -- underscore s
 		{"Rate limit exceeded. Please try again later.", false, true},
 		{"and the bakery?", true, false},
 	} {
-		m := b.createMessage(chatID, 555, "tester", "user", row.text, row.isUser)
+		m := b.createMessage(chatKey(chatID), 555, "tester", "user", row.text, row.isUser)
 		m.Timestamp = base.Add(time.Duration(i) * time.Minute)
 		m.Aside = row.aside
 		require.NoError(t, b.storeMessage(&m))

@@ -46,8 +46,8 @@ func historyTestBot(t *testing.T, stub *anthropicStub) (*Bot, telegramRecord) {
 // as at intake, so a first load cannot read the new row and add it twice.
 func storeUserText(t *testing.T, b *Bot, chatID int64, text string) Message {
 	t.Helper()
-	b.getOrCreateChatMemory(chatID)
-	m := b.createMessage(chatID, 555, "tester", "user", text, true)
+	b.getOrCreateChatMemory(chatKey(chatID))
+	m := b.createMessage(chatKey(chatID), 555, "tester", "user", text, true)
 	require.NoError(t, b.storeMessage(&m))
 	joined, ok := b.joinConversation(m)
 	require.True(t, ok)
@@ -58,19 +58,25 @@ func storeUserText(t *testing.T, b *Bot, chatID int64, text string) Message {
 // memory, as a text turn would, without a model.
 func answerInTurn(t *testing.T, b *Bot, chatID int64, reply string) {
 	t.Helper()
-	turn, _, ok := b.beginTextTurn(textReq(chatID), b.newestAnswerableSeqInChat(chatID))
+	turn, _, ok := b.beginTextTurn(textReq(chatID), b.newestAnswerableSeqInChat(chatKey(chatID)))
 	require.True(t, ok)
 	defer b.finishTurn(turn)
-	b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatID))
-	_, err := b.recordTurnReply(turn, chatID, reply)
+	b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatKey(chatID)))
+	_, err := b.recordTurnReply(turn, chatKey(chatID), reply)
 	require.NoError(t, err)
 }
 
+// chatIdle reports whether no turn runs in any conversation of the chat:
+// any of its Business connections or forum topics.
 func chatIdle(b *Bot, chatID int64) bool {
 	b.turnsMu.Lock()
 	defer b.turnsMu.Unlock()
-	_, busy := b.turns[chatID]
-	return !busy
+	for k := range b.turns {
+		if k.chatID == chatID {
+			return false
+		}
+	}
+	return true
 }
 
 // turnsRegistered is how many turns the bot has registered so far.
@@ -82,7 +88,7 @@ func turnsRegistered(b *Bot) uint64 {
 
 // memoryTexts is the text of every message in the chat's memory, in order.
 func memoryTexts(b *Bot, chatID int64) []string {
-	mem := b.getOrCreateChatMemory(chatID)
+	mem := b.getOrCreateChatMemory(chatKey(chatID))
 	b.chatMemoriesMu.RLock()
 	defer b.chatMemoriesMu.RUnlock()
 	texts := make([]string, 0, len(mem.Messages))
@@ -97,7 +103,7 @@ func memoryTexts(b *Bot, chatID int64) []string {
 func dropChatMemory(b *Bot, chatID int64) {
 	b.chatMemoriesMu.Lock()
 	defer b.chatMemoriesMu.Unlock()
-	delete(b.chatMemories, chatID)
+	delete(b.chatMemories, chatKey(chatID))
 }
 
 func answeredOn(t *testing.T, b *Bot, id uint) *time.Time {
@@ -155,7 +161,7 @@ func TestRespondToChat_CollectedMessageIsAnsweredAfterTheReply(t *testing.T) { /
 	require.Eventually(t, func() bool {
 		b.turnsMu.Lock()
 		defer b.turnsMu.Unlock()
-		running, ok := b.turns[chatID]
+		running, ok := b.turns[chatKey(chatID)]
 		return ok && running.committed
 	}, 5*time.Second, 5*time.Millisecond)
 
@@ -194,7 +200,7 @@ func TestGetAnthropicResponse_RefusesHistoryEndingWithTheBot(t *testing.T) { //N
 		"empty": nil,
 	} {
 		logged.Reset()
-		_, err := b.getAnthropicResponse(ctx, 42, messages, false, "alice", "", "", false, "en", 0, replySinks{})
+		_, err := b.getAnthropicResponse(ctx, chatKey(42), messages, false, "alice", "", "", false, "en", 0, replySinks{})
 		assert.ErrorIs(t, err, errHistoryNotUserLast, name)
 		assert.Contains(t, logged.String(), "does not end with a user message", name)
 	}
@@ -223,14 +229,14 @@ func TestRespondToChat_HistoryEndingWithTheBotGetsTheErrorReply(t *testing.T) { 
 func TestRecordTurnReply_GoesWhereTheTurnsContextEnded(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	b, _ := setupBotForTest(t, 123)
 	const chatID = int64(780)
-	mem := b.getOrCreateChatMemory(chatID)
+	mem := b.getOrCreateChatMemory(chatKey(chatID))
 	first := storeUserText(t, b, chatID, "first")
 	turn, _, ok := b.beginTextTurn(textReq(chatID), first.Seq)
 	require.True(t, ok)
 	b.snapshotForTurn(turn, mem)
 	late := storeUserText(t, b, chatID, "arrived during the turn")
 
-	_, err := b.recordTurnReply(turn, chatID, "answer to first")
+	_, err := b.recordTurnReply(turn, chatKey(chatID), "answer to first")
 	require.NoError(t, err)
 	b.finishTurn(turn)
 
@@ -246,10 +252,10 @@ func TestRespondToChat_MessageThatReachedMemoryLateIsStillAnswered(t *testing.T)
 	stub, open := newGatedAnthropicStub(t, candleFarmStream(), 1)
 	b, _ := historyTestBot(t, stub)
 	const chatID = int64(785)
-	b.getOrCreateChatMemory(chatID) // loaded before the stores, as at intake
-	first := b.createMessage(chatID, 555, "tester", "user", "first, stored first", true)
+	b.getOrCreateChatMemory(chatKey(chatID)) // loaded before the stores, as at intake
+	first := b.createMessage(chatKey(chatID), 555, "tester", "user", "first, stored first", true)
 	require.NoError(t, b.storeMessage(&first))
-	second := b.createMessage(chatID, 556, "other", "user", "second, stored second", true)
+	second := b.createMessage(chatKey(chatID), 556, "other", "user", "second, stored second", true)
 	require.NoError(t, b.storeMessage(&second))
 	b.joinConversation(second) // second's handler reaches memory first
 
@@ -304,9 +310,9 @@ func TestReload_KeepsReplyBeforeMessageThatArrivedDuringItsTurn(t *testing.T) { 
 	first := storeUserText(t, b, chatID, "first")
 	turn, _, ok := b.beginTextTurn(textReq(chatID), first.Seq)
 	require.True(t, ok)
-	b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatID))
+	b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatKey(chatID)))
 	late := storeUserText(t, b, chatID, "arrived during the turn")
-	reply, err := b.recordTurnReply(turn, chatID, "answer to first")
+	reply, err := b.recordTurnReply(turn, chatKey(chatID), "answer to first")
 	require.NoError(t, err)
 	b.finishTurn(turn)
 
@@ -329,10 +335,10 @@ func TestRecordTurnReply_AppendedReplyKeepsTheCurrentTime(t *testing.T) { //NOSO
 	first := storeUserText(t, b, chatID, "first")
 	turn, _, ok := b.beginTextTurn(textReq(chatID), first.Seq)
 	require.True(t, ok)
-	b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatID))
+	b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatKey(chatID)))
 	b.clock = &MockClock{currentTime: first.Timestamp.Add(time.Hour)}
 
-	reply, err := b.recordTurnReply(turn, chatID, "answer to first")
+	reply, err := b.recordTurnReply(turn, chatKey(chatID), "answer to first")
 	require.NoError(t, err)
 	b.finishTurn(turn)
 
@@ -344,7 +350,7 @@ func TestRecordTurnReply_AppendedReplyKeepsTheCurrentTime(t *testing.T) { //NOSO
 func TestRecordTurnReply_FrontierEvicted(t *testing.T) { //NOSONAR go:S100 -- underscore separation is idiomatic in Go test names
 	b, _ := setupBotForTest(t, 123)
 	const chatID = int64(787)
-	mem := b.getOrCreateChatMemory(chatID)
+	mem := b.getOrCreateChatMemory(chatKey(chatID))
 	first := storeUserText(t, b, chatID, "first")
 	turn, _, ok := b.beginTextTurn(textReq(chatID), first.Seq)
 	require.True(t, ok)
@@ -352,7 +358,7 @@ func TestRecordTurnReply_FrontierEvicted(t *testing.T) { //NOSONAR go:S100 -- un
 	for i := 0; i < mem.Size; i++ {
 		storeUserText(t, b, chatID, "flood")
 	}
-	_, err := b.recordTurnReply(turn, chatID, "answer to first")
+	_, err := b.recordTurnReply(turn, chatKey(chatID), "answer to first")
 	require.NoError(t, err)
 	b.finishTurn(turn)
 
@@ -378,7 +384,7 @@ func TestRunTurn_ErrorReplyIsFiledWhereTheContextEnded(t *testing.T) { //NOSONAR
 	var late Message
 
 	b.runTurn(turn, turnCtx, req, func(context.Context, replyOutput) (string, error) {
-		b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatID))
+		b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatKey(chatID)))
 		late = storeUserText(t, b, chatID, "arrived during the turn")
 		return "", boom
 	})
@@ -405,11 +411,11 @@ func TestRunTurn_StoppedPartialIsFiledWhereTheContextEnded(t *testing.T) { //NOS
 	var late Message
 
 	b.runTurn(turn, turnCtx, req, func(ctx context.Context, out replyOutput) (string, error) {
-		b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatID))
+		b.snapshotForTurn(turn, b.getOrCreateChatMemory(chatKey(chatID)))
 		out.onProgress("Partial answer")
 		waitDraftShown(t, b, turn)
 		late = storeUserText(t, b, chatID, "arrived during the turn")
-		require.True(t, b.stopTurn(chatID, int(turn.seq)))
+		require.True(t, b.stopTurn(chatKey(chatID), int(turn.seq)))
 		<-ctx.Done()
 		return "", ctx.Err()
 	})
@@ -439,7 +445,7 @@ func TestChatMemory_SequencesStayConsistentUnderConcurrentIntake(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				b.newestAnswerableSeqInChat(chatID)
+				b.newestAnswerableSeqInChat(chatKey(chatID))
 			}
 		}
 	}()
@@ -461,7 +467,7 @@ func TestChatMemory_SequencesStayConsistentUnderConcurrentIntake(t *testing.T) {
 	close(stop)
 	<-readers
 
-	mem := b.getOrCreateChatMemory(chatID)
+	mem := b.getOrCreateChatMemory(chatKey(chatID))
 	b.chatMemoriesMu.RLock()
 	msgs := slices.Clone(mem.Messages)
 	b.chatMemoriesMu.RUnlock()
@@ -476,5 +482,5 @@ func TestChatMemory_SequencesStayConsistentUnderConcurrentIntake(t *testing.T) {
 		}
 		last[m.UserID] = m.TelegramMessageID
 	}
-	assert.Equal(t, msgs[len(msgs)-1].Seq, b.newestAnswerableSeqInChat(chatID))
+	assert.Equal(t, msgs[len(msgs)-1].Seq, b.newestAnswerableSeqInChat(chatKey(chatID)))
 }

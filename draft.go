@@ -91,22 +91,35 @@ func (d *draftStream) start() { go d.run() }
 // draft showed turned out to be a progress note. From then on current is ""
 // and the draft is not kept alive, until answer text arrives again.
 func (d *draftStream) update(text string) {
-	d.mu.Lock()
-	d.latest = text
-	if text == "" {
-		d.shown = ""
-	}
-	d.mu.Unlock()
+	d.setLatest(text)
 	select {
 	case d.kick <- struct{}{}:
 	default:
 	}
 }
 
+// setLatest records text as the newest reply text, under d.mu.
+func (d *draftStream) setLatest(text string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.latest = text
+	if text == "" {
+		d.shown = ""
+	}
+}
+
+// texts is the newest reply text and the text on screen, under d.mu.
+func (d *draftStream) texts() (latest, shown string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.latest, d.shown
+}
+
 // run is the sender loop: wake on new text or on the keepalive deadline,
 // respect the throttle, send the newest text, repeat until closed or failed.
 func (d *draftStream) run() {
 	defer close(d.done)
+	defer d.b.recoverPanic("draft")
 
 	var lastSend time.Time
 	for {
@@ -131,9 +144,7 @@ func (d *draftStream) run() {
 			}
 		}
 
-		d.mu.Lock()
-		text, shown := d.latest, d.shown
-		d.mu.Unlock()
+		text, shown := d.texts()
 		if text == "" {
 			// Nothing to show, and an empty draft is never sent. Disarm the
 			// keepalive until answer text arrives; that send is a first one.
@@ -163,9 +174,7 @@ func (d *draftStream) send(text string) bool {
 		KeepOnStop:      true,
 	})
 	if err != nil {
-		d.mu.Lock()
-		d.failed = true
-		d.mu.Unlock()
+		d.markFailed()
 		if d.ctx.Err() == nil {
 			// Cosmetic from here on: the final message is still sent.
 			InfoLogger.Printf("[%s] draft %s for chat %d failed, falling back to final message only: %v",
@@ -174,16 +183,30 @@ func (d *draftStream) send(text string) bool {
 		return false
 	}
 
-	d.mu.Lock()
-	first := d.shown == ""
-	if d.latest != "" { // else the text became a progress note while in flight
-		d.shown = text
-	}
-	d.mu.Unlock()
-	if first && d.onFirst != nil {
+	if d.markShown(text) && d.onFirst != nil {
 		d.onFirst()
 	}
 	return true
+}
+
+// markFailed records that a draft call failed, under d.mu.
+func (d *draftStream) markFailed() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.failed = true
+}
+
+// markShown records text as on screen after a draft call, unless the reply
+// became a progress note while the call was in flight, and reports whether
+// it was the first text shown, under d.mu.
+func (d *draftStream) markShown(text string) (first bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	first = d.shown == ""
+	if d.latest != "" {
+		d.shown = text
+	}
+	return first
 }
 
 // current returns the answer text the user has actually seen.
@@ -247,6 +270,11 @@ func (b *Bot) newAnswerOutput(turnCtx context.Context, turn *chatTurn, to replyT
 			onProgress: d.update,
 			finish: func(ctx context.Context, joined string) error {
 				d.close()
+				if b.clearedTurn(turn) {
+					// /clear landed while the last draft call was out: the
+					// reply answers a history that is gone.
+					return nil
+				}
 				return b.sendLongMessage(ctx, to, joined)
 			},
 			partial:    d.current,

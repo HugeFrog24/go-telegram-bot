@@ -63,7 +63,7 @@ func TestBuildContextMessages_CacheHistoryToggle(t *testing.T) { //NOSONAR go:S1
 	}
 
 	t.Run("enabled by default", func(t *testing.T) {
-		msgs := b.buildContextMessages(memory)
+		msgs := b.buildContextMessages(memory.Messages)
 		require.Len(t, msgs, 2)
 		require.NotNil(t, msgs[0].OfUser, "user memory becomes a user turn")
 		require.NotNil(t, msgs[1].OfAssistant, "bot memory becomes an assistant turn")
@@ -75,7 +75,7 @@ func TestBuildContextMessages_CacheHistoryToggle(t *testing.T) { //NOSONAR go:S1
 		b.config.CacheHistory = &off
 		defer func() { b.config.CacheHistory = nil }()
 
-		msgs := b.buildContextMessages(memory)
+		msgs := b.buildContextMessages(memory.Messages)
 		require.Len(t, msgs, 2)
 		assert.True(t, param.IsOmitted(msgs[1].OfAssistant.Content[0].OfText.CacheControl))
 	})

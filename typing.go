@@ -47,6 +47,7 @@ func (b *Bot) startChatAction(
 	send()
 
 	go func() {
+		defer b.recoverPanic("chat action")
 		ticker := time.NewTicker(typingRefreshInterval)
 		defer ticker.Stop()
 		for {
@@ -60,4 +61,12 @@ func (b *Bot) startChatAction(
 	}()
 
 	return cancel
+}
+
+// withTyping runs work with the typing indicator on, stopping it however work
+// ends, a panic included.
+func (b *Bot) withTyping(ctx context.Context, to replyTarget, work func() (string, error)) (string, error) {
+	stop := b.startChatAction(ctx, to, models.ChatActionTyping)
+	defer stop()
+	return work()
 }

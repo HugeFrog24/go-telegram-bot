@@ -194,7 +194,7 @@ func TestRunTurn_SegmentModeStatusThenAnswerThenDelete(t *testing.T) { //NOSONAR
 		{kind: "delete", id: 501},
 	}, rec.snapshot(), "the status message is silent, the answer notifies, and the delete comes last")
 
-	msgs := b.getOrCreateChatMemory(notesGroupChat).Messages
+	msgs := b.getOrCreateChatMemory(chatKey(notesGroupChat)).Messages
 	require.NotEmpty(t, msgs)
 	last := msgs[len(msgs)-1]
 	assert.False(t, last.IsUser)
@@ -309,7 +309,7 @@ func TestRunTurn_DraftModeTextNoteEndToEnd(t *testing.T) { //NOSONAR go:S100 -- 
 			messages := []anthropic.BetaMessageParam{
 				anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock("Where is the candle farm?")),
 			}
-			return b.getAnthropicResponse(ctx, req.chatID, messages, false, req.username, "", "", false, "en", 0, out.sinks())
+			return b.getAnthropicResponse(ctx, req.conv(), messages, false, req.username, "", "", false, "en", 0, out.sinks())
 		})
 	}()
 	waitTurn := func() {
@@ -351,7 +351,7 @@ func TestRunTurn_DraftModeTextNoteEndToEnd(t *testing.T) { //NOSONAR go:S100 -- 
 	// One send per new text, plus at most one keepalive per interval.
 	assert.LessOrEqual(t, len(drafts), 3+int(time.Since(began)/b.draftKeepalive), "draft sends stay bounded")
 
-	msgs := b.getOrCreateChatMemory(123).Messages
+	msgs := b.getOrCreateChatMemory(chatKey(123)).Messages
 	require.NotEmpty(t, msgs)
 	assert.Equal(t, answer, msgs[len(msgs)-1].Text, "memory holds the answer")
 	for _, m := range msgs {
@@ -420,7 +420,7 @@ func TestRunTurn_StopDeletesStatusBeforePartial(t *testing.T) { //NOSONAR go:S10
 		sinks.onProgress("Partial answer")
 		waitDraftShown(t, b, turn)
 
-		require.True(t, b.stopTurn(123, int(turn.seq)))
+		require.True(t, b.stopTurn(chatKey(123), int(turn.seq)))
 		<-ctx.Done()
 		return "", ctx.Err()
 	})
@@ -448,7 +448,7 @@ func TestRunTurn_StopAfterTextNoteSendsNoPartial(t *testing.T) { //NOSONAR go:S1
 		sinks.onProgress("")
 		rec.waitSend(t, "Let me check")
 
-		require.True(t, b.stopTurn(123, int(turn.seq)))
+		require.True(t, b.stopTurn(chatKey(123), int(turn.seq)))
 		<-ctx.Done()
 		return "", ctx.Err()
 	})
@@ -457,7 +457,7 @@ func TestRunTurn_StopAfterTextNoteSendsNoPartial(t *testing.T) { //NOSONAR go:S1
 		{kind: "send", text: "Let me check", id: 501, silent: true},
 		{kind: "delete", id: 501},
 	}, rec.snapshot(), "the note was never answer text, so there is no partial to send")
-	for _, m := range b.getOrCreateChatMemory(123).Messages {
+	for _, m := range b.getOrCreateChatMemory(chatKey(123)).Messages {
 		assert.True(t, m.IsUser, "nothing is stored for the bot, least of all the note: %q", m.Text)
 	}
 }

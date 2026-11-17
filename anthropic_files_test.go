@@ -165,7 +165,12 @@ func TestMarkFilesPendingCleanup(t *testing.T) {
 	}
 	assert.NoError(t, b.db.Create(&row4).Error)
 
-	updated, err := b.markFilesPendingCleanup(t.Context(), chatID, []string{"file_a", "file_b"})
+	// The same chat ID through a Business connection is another conversation.
+	row5 := Message{BotID: b.botID, ChatID: chatID, BusinessConnectionID: "conn-A1", UserID: 777, IsUser: true,
+		Text: "business chat", Timestamp: time.Now(), ImageFileIDs: []string{"file_a"}}
+	assert.NoError(t, b.db.Create(&row5).Error)
+
+	updated, err := b.markFilesPendingCleanup(t.Context(), chatKey(chatID), []string{"file_a", "file_b"})
 	assert.NoError(t, err)
 	assert.Equal(t, 2, updated, "rows 1 and 2 should have been updated")
 
@@ -188,4 +193,8 @@ func TestMarkFilesPendingCleanup(t *testing.T) {
 	assert.NoError(t, b.db.First(&r4, row4.ID).Error)
 	assert.Equal(t, []string{"file_a"}, r4.ImageFileIDs)
 	assert.Nil(t, r4.FilesCleanedAt)
+
+	var r5 Message
+	assert.NoError(t, b.db.First(&r5, row5.ID).Error)
+	assert.Equal(t, []string{"file_a"}, r5.ImageFileIDs, "another conversation's row is left alone")
 }
